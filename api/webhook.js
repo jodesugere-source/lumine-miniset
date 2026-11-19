@@ -3,7 +3,7 @@
 // ==========================================
 const ADMIN_USERNAME = "Fellstore1"; // Tanpa tanda @
 const LINK_CH_CADANGAN = "https://t.me/+0GXaaPyrnd5kMmY1";
-const LINK_CH_FREE = "https://t.me/+jf3tLqLIG444MjBI";
+const LINK_CH_FREE = "https://t.me/+905Qg2M3mi02YzI9";
 const REDIS_KEY = "lumine_miniset_katalog";
 const REDIS_BUNDLE_KEY = "lumine_miniset_bundle";
 
