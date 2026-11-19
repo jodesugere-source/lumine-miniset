@@ -11,9 +11,9 @@ const REDIS_BUNDLE_KEY = "lumine_miniset_bundle";
 // 2. FUNGSI DATABASE (UPSTASH REDIS REST API)
 // ==========================================
 async function redisCommand(commandArray) {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const token = process.env.UPSTASH_REDIS_REST_TOKEN;
-
+    const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  
   if (!url || !token) {
     throw new Error("UPSTASH_REDIS_REST_URL atau TOKEN belum diatur di Vercel.");
   }
@@ -175,8 +175,9 @@ module.exports = async function handler(req, res) {
         status: "Webhook berhasil diatur",
         webhook_url: webhookUrl,
         database_connected: Boolean(
-          process.env.UPSTASH_REDIS_REST_URL &&
-            process.env.UPSTASH_REDIS_REST_TOKEN
+         (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL) &&
+            (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN)
+          
         ),
         telegram_response: result,
       });
