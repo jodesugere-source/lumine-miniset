@@ -387,12 +387,7 @@ async function notifyResellerTierUp(token, order, result) {
   }
 }
 
-async function addStoreOmset(nominal) {
-  await Promise.all([
-    redisCommand(["INCRBY", REDIS_STORE_OMSET_KEY, Math.round(Number(nominal) || 0)]),
-    redisCommand(["INCR", REDIS_STORE_OMSET_CNT_KEY]),
-  ]);
-}
+
 
 async function getStoreOmset() {
   const [rp, cnt] = await Promise.all([
@@ -488,7 +483,16 @@ async function getKatalog() {
 }
 
 async function saveKatalog(list) {
+  let before = [];
+  try {
+    before = await getKatalog();
+  } catch {}
   await redisCommand(["SET", REDIS_KEY, JSON.stringify(list)]);
+  try {
+    await notifyWishlistChanges(before, list);
+  } catch (e) {
+    console.error("Notif wishlist gagal:", e);
+  }
 }
 
 async function getQris() {
@@ -1592,6 +1596,11 @@ async function processAccOrder(token, order) {
     await maybeRewardReferral(token, order);
   } catch (refErr) {
     console.error("Referral reward error:", refErr);
+  }
+  try {
+    await maybeRewardMitra(token, order);
+  } catch (mitraErr) {
+    console.error("Mitra reward error:", mitraErr);
   }
   return result;
 }
@@ -4664,8 +4673,8 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
 
   if (cmd === "/wd") {
     if (!msg.chat || msg.chat.type !== "private") return true;
-    if (!(await isReseller(uid))) {
-      await reply("❌ Fitur WD khusus reseller.");
+    if (!(await isReseller(uid)) && !(await isMitra(uid))) {
+      await reply("❌ Fitur WD khusus reseller atau mitra.");
       return true;
     }
     const m = arg.match(/^(\S+)\s+([\s\S]+)$/);
@@ -5294,6 +5303,477 @@ async function sendPanduan(token, chatId, nodeKey, messageId) {
   return tgRequest(token, "sendMessage", payload);
 }
 
+// ==========================================
+// FITUR BARU: WISHLIST + NOTIFIKASI (HARGA TURUN, HABIS, KEMBALI TERSEDIA)
+// ==========================================
+
+const WL_MAX_ITEMS = 20; // maks set per wishlist
+const REDIS_WL_USER_PREFIX = "lumine_main_wl_u_"; // hash per user: id set -> JSON {nama, harga, out}
+const REDIS_WL_ITEM_PREFIX = "lumine_main_wl_i_"; // set per set-katalog: id user yang memantau
+
+// Ambil seluruh wishlist user: { id: {nama, harga, out} }
+async function getWishlist(userId) {
+  const raw = await redisCommand(["HGETALL", REDIS_WL_USER_PREFIX + String(userId)]);
+  const out = {};
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      try {
+        out[raw[i]] = JSON.parse(raw[i + 1]);
+      } catch {}
+    }
+  }
+  return out;
+}
+
+async function isInWishlist(userId, itemId) {
+  const res = await redisCommand(["HEXISTS", REDIS_WL_USER_PREFIX + String(userId), String(itemId)]);
+  return Number(res) === 1;
+}
+
+// Tambah atau hapus dari wishlist. Hasil: true (ditambah), false (dihapus), "penuh"
+async function toggleWishlist(userId, item) {
+  const uKey = REDIS_WL_USER_PREFIX + String(userId);
+  const iKey = REDIS_WL_ITEM_PREFIX + String(item.id);
+
+  if (await isInWishlist(userId, item.id)) {
+    await redisCommand(["HDEL", uKey, String(item.id)]);
+    await redisCommand(["SREM", iKey, String(userId)]);
+    return false;
+  }
+
+  const current = Object.keys(await getWishlist(userId)).length;
+  if (current >= WL_MAX_ITEMS) return "penuh";
+
+  await redisCommand([
+    "HSET",
+    uKey,
+    String(item.id),
+    JSON.stringify({ nama: item.nama, harga: item.harga, out: false }),
+  ]);
+  await redisCommand(["SADD", iKey, String(userId)]);
+  return true;
+}
+
+async function removeFromWishlist(userId, itemId) {
+  await redisCommand(["HDEL", REDIS_WL_USER_PREFIX + String(userId), String(itemId)]);
+  await redisCommand(["SREM", REDIS_WL_ITEM_PREFIX + String(itemId), String(userId)]);
+}
+
+// Tombol wishlist di halaman detail produk
+function buildWishlistButton(inWishlist, itemId) {
+  return {
+    text: inWishlist ? "💔 Hapus dari Wishlist" : "⭐ Simpan ke Wishlist",
+    callback_data: `wl_${itemId}`,
+  };
+}
+
+// Dipanggil saat tombol wishlist ditekan di halaman detail
+async function handleWishlistToggle(token, chatId, messageId, userId, itemId) {
+  const katalog = await getKatalog();
+  const item = katalog.find((k) => String(k.id) === String(itemId));
+  if (!item) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: "⚠️ Set ini sudah tidak tersedia, jadi tidak bisa diubah dari wishlist.",
+    });
+    return;
+  }
+
+  const result = await toggleWishlist(userId, item);
+  if (result === "penuh") {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `Wishlist kamu sudah penuh (maks ${WL_MAX_ITEMS} set). Hapus salah satu dulu lewat /wishlist.`,
+    });
+    return;
+  }
+
+  // Perbarui tombol di halaman detail tanpa mengirim ulang pesan
+  const wlRow = [buildWishlistButton(result, item.id)];
+  await tgRequest(token, "editMessageReplyMarkup", {
+    chat_id: chatId,
+    message_id: messageId,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `💳 Beli Set Ini (${item.harga})`, callback_data: `buy_${item.id}` }],
+        wlRow,
+        [{ text: "🔙 Kembali ke Katalog", callback_data: "menu_katalog" }],
+      ],
+    },
+  });
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: result
+      ? `⭐ <b>${escapeHtml(item.nama)}</b> disimpan ke wishlist. Kamu akan dikabari kalau harganya turun atau stoknya kembali.`
+      : `Dihapus dari wishlist.`,
+    parse_mode: "HTML",
+  });
+}
+
+// Daftar wishlist user, lengkap dengan status tersedia atau tidak
+async function sendWishlist(token, chatId, userId) {
+  const wl = await getWishlist(userId);
+  const ids = Object.keys(wl);
+
+  if (!ids.length) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "⭐ <b>Wishlist kamu masih kosong</b>\n\n" +
+        "Buka set di katalog, lalu tekan ⭐ Simpan ke Wishlist.",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const katalog = await getKatalog();
+  const aktif = new Set(katalog.map((k) => String(k.id)));
+
+  let text = `⭐ <b>Wishlist Kamu</b> (${ids.length}/${WL_MAX_ITEMS})\n\n`;
+  const rows = [];
+  for (const id of ids) {
+    const w = wl[id];
+    const tersedia = aktif.has(id);
+    text += `• ${escapeHtml(w.nama)} — ${escapeHtml(w.harga)} ${tersedia ? "✅" : "⏸ belum tersedia"}\n`;
+    const row = [];
+    if (tersedia) row.push({ text: `🛍️ ${String(w.nama).slice(0, 25)}`, callback_data: `detail_${id}` });
+    row.push({ text: "🗑 Hapus", callback_data: `wlr_${id}` });
+    rows.push(row);
+  }
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+// Dipanggil dari saveKatalog: bandingkan katalog lama dan baru, lalu kabari pemantau yang relevan
+async function notifyWishlistChanges(before, after) {
+  const token = process.env.BOT_TOKEN;
+  const beforeMap = new Map(before.map((i) => [String(i.id), i]));
+  const afterMap = new Map(after.map((i) => [String(i.id), i]));
+  const allIds = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+
+  for (const id of allIds) {
+    const subs = await redisCommand(["SMEMBERS", REDIS_WL_ITEM_PREFIX + id]);
+    if (!Array.isArray(subs) || !subs.length) continue;
+
+    const was = beforeMap.get(id);
+    const now = afterMap.get(id);
+
+    for (const uid of subs) {
+      const uKey = REDIS_WL_USER_PREFIX + String(uid);
+      const raw = await redisCommand(["HGET", uKey, id]);
+      if (!raw) continue;
+
+      let w;
+      try {
+        w = JSON.parse(raw);
+      } catch {
+        continue;
+      }
+
+      let changed = false;
+
+      if (was && !now) {
+        // Hilang dari katalog: sekali kabari, lalu tandai
+        if (!w.out) {
+          w.out = true;
+          changed = true;
+          await tgRequest(token, "sendMessage", {
+            chat_id: uid,
+            parse_mode: "HTML",
+            text: `⏸ <b>${escapeHtml(w.nama)}</b> di wishlistmu sedang tidak tersedia. Kami kabari saat kembali.`,
+          });
+        }
+      } else if (!was && now) {
+        // Kembali tersedia (restock)
+        if (w.out) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: uid,
+            parse_mode: "HTML",
+            text: `🔔 <b>${escapeHtml(now.nama)}</b> sudah tersedia lagi!\n💲 Harga: <code>${escapeHtml(now.harga)}</code>`,
+            reply_markup: {
+              inline_keyboard: [[{ text: "🛍️ Lihat Set Ini", callback_data: `detail_${id}` }]],
+            },
+          });
+        }
+        w.out = false;
+        w.nama = now.nama;
+        w.harga = now.harga;
+        changed = true;
+      } else if (was && now) {
+        // Masih ada: cek penurunan harga
+        const hargaLama = parseNominal(w.harga);
+        const hargaBaru = parseNominal(now.harga);
+        if (hargaBaru < hargaLama) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: uid,
+            parse_mode: "HTML",
+            text:
+              `💸 <b>Harga turun!</b>\n` +
+              `<b>${escapeHtml(now.nama)}</b>: <s>${escapeHtml(w.harga)}</s> ➜ <code>${escapeHtml(now.harga)}</code>`,
+            reply_markup: {
+              inline_keyboard: [[{ text: "🛍️ Lihat Set Ini", callback_data: `detail_${id}` }]],
+            },
+          });
+        }
+        if (w.harga !== now.harga || w.nama !== now.nama) {
+          w.harga = now.harga;
+          w.nama = now.nama;
+          changed = true;
+        }
+      }
+
+      if (changed) {
+        await redisCommand(["HSET", uKey, id, JSON.stringify(w)]);
+      }
+    }
+  }
+}
+
+// ==========================================
+// RINGKASAN HARIAN (VERSI 2) + OMSET HARIAN + REWARD ULASAN
+// ==========================================
+const SUMMARY_ENABLED = true;
+const SUMMARY_HOUR_WIB = 7; // ringkasan dikirim di update pertama setelah jam ini (WIB)
+const REDIS_SUMMARY_LAST_KEY = "lumine_main_summary_last";
+const REVIEW_REWARD_SALDO = 500; // saldo untuk pembeli yang memberi ulasan (sekali per order)
+const REDIS_REVIEW_REWARD_KEY = "lumine_main_review_reward"; // hash: id order -> id user
+
+// Tanggal WIB dalam format YYYY-MM-DD untuk timestamp (ms) tertentu
+function wibDayKey(ms) {
+  const d = new Date(ms + 7 * 3600 * 1000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+}
+
+// Tambah omset ke total dan ke penghitung harian
+async function addStoreOmset(nominal) {
+  const amount = Math.round(Number(nominal) || 0);
+  const dayKey = "lumine_main_omset_day_" + wibDayKey(Date.now());
+  await Promise.all([
+    redisCommand(["INCRBY", REDIS_STORE_OMSET_KEY, amount]),
+    redisCommand(["INCR", REDIS_STORE_OMSET_CNT_KEY]),
+    redisCommand(["HINCRBY", dayKey, "rupiah", amount]),
+    redisCommand(["HINCRBY", dayKey, "count", 1]),
+  ]);
+  await redisCommand(["EXPIRE", dayKey, 60 * 60 * 24 * 90]);
+}
+
+async function getDailyOmset(dayKey) {
+  const raw = await redisCommand(["HGETALL", "lumine_main_omset_day_" + dayKey]);
+  const map = {};
+  if (Array.isArray(raw)) for (let i = 0; i < raw.length; i += 2) map[raw[i]] = raw[i + 1];
+  return { rupiah: parseInt(map.rupiah, 10) || 0, count: parseInt(map.count, 10) || 0 };
+}
+
+// Ringkasan harian untuk admin: dikirim sekali sehari, berisi data kemarin dan antrean hari ini
+async function maybeSendDailySummary(token) {
+  if (!SUMMARY_ENABLED) return;
+  const now = Date.now();
+  const wib = new Date(now + 7 * 3600 * 1000);
+  if (wib.getUTCHours() < SUMMARY_HOUR_WIB) return;
+
+  const todayKey = wibDayKey(now);
+  const yesterdayKey = wibDayKey(now - 86400000);
+  const last = await redisCommand(["GET", REDIS_SUMMARY_LAST_KEY]);
+  if (last === todayKey) return;
+  await redisCommand(["SET", REDIS_SUMMARY_LAST_KEY, todayKey]);
+
+  const qris = await getQris();
+  const adminChatId = qris && qris.admin_chat_id;
+  if (!adminChatId) return;
+
+  const [pendingOrder, pendingSub, pendingWd, harian, omset, users, resellers] = await Promise.all([
+    redisCommand(["HLEN", REDIS_PENDING_MAP_KEY]),
+    redisCommand(["HLEN", REDIS_SUB_PENDING_KEY]),
+    redisCommand(["HLEN", REDIS_WD_PENDING_KEY]),
+    getDailyOmset(yesterdayKey),
+    getStoreOmset(),
+    redisCommand(["SCARD", REDIS_USERS_KEY]),
+    redisCommand(["HLEN", REDIS_RESELLER_KEY]),
+  ]);
+
+  const antrean = (Number(pendingOrder) || 0) + (Number(pendingSub) || 0) + (Number(pendingWd) || 0);
+  const text =
+    `☀️ <b>RINGKASAN HARIAN</b>\n` +
+    `📅 Data kemarin: ${escapeHtml(yesterdayKey)}\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `💰 Omset kemarin : <code>${formatRupiah(harian.rupiah)}</code> (${harian.count} transaksi)\n` +
+    `💼 Total omset : <code>${formatRupiah(omset.rupiah)}</code>\n` +
+    `👥 Total pembeli : <b>${Number(users) || 0}</b>\n` +
+    `🤝 Total reseller : <b>${Number(resellers) || 0}</b>\n\n` +
+    `📋 <b>Antrean yang perlu dicek</b>\n` +
+    `• Order pending : <b>${Number(pendingOrder) || 0}</b>\n` +
+    `• Klaim subscribe : <b>${Number(pendingSub) || 0}</b>\n` +
+    `• Penarikan (WD) : <b>${Number(pendingWd) || 0}</b>\n` +
+    (antrean > 0 ? `\nAda ${antrean} antrean menunggu. 💪` : `\nTidak ada antrean. ✅`);
+
+  await tgRequest(token, "sendMessage", { chat_id: adminChatId, text, parse_mode: "HTML" });
+}
+
+// Reward saldo untuk ulasan, hanya sekali per order
+async function rewardReview(token, chatId, userId, orderId) {
+  if (!REVIEW_REWARD_SALDO || !orderId) return;
+  const added = await redisCommand(["HSETNX", REDIS_REVIEW_REWARD_KEY, String(orderId), String(userId)]);
+  if (Number(added) !== 1) return;
+  await addUserSaldo(userId, REVIEW_REWARD_SALDO);
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      `🎁 Makasih sudah mengulas! Saldo <code>${formatRupiah(REVIEW_REWARD_SALDO)}</code> ` +
+      `sudah masuk ke akunmu dan bisa dipakai untuk belanja berikutnya 💜`,
+  });
+}
+
+// ==========================================
+// PROGRAM MITRA: BAGI LINK, DAPAT KOMISI (BISA DI-WD)
+// ==========================================
+const MITRA_ENABLED = true;
+const MITRA_COMMISSION_PERCENT = 5; // komisi dari nominal yang dibayar pembeli (setelah diskon)
+const MITRA_MONTHLY_CAP = 100000; // batas komisi per mitra per bulan (Rp)
+const REDIS_MITRA_CODE_KEY = "lumine_main_mitra_code"; // hash: kode -> id user
+const REDIS_MITRA_USER_KEY = "lumine_main_mitra_user"; // hash: id user -> kode
+const REDIS_MITRA_REF_KEY = "lumine_main_mitra_ref"; // hash: id pembeli -> kode (hanya pembeli baru)
+const REDIS_MITRA_BUYERS_PREFIX = "lumine_main_mitra_buyers_"; // hash per kode: id pembeli -> 1
+const REDIS_MITRA_PAID_KEY = "lumine_main_mitra_paid"; // hash: id order -> id mitra (komisi sekali per order)
+const REDIS_MITRA_MONTH_PREFIX = "lumine_main_mitra_month_"; // hash per bulan: id mitra -> total komisi
+
+async function getMitraCode(uid) {
+  const c = await redisCommand(["HGET", REDIS_MITRA_USER_KEY, String(uid)]);
+  return c ? String(c) : null;
+}
+
+async function isMitra(uid) {
+  return Boolean(await getMitraCode(uid));
+}
+
+function wibMonthKey() {
+  const d = new Date(Date.now() + 7 * 3600 * 1000);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+async function sendMitraInfo(token, chatId, uid) {
+  const code = await getMitraCode(uid);
+  const me = await tgRequest(token, "getMe", {});
+  const uname = (me && me.result && me.result.username) || "";
+  const buyers = await redisCommand(["HLEN", REDIS_MITRA_BUYERS_PREFIX + code]);
+  const m = await getResellerMargin(uid);
+  const link = `https://t.me/${uname}?start=m_${code}`;
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      `🤝 <b>Program Mitra</b>\n\n` +
+      `Link kamu:\n<code>${link}</code>\n\n` +
+      `Setiap pembeli baru yang datang lewat link ini dan membayar pakai QRIS, ` +
+      `kamu dapat komisi <b>${MITRA_COMMISSION_PERCENT}%</b> dari nominal yang dibayar.\n\n` +
+      `👥 Pembeli dari link kamu : <b>${Number(buyers) || 0}</b>\n` +
+      `💰 Total komisi : <code>${formatRupiah(m.earned)}</code>\n` +
+      `💳 Bisa ditarik : <code>${formatRupiah(m.available)}</code>\n\n` +
+      `Tarik komisi lewat bot ini: <code>/wd NOMINAL TUJUAN</code>`,
+  });
+}
+
+// /daftarmitra KODE
+async function registerMitra(token, msg, kodeRaw) {
+  const chatId = msg.chat.id;
+  const uid = String(msg.from.id);
+  const reply = (text) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      reply_to_message_id: msg.message_id,
+    });
+
+  if (!MITRA_ENABLED) return reply("Program mitra sedang tidak dibuka.");
+  if (msg.chat.type !== "private") return reply("Daftar mitra lewat chat pribadi dengan bot ya.");
+  if (await isMitra(uid)) return sendMitraInfo(token, chatId, uid);
+
+  const kode = String(kodeRaw || "").trim().toLowerCase();
+  if (!/^[a-z0-9]{3,16}$/.test(kode)) {
+    return reply(
+      "Format: <code>/daftarmitra KODE</code>\n" +
+        "Kode 3 sampai 16 huruf atau angka, tanpa spasi.\n" +
+        "Contoh: <code>/daftarmitra kiko99</code>"
+    );
+  }
+
+  const ok = await redisCommand(["HSETNX", REDIS_MITRA_CODE_KEY, kode, uid]);
+  if (Number(ok) !== 1) return reply("Kode itu sudah dipakai orang lain. Coba kode lain ya.");
+  await redisCommand(["HSET", REDIS_MITRA_USER_KEY, uid, kode]);
+
+  await reply("🎉 Selamat, kamu sudah jadi mitra!");
+  await sendMitraInfo(token, chatId, uid);
+}
+
+// Dipanggil saat pembeli baru masuk lewat link mitra (/start m_KODE)
+async function recordMitraReferral(buyerId, codeRaw, isNewUser) {
+  if (!MITRA_ENABLED || !isNewUser) return;
+  const code = String(codeRaw || "").toLowerCase();
+  const owner = await redisCommand(["HGET", REDIS_MITRA_CODE_KEY, code]);
+  if (!owner || String(owner) === String(buyerId)) return; // kode tidak ada, atau pakai link sendiri
+  const set = await redisCommand(["HSETNX", REDIS_MITRA_REF_KEY, String(buyerId), code]);
+  if (Number(set) !== 1) return; // sudah tercatat dari mitra lain
+  await redisCommand(["HSET", REDIS_MITRA_BUYERS_PREFIX + code, String(buyerId), "1"]);
+}
+
+// Dipanggil setelah order di-ACC: hitung komisi mitra (hanya pembayaran uang asli)
+async function maybeRewardMitra(token, order) {
+  if (!MITRA_ENABLED || !order || order.rbot_owner || order.is_deposit) return;
+  if (order.paid_with_saldo) return;
+
+  const buyerId = String(order.buyer_id);
+  const code = await redisCommand(["HGET", REDIS_MITRA_REF_KEY, buyerId]);
+  if (!code) return;
+  const mitraId = await redisCommand(["HGET", REDIS_MITRA_CODE_KEY, String(code)]);
+  if (!mitraId || String(mitraId) === buyerId) return; // tidak boleh komisi dari pembelian sendiri
+
+  const paid = Number(order.final_base_nominal || order.base_nominal) || 0;
+  const commission = Math.floor((paid * MITRA_COMMISSION_PERCENT) / 100);
+  if (commission <= 0) return;
+
+  // Sekali per order, aman walau ACC terpanggil dua kali
+  const first = await redisCommand(["HSETNX", REDIS_MITRA_PAID_KEY, String(order.id), String(mitraId)]);
+  if (Number(first) !== 1) return;
+
+  // Batas komisi bulanan
+  const monthKey = REDIS_MITRA_MONTH_PREFIX + wibMonthKey();
+  const used = parseInt(await redisCommand(["HGET", monthKey, String(mitraId)]), 10) || 0;
+  const give = Math.min(commission, Math.max(0, MITRA_MONTHLY_CAP - used));
+  if (give <= 0) return;
+
+  await redisCommand(["HINCRBY", monthKey, String(mitraId), give]);
+  await redisCommand(["EXPIRE", monthKey, 60 * 60 * 24 * 400]);
+  // Masuk ke ledger margin yang sama dengan reseller, jadi bisa di-WD lewat /wd
+  await redisCommand(["HINCRBY", REDIS_RBOT_MARGIN_KEY, String(mitraId), give]);
+
+  const m = await getResellerMargin(mitraId);
+  await tgRequest(token, "sendMessage", {
+    chat_id: mitraId,
+    parse_mode: "HTML",
+    text:
+      `💸 <b>Ada penjualan dari linkmu!</b>\n\n` +
+      `Komisi masuk: <code>+${formatRupiah(give)}</code>\n` +
+      `💳 Bisa ditarik sekarang: <code>${formatRupiah(m.available)}</code>\n\n` +
+      `Tarik lewat bot: <code>/wd NOMINAL TUJUAN</code>`,
+  });
+}
+
+// Admin: /cabutmitra ID_USER
+async function removeMitra(token, uid) {
+  const code = await getMitraCode(uid);
+  if (!code) return false;
+  await redisCommand(["HDEL", REDIS_MITRA_CODE_KEY, code]);
+  await redisCommand(["HDEL", REDIS_MITRA_USER_KEY, String(uid)]);
+  return true;
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -5637,6 +6117,13 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
           reply_markup: lb.reply_markup,
         });
+      } else if (data.startsWith("wl_")) {
+        await handleWishlistToggle(token, chatId, messageId, callerId, data.slice(3));
+        return res.status(200).json({ ok: true });
+      } else if (data.startsWith("wlr_")) {
+        await removeFromWishlist(callerId, data.slice(4));
+        await sendWishlist(token, chatId, callerId);
+        return res.status(200).json({ ok: true });
       } else if (data.startsWith("detail_")) {
         const katalogList = await getKatalog();
         const itemId = data.replace("detail_", "");
@@ -5681,6 +6168,7 @@ module.exports = async function handler(req, res) {
           `╰────────────────────${voucherNote}\n\n` +
           `💳 Klik tombol di bawah untuk checkout via <b>Saldo</b> atau <b>QRIS</b>!`;
 
+        const wlRowMarkup = [buildWishlistButton(await isInWishlist(callerId, item.id), item.id)];
         const inlineMarkup = {
           inline_keyboard: [
             [
@@ -5697,6 +6185,8 @@ module.exports = async function handler(req, res) {
             ],
           ],
         };
+
+        inlineMarkup.inline_keyboard.splice(1, 0, wlRowMarkup);
 
         if (item.photo_id) {
           await tgRequest(token, "sendPhoto", {
@@ -6161,6 +6651,13 @@ module.exports = async function handler(req, res) {
         isNewUser = Number(addedRes) === 1;
       }
 
+      // Ringkasan harian untuk admin (sekali per hari)
+      try {
+        await maybeSendDailySummary(token);
+      } catch (sumErr) {
+        console.error("Ringkasan harian error:", sumErr);
+      }
+
       // Hadiah leaderboard bulan lalu (jalan sekali per bulan, otomatis)
       try {
         await maybeAwardLastMonth(token);
@@ -6182,6 +6679,7 @@ module.exports = async function handler(req, res) {
 
           await saveRating(pendingRate.order_id, senderId, buyerFullName, pendingRate.stars, komentar);
           await clearPendingRating(senderId);
+          await rewardReview(token, chatId, senderId, pendingRate.order_id);
 
           await tgRequest(token, "sendMessage", {
             chat_id: chatId,
@@ -6228,6 +6726,40 @@ module.exports = async function handler(req, res) {
       }
       if (/^\/panduan(\s|$)/i.test(rawText)) {
         await sendPanduan(token, chatId, "root");
+        return res.status(200).json({ ok: true });
+      }
+
+      // MITRA
+      if (/^\/daftarmitra(\s|$)/i.test(rawText)) {
+        await registerMitra(token, msg, rawText.replace(/^\/daftarmitra\s*/i, ""));
+        return res.status(200).json({ ok: true });
+      }
+      if (/^\/mitra(\s|$)/i.test(rawText) && msg.chat.type === "private") {
+        if (await isMitra(senderId)) {
+          await sendMitraInfo(token, chatId, String(senderId));
+        } else {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            parse_mode: "HTML",
+            text: "Kamu belum jadi mitra. Daftar dengan <code>/daftarmitra KODE</code>, contoh <code>/daftarmitra kiko99</code>.",
+          });
+        }
+        return res.status(200).json({ ok: true });
+      }
+      if (isAdmin && /^\/cabutmitra(\s|$)/i.test(rawText)) {
+        const targetUid = rawText.replace(/^\/cabutmitra\s*/i, "").trim();
+        const ok = /^\d{5,15}$/.test(targetUid) ? await removeMitra(token, targetUid) : false;
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: ok ? `✅ ${targetUid} sudah bukan mitra lagi.` : "ID tidak valid atau bukan mitra.",
+          reply_to_message_id: msg.message_id,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // WISHLIST
+      if (/^\/wishlist(\s|$)/i.test(rawText) || rawText === "⭐ Wishlist") {
+        await sendWishlist(token, chatId, senderId);
         return res.status(200).json({ ok: true });
       }
 
@@ -7780,7 +8312,16 @@ module.exports = async function handler(req, res) {
           }
         }
 
-        if (text === "/start" || startRefMatch) {
+        const startMitraMatch = /^\/start\s+m_([a-z0-9]{3,16})$/i.exec(text);
+        if (startMitraMatch) {
+          try {
+            await recordMitraReferral(senderId, startMitraMatch[1], isNewUser);
+          } catch (mitraRecErr) {
+            console.error("Mitra record error:", mitraRecErr);
+          }
+        }
+
+        if (text === "/start" || startRefMatch || startMitraMatch) {
           const buyerName = escapeHtml((msg.from && msg.from.first_name) || "Kak");
           let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.`;
 
