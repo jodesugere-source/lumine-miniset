@@ -11,6 +11,20 @@ const RESELLER_PRICE_STANDAR = 2000; // harga reseller Paket Standar (retail Rp 
 const RESELLER_MIN_ORDER = 10; // minimal ambil set per order
 const DEFAULT_MACRO_SECRET = "lumineacc2026";
 
+// ---- TIER RESELLER (berdasarkan total omset kumulatif; URUT dari kecil ke besar) ----
+// Tier otomatis naik saat omset reseller mencapai min_omset. Ubah angka sesuai kebutuhan.
+const RESELLER_TIERS = [
+  { name: "🥉 Bronze", min_omset: 0, price_lite: RESELLER_PRICE_LITE, price_standar: RESELLER_PRICE_STANDAR },
+  { name: "🥈 Silver", min_omset: 100000, price_lite: 1100, price_standar: 1850 },
+  { name: "🥇 Gold", min_omset: 300000, price_lite: 1000, price_standar: 1700 },
+  { name: "💎 Platinum", min_omset: 750000, price_lite: 900, price_standar: 1500 },
+];
+
+// ---- UPSELL SETELAH PEMBAYARAN DI-ACC ----
+const UPSELL_ENABLED = true; // false = matikan fitur upsell
+const UPSELL_DISCOUNT_PERCENT = 10; // diskon untuk set tawaran
+const UPSELL_WINDOW_MINUTES = 10; // lama penawaran berlaku
+
 const REDIS_KEY = "lumine_main_katalog";
 const REDIS_BUNDLE_KEY = "lumine_main_bundle";
 const REDIS_QRIS_KEY = "lumine_main_qris";
@@ -37,6 +51,7 @@ const REDIS_STORE_OMSET_CNT_KEY = "lumine_main_store_omset_cnt";
 const REDIS_RATING_KEY = "lumine_main_rating_list";
 const REDIS_RATING_SUMMARY_KEY = "lumine_main_rating_summary";
 const REDIS_RATING_PENDING_KEY = "lumine_main_rating_pending";
+const REDIS_UPSELL_PREFIX = "lumine_main_upsell_";
 
 function escapeHtml(str) {
   return String(str || "")
@@ -140,10 +155,102 @@ async function getResellerOmset(userId) {
 }
 
 async function addResellerOmset(userId, nominal) {
-  await Promise.all([
-    redisCommand(["HINCRBY", REDIS_RESELLER_OMSET_KEY, String(userId), Math.round(Number(nominal) || 0)]),
+  const add = Math.round(Number(nominal) || 0);
+  const [rp, cnt] = await Promise.all([
+    redisCommand(["HINCRBY", REDIS_RESELLER_OMSET_KEY, String(userId), add]),
     redisCommand(["HINCRBY", REDIS_RESELLER_OMSET_CNT_KEY, String(userId), 1]),
   ]);
+  return { rupiah: parseInt(rp, 10) || 0, count: parseInt(cnt, 10) || 0, added: add };
+}
+
+// ---- TIER RESELLER: HITUNG & TAMPILAN ----
+function getResellerTierInfo(omsetRupiah) {
+  const omset = Number(omsetRupiah) || 0;
+  let index = 0;
+  for (let i = 0; i < RESELLER_TIERS.length; i++) {
+    if (omset >= RESELLER_TIERS[i].min_omset) index = i;
+  }
+  const tier = RESELLER_TIERS[index];
+  const next = RESELLER_TIERS[index + 1] || null;
+  return {
+    index,
+    tier,
+    next,
+    remaining: next ? Math.max(0, next.min_omset - omset) : 0,
+  };
+}
+
+function buildTierSummaryLines(info) {
+  const t = info.tier;
+  let out =
+    `🏅 <b>Tier:</b> ${t.name}\n` +
+    `💲 <b>Harga Tier:</b> Lite <code>${formatRupiah(t.price_lite)}</code> • Standar <code>${formatRupiah(t.price_standar)}</code>\n`;
+  out += info.next
+    ? `🎯 <b>Naik ke ${info.next.name}:</b> kurang <code>${formatRupiah(info.remaining)}</code> lagi`
+    : "🏆 <b>Kamu sudah di tier tertinggi!</b>";
+  return out;
+}
+
+function buildTierLadderBlock() {
+  let out = "╭─── 💰 <b>HARGA RESELLER PER TIER</b> ───\n";
+  for (const t of RESELLER_TIERS) {
+    const syarat = t.min_omset > 0 ? `omset ≥ ${formatRupiah(t.min_omset)}` : "tier awal";
+    out +=
+      `│ ${t.name} <i>(${syarat})</i>\n` +
+      `│    Lite <code>${formatRupiah(t.price_lite)}</code> • Standar <code>${formatRupiah(t.price_standar)}</code>\n`;
+  }
+  out += `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n`;
+  out += "╰────────────────────\n\n";
+  return out;
+}
+
+function buildMyTierBlock(omset, info) {
+  const t = info.tier;
+  let out =
+    "╭─── 🏅 <b>TIER KAMU</b> ───\n" +
+    `│ • Tier : <b>${t.name}</b>\n` +
+    `│ • Omset : <code>${formatRupiah(omset.rupiah)}</code>\n` +
+    `│ • <b>Paket Lite</b> : <code>${formatRupiah(t.price_lite)}</code>\n` +
+    `│ • <b>Paket Standar</b> : <code>${formatRupiah(t.price_standar)}</code>\n` +
+    `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n`;
+  out += info.next
+    ? `│ 🎯 Naik ke <b>${info.next.name}</b> kurang <code>${formatRupiah(info.remaining)}</code> lagi ` +
+      `(Lite ${formatRupiah(info.next.price_lite)} • Standar ${formatRupiah(info.next.price_standar)})\n`
+    : "│ 🏆 Kamu sudah di tier tertinggi!\n";
+  out += "╰────────────────────\n\n";
+  return out;
+}
+
+async function notifyResellerTierUp(token, order, result) {
+  const before = getResellerTierInfo(result.rupiah - result.added);
+  const after = getResellerTierInfo(result.rupiah);
+  if (after.index <= before.index) return;
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: order.buyer_id,
+    text:
+      `🎉 <b>SELAMAT, KAMU NAIK TIER!</b>\n\n` +
+      `${before.tier.name} ➜ <b>${after.tier.name}</b>\n\n` +
+      `💲 <b>Harga baru:</b> Lite <code>${formatRupiah(after.tier.price_lite)}</code> • Standar <code>${formatRupiah(after.tier.price_standar)}</code>\n\n` +
+      `<i>Hubungi admin saat order grosir biar harga tier barumu dipakai ya!</i>`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [[{ text: "📊 Cek Omset Saya", callback_data: "reseller_omset_self" }]],
+    },
+  });
+
+  const qris = await getQris();
+  if (qris && qris.admin_chat_id) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: qris.admin_chat_id,
+      text:
+        `🏅 <b>RESELLER NAIK TIER</b>\n\n` +
+        `👤 ${escapeHtml(order.buyer_name)} (<code>${escapeHtml(String(order.buyer_id))}</code>)\n` +
+        `${before.tier.name} ➜ <b>${after.tier.name}</b>\n` +
+        `💰 Omset: <code>${formatRupiah(result.rupiah)}</code>`,
+      parse_mode: "HTML",
+    });
+  }
 }
 
 async function addStoreOmset(nominal) {
@@ -680,6 +787,151 @@ async function buildLeaderboardPayload(period, viewerId) {
 
   return { text, reply_markup };
 }
+// ---- UPSELL: PENAWARAN SET BERIKUTNYA SETELAH ACC ----
+function formatWibClock(ms) {
+  const d = new Date(ms + 7 * 3600 * 1000);
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mm = String(d.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm} WIB`;
+}
+
+function calcUpsellDiscount(baseNominal, percent) {
+  const base = Number(baseNominal) || 0;
+  const raw = Math.round(((base * (Number(percent) || 0)) / 100) / 50) * 50;
+  return Math.max(0, Math.min(raw, base - 500));
+}
+
+async function getUpsellOffer(userId) {
+  const raw = await redisCommand(["GET", `${REDIS_UPSELL_PREFIX}${userId}`]);
+  if (!raw) return null;
+  try {
+    const offer = JSON.parse(raw);
+    if (!offer || !offer.item_id || Number(offer.expires_at) <= Date.now()) return null;
+    return offer;
+  } catch {
+    return null;
+  }
+}
+
+async function saveUpsellOffer(userId, offer) {
+  await redisCommand([
+    "SET",
+    `${REDIS_UPSELL_PREFIX}${userId}`,
+    JSON.stringify(offer),
+    "EX",
+    String(UPSELL_WINDOW_MINUTES * 60 + 60),
+  ]);
+}
+
+async function clearUpsellOffer(userId) {
+  await redisCommand(["DEL", `${REDIS_UPSELL_PREFIX}${userId}`]);
+}
+
+// Pilih diskon terbaik (tidak ditumpuk): voucher aktif ATAU penawaran upsell untuk set tsb.
+async function resolveBestDiscount(userId, itemId, baseNominal) {
+  const maxCut = Math.max(0, baseNominal - 500);
+
+  let voucherDisc = 0;
+  let voucher = null;
+  const activeVoucher = await getActiveUserVoucher(userId);
+  if (activeVoucher) {
+    voucherDisc = Math.min(Number(activeVoucher.discount) || 0, maxCut);
+    if (voucherDisc > 0) voucher = activeVoucher;
+  }
+
+  let upsellDisc = 0;
+  const offer = itemId ? await getUpsellOffer(userId) : null;
+  if (offer && String(offer.item_id) === String(itemId)) {
+    upsellDisc = Math.min(calcUpsellDiscount(baseNominal, offer.percent), maxCut);
+  }
+
+  if (upsellDisc > 0 && upsellDisc >= voucherDisc) {
+    return { source: "upsell", discount: upsellDisc, code: "UPSELL" };
+  }
+  if (voucherDisc > 0) {
+    return { source: "voucher", discount: voucherDisc, code: voucher.code };
+  }
+  return { source: "", discount: 0, code: "" };
+}
+
+async function consumeDiscountSource(userId, source) {
+  if (source === "upsell") await clearUpsellOffer(userId);
+  else if (source === "voucher") await clearActiveUserVoucher(userId);
+}
+
+function buildDiscountLine(source, code, discount) {
+  if (!(discount > 0)) return "";
+  if (source === "upsell") {
+    return `🔥 <b>Diskon Spesial (Upsell):</b> -${formatRupiah(discount)}\n`;
+  }
+  return `🎟️ <b>Voucher (${escapeHtml(code)}):</b> -${formatRupiah(discount)}\n`;
+}
+
+async function sendUpsellOffer(token, order, ctx) {
+  if (!UPSELL_ENABLED || order.is_deposit || ctx.isReseller) return;
+
+  const percent = UPSELL_DISCOUNT_PERCENT;
+  const koleksi = await getKoleksi(order.buyer_id);
+  const ownedNames = new Set(koleksi.map((k) => k.nama));
+
+  const candidates = (ctx.katalogList || [])
+    .filter((k) => {
+      if (!k || !k.id || String(k.id) === String(ctx.boughtItemId)) return false;
+      if (ownedNames.has(k.nama)) return false;
+      const hasLinks = (Array.isArray(k.links) && k.links.length > 0) || Boolean(k.link);
+      const hasFiles = Array.isArray(k.files) && k.files.length > 0;
+      if (!hasLinks && !hasFiles) return false;
+      return calcUpsellDiscount(parseNominal(k.harga), percent) > 0;
+    })
+    .sort((a, b) => (Number(b.sold) || 0) - (Number(a.sold) || 0));
+
+  const pick = candidates[0];
+  if (!pick) return;
+
+  const base = parseNominal(pick.harga);
+  const discount = calcUpsellDiscount(base, percent);
+  const finalPrice = base - discount;
+  const expiresAt = Date.now() + UPSELL_WINDOW_MINUTES * 60 * 1000;
+
+  await saveUpsellOffer(order.buyer_id, {
+    item_id: String(pick.id),
+    percent,
+    expires_at: expiresAt,
+  });
+
+  const text =
+    `🔥 <b>PENAWARAN SPESIAL, KHUSUS KAMU!</b>\n\n` +
+    `Makasih udah belanja! Ambil set berikutnya dengan <b>diskon ${percent}%</b> — berlaku <b>${UPSELL_WINDOW_MINUTES} menit</b> saja.\n\n` +
+    `🎁 <b>${escapeHtml(pick.nama)}</b>\n` +
+    (pick.isi ? `📦 ${escapeHtml(pick.isi)}\n` : "") +
+    `💰 <s>${formatRupiah(base)}</s> ➜ <b>${formatRupiah(finalPrice)}</b>\n` +
+    `⏳ Berlaku sampai <b>${formatWibClock(expiresAt)}</b>`;
+
+  const replyMarkup = {
+    inline_keyboard: [
+      [{ text: `🛒 Ambil Diskon ${percent}% — ${formatRupiah(finalPrice)}`, callback_data: `buy_${pick.id}` }],
+      [{ text: "🛍️ Lihat Katalog", callback_data: "menu_katalog" }],
+    ],
+  };
+
+  if (pick.photo_id) {
+    await tgRequest(token, "sendPhoto", {
+      chat_id: order.buyer_id,
+      photo: pick.photo_id,
+      caption: text,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  } else {
+    await tgRequest(token, "sendMessage", {
+      chat_id: order.buyer_id,
+      text,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  }
+}
+
 async function createOrder(
   user,
   itemNama,
@@ -697,14 +949,16 @@ async function createOrder(
   let discount = Number(extraFields && extraFields.preset_discount) || 0;
   let voucherCode = (extraFields && extraFields.preset_voucher_code) || "";
 
-  if (!isDeposit && discount === 0 && !voucherCode) {
-    const activeVoucher = await getActiveUserVoucher(user.id);
-    if (activeVoucher) {
-      discount = Math.min(Number(activeVoucher.discount) || 0, Math.max(0, baseNominal - 500));
-      if (discount > 0) {
-        voucherCode = activeVoucher.code;
-        await clearActiveUserVoucher(user.id);
-      }
+  let upsellApplied = Boolean(extraFields && extraFields.upsell);
+
+  const skipLookup = Boolean(extraFields && extraFields.skip_discount_lookup);
+  if (!isDeposit && !skipLookup && discount === 0 && !voucherCode) {
+    const best = await resolveBestDiscount(user.id, itemId, baseNominal);
+    if (best.discount > 0) {
+      discount = best.discount;
+      voucherCode = best.code;
+      upsellApplied = best.source === "upsell";
+      await consumeDiscountSource(user.id, best.source);
     }
   }
 
@@ -722,6 +976,7 @@ async function createOrder(
     base_nominal: baseNominal,
     discount: discount,
     voucher_code: voucherCode,
+    upsell: upsellApplied,
     final_base_nominal: finalBaseNominal,
     kode_unik: kodeUnik,
     total_nominal: totalNominal,
@@ -921,8 +1176,13 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
     addKoleksi(order.buyer_id, deliveredName, deliveredLinks[0] || ""),
     addStoreOmset(order.total_nominal),
   ];
+  let resellerResult = null;
   if (buyerIsReseller) {
-    omsetTasks.push(addResellerOmset(order.buyer_id, order.total_nominal));
+    omsetTasks.push(
+      addResellerOmset(order.buyer_id, order.total_nominal).then((r) => {
+        resellerResult = r;
+      })
+    );
   }
   await Promise.all(omsetTasks);
 
@@ -960,6 +1220,26 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
     } else {
       await tgRequest(token, "sendPhoto", { chat_id: order.buyer_id, photo: f.file_id });
     }
+  }
+
+  // NOTIF NAIK TIER RESELLER (tidak boleh mengganggu proses ACC)
+  if (resellerResult) {
+    try {
+      await notifyResellerTierUp(token, order, resellerResult);
+    } catch (tierErr) {
+      console.error("Tier Up Notif Error:", tierErr);
+    }
+  }
+
+  // UPSELL: TAWARKAN SET BERIKUTNYA DENGAN DISKON BERBATAS WAKTU
+  try {
+    await sendUpsellOffer(token, order, {
+      katalogList,
+      boughtItemId: soldItemId,
+      isReseller: buyerIsReseller,
+    });
+  } catch (upsellErr) {
+    console.error("Upsell Error:", upsellErr);
   }
 
   return { deliveredName, deliveredLink: deliveredLinks[0] || "" };
@@ -1125,13 +1405,10 @@ async function sendMainMenuCard(token, chatId) {
         { text: "🎟️ Pakai Voucher", callback_data: "menu_voucher" },
       ],
       [
-        { text: "💎 Upgrade CH Utama", callback_data: "menu_upgrade" },
         { text: "📋 Cara Order", callback_data: "menu_cara" },
-      ],
-      [
         { text: "🤝 Menu Reseller", callback_data: "menu_reseller" },
-        { text: "🔗 Channel Lainnya", callback_data: "menu_channel" },
       ],
+      [{ text: "🔗 Channel Lainnya", callback_data: "menu_channel" }],
       [{ text: `💬 Admin (@${ADMIN_USERNAME})`, url: `https://t.me/${ADMIN_USERNAME}` }],
     ],
   };
@@ -1450,6 +1727,11 @@ async function sendResellerMenu(token, chatId, user) {
   );
 
   const statusReseller = await isReseller(userId);
+  let tierBlock = buildTierLadderBlock();
+  if (statusReseller) {
+    const myOmset = await getResellerOmset(userId);
+    tierBlock = buildMyTierBlock(myOmset, getResellerTierInfo(myOmset.rupiah));
+  }
   const statusLine = statusReseller
     ? "✅ <b>Status Kamu: Reseller Aktif</b>\n\n"
     : "";
@@ -1472,13 +1754,10 @@ async function sendResellerMenu(token, chatId, user) {
       "🤝 <b>MENU RESELLER | PHOTOPACK</b>\n" +
       "<i>Jual ulang foto pack Lumine dengan harga grosir</i>\n\n" +
       statusLine +
-      "╭─── 💰 <b>HARGA RESELLER</b> ───\n" +
-      `│ • <b>Paket Lite</b> (5–7 Foto) : <code>${formatRupiah(RESELLER_PRICE_LITE)}</code>\n` +
-      `│ • <b>Paket Standar</b> (8–10 Foto) : <code>${formatRupiah(RESELLER_PRICE_STANDAR)}</code>\n` +
-      `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n` +
-      "╰────────────────────\n\n" +
+      tierBlock +
       "╭─── 🌟 <b>KEUNTUNGAN</b> ───\n" +
       "│ ✅ Harga lebih murah dari harga retail\n" +
+      "│ ✅ Naik tier otomatis → harga makin murah\n" +
       "│ ✅ Koleksi Photopack HD tanpa watermark\n" +
       "│ ✅ Update set baru dari katalog\n" +
       "│ ✅ Dibantu langsung oleh admin\n" +
@@ -1515,27 +1794,6 @@ async function sendCaraOrder(token, chatId) {
           { text: "🛍️ Buka Katalog", callback_data: "menu_katalog" },
           { text: "💰 Isi Saldo", callback_data: "menu_saldo" },
         ],
-        [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
-      ],
-    },
-  });
-}
-
-async function sendUpgradeCh(token, chatId) {
-  await tgRequest(token, "sendMessage", {
-    chat_id: chatId,
-    text:
-      "💎 <b>UPGRADE KE FULL SET (CHANNEL UTAMA)</b>\n\n" +
-      "╭─── 🌟 <b>KEUNTUNGAN VIP</b> ───\n" +
-      "│ ✅ Full Set lengkap (<b>20 – 40+ foto HD</b>)\n" +
-      "│ ✅ <b>Bonus Video</b> eksklusif\n" +
-      "│ ✅ Harga mulai <b>Rp 5.000 – Rp 10.000</b>\n" +
-      "╰─────────────────────\n\n" +
-      "Klik tombol di bawah untuk chat admin langsung 👇",
-    parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "💬 Chat Admin untuk Join CH Utama", url: `https://t.me/${ADMIN_USERNAME}` }],
         [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
       ],
     },
@@ -1649,10 +1907,11 @@ async function sendQrisInvoiceForTarget(token, chatId, user, target) {
     }
   );
 
-  const discountLine =
-    order.discount > 0
-      ? `🎟️ <b>Voucher (${escapeHtml(order.voucher_code)}):</b> -${formatRupiah(order.discount)}\n`
-      : "";
+  const discountLine = buildDiscountLine(
+    order.upsell ? "upsell" : "voucher",
+    order.voucher_code,
+    order.discount
+  );
 
   const invoiceCaption =
     `🧾 <b>INVOICE PESANAN #${order.id}</b>\n\n` +
@@ -1921,8 +2180,6 @@ module.exports = async function handler(req, res) {
         await sendPromoBundling(token, chatId);
       } else if (data === "menu_cara") {
         await sendCaraOrder(token, chatId);
-      } else if (data === "menu_upgrade") {
-        await sendUpgradeCh(token, chatId);
       } else if (data === "menu_channel") {
         await sendChannelLainnya(token, chatId);
       } else if (data === "menu_reseller") {
@@ -2054,18 +2311,9 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        let discount = 0;
-        let voucherCode = "";
-        const activeVoucher = await getActiveUserVoucher(callerId);
-        if (activeVoucher) {
-          discount = Math.min(
-            Number(activeVoucher.discount) || 0,
-            Math.max(0, target.baseNominal - 500)
-          );
-          if (discount > 0) {
-            voucherCode = activeVoucher.code;
-          }
-        }
+        const bestDiscount = await resolveBestDiscount(callerId, target.itemId, target.baseNominal);
+        const discount = bestDiscount.discount;
+        const voucherCode = bestDiscount.code;
 
         const finalPrice = Math.max(500, target.baseNominal - discount);
         const deduction = await deductUserSaldo(callerId, finalPrice);
@@ -2089,7 +2337,7 @@ module.exports = async function handler(req, res) {
         }
 
         if (discount > 0) {
-          await clearActiveUserVoucher(callerId);
+          await consumeDiscountSource(callerId, bestDiscount.source);
         }
 
         const order = await createOrder(
@@ -2104,6 +2352,8 @@ module.exports = async function handler(req, res) {
             paid_with_saldo: true,
             preset_discount: discount,
             preset_voucher_code: voucherCode,
+            upsell: bestDiscount.source === "upsell",
+            skip_discount_lookup: true,
             target_links: target.targetLinks || [],
             target_files: target.targetFiles || [],
           }
@@ -2136,21 +2386,16 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        const [saldo, activeV] = await Promise.all([
+        const [saldo, bestDiscount] = await Promise.all([
           getUserSaldo(callerId),
-          getActiveUserVoucher(callerId),
+          resolveBestDiscount(callerId, target.itemId, target.baseNominal),
         ]);
-        const discount = activeV
-          ? Math.min(Number(activeV.discount) || 0, Math.max(0, target.baseNominal - 500))
-          : 0;
+        const discount = bestDiscount.discount;
         const effectivePrice = Math.max(500, target.baseNominal - discount);
 
         if (saldo >= effectivePrice) {
           const sisaSaldo = saldo - effectivePrice;
-          const voucherLine =
-            discount > 0
-              ? `🎟️ <b>Voucher (${escapeHtml(activeV.code)}):</b> -${formatRupiah(discount)}\n`
-              : "";
+          const voucherLine = buildDiscountLine(bestDiscount.source, bestDiscount.code, discount);
 
           await tgRequest(token, "sendMessage", {
             chat_id: chatId,
@@ -2348,13 +2593,15 @@ module.exports = async function handler(req, res) {
           });
         } else {
           const omset = await getResellerOmset(callerId);
+          const tierInfo = getResellerTierInfo(omset.rupiah);
           await tgRequest(token, "sendMessage", {
             chat_id: chatId,
             text:
               "📊 <b>OMSET RESELLER KAMU</b>\n" +
               "━━━━━━━━━━━━━━━━━━━━\n" +
               `💰 <b>Total Omset:</b> <code>${formatRupiah(omset.rupiah)}</code>\n` +
-              `🧾 <b>Total Transaksi:</b> <b>${omset.count}x</b>`,
+              `🧾 <b>Total Transaksi:</b> <b>${omset.count}x</b>\n\n` +
+              buildTierSummaryLines(tierInfo),
             parse_mode: "HTML",
           });
         }
@@ -2591,7 +2838,7 @@ module.exports = async function handler(req, res) {
           const omset = await getResellerOmset(uid);
           listText +=
             `• <b>${escapeHtml(info.nama || "Reseller")}</b> (<code>${escapeHtml(uid)}</code>)\n` +
-            `  💰 Omset: <code>${formatRupiah(omset.rupiah)}</code> • 🧾 ${omset.count}x transaksi\n`;
+            `  🏅 ${getResellerTierInfo(omset.rupiah).tier.name} • 💰 Omset: <code>${formatRupiah(omset.rupiah)}</code> • 🧾 ${omset.count}x transaksi\n`;
         }
         listText += `\nTotal: <b>${ids.length} reseller</b>`;
         await tgRequest(token, "sendMessage", { chat_id: chatId, text: listText, parse_mode: "HTML" });
@@ -2621,6 +2868,7 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
         const omset = await getResellerOmset(targetUid);
+        const tierInfo = getResellerTierInfo(omset.rupiah);
         await tgRequest(token, "sendMessage", {
           chat_id: chatId,
           text:
@@ -2628,7 +2876,8 @@ module.exports = async function handler(req, res) {
             `━━━━━━━━━━━━━━━━━━━━\n` +
             `👤 <b>${escapeHtml(info.nama || "Reseller")}</b> (<code>${escapeHtml(targetUid)}</code>)\n` +
             `💰 <b>Total Omset:</b> <code>${formatRupiah(omset.rupiah)}</code>\n` +
-            `🧾 <b>Total Transaksi:</b> <b>${omset.count}x</b>`,
+            `🧾 <b>Total Transaksi:</b> <b>${omset.count}x</b>\n\n` +
+            buildTierSummaryLines(tierInfo),
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
@@ -3611,7 +3860,6 @@ module.exports = async function handler(req, res) {
         } else if (text === "📋 Cara Order" || text === "📋 Cara Beli & Aturan") {
           await sendCaraOrder(token, chatId);
         } else if (text === "💎 Info & Channel") {
-          await sendUpgradeCh(token, chatId);
           await sendChannelLainnya(token, chatId);
         } else if (text === "🤝 Reseller" || text === "/reseller") {
           await sendResellerMenu(token, chatId, msg.from);
