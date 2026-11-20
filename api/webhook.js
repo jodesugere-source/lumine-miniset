@@ -841,39 +841,67 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
 
   const katalogList = await getKatalog();
   let deliveredName = order.item_nama;
-  let deliveredLink = order.target_link;
+  let deliveredLinks =
+    Array.isArray(order.target_links) && order.target_links.length > 0
+      ? order.target_links
+      : order.target_link
+      ? [order.target_link]
+      : [];
+  let deliveredFiles = Array.isArray(order.target_files) ? order.target_files : [];
   let soldItemId = order.item_id || "";
   let buyerText = "";
 
   if (order.is_mystery) {
     const bundle = await getBundle();
-    const pool = katalogList.map((k) => ({ id: String(k.id), nama: k.nama, link: k.link }));
+    const pool = katalogList.map((k) => ({
+      id: String(k.id),
+      nama: k.nama,
+      links:
+        Array.isArray(k.links) && k.links.length > 0 ? k.links : k.link ? [k.link] : [],
+      files: Array.isArray(k.files) ? k.files : [],
+    }));
     if (bundle.link && bundle.link.trim() !== "") {
-      pool.push({ id: "", nama: "🌟 JACKPOT: Promo Bundling 2 Photopack", link: bundle.link });
+      pool.push({
+        id: "",
+        nama: "🌟 JACKPOT: Promo Bundling 2 Photopack",
+        links: [bundle.link],
+        files: [],
+      });
     }
     const won =
       pool.length > 0
         ? pool[Math.floor(Math.random() * pool.length)]
-        : { id: "", nama: "Paket Spesial Lumine", link: `https://t.me/${ADMIN_USERNAME}` };
+        : { id: "", nama: "Paket Spesial Lumine", links: [`https://t.me/${ADMIN_USERNAME}`], files: [] };
 
     soldItemId = won.id;
     deliveredName = won.nama;
-    deliveredLink = normalizeUrl(won.link);
+    deliveredLinks = (won.links || []).map(normalizeUrl);
+    deliveredFiles = won.files || [];
+
+    const linksBlock =
+      deliveredLinks.length > 0
+        ? deliveredLinks.map((l) => `🔗 ${escapeHtml(l)}`).join("\n")
+        : "<i>(File dikirim langsung di pesan berikutnya)</i>";
 
     buyerText =
       `🎲 <b>MYSTERY BOX TERBUKA! (Pesanan #${order.id})</b> 🎲\n\n` +
       `Selamat! Kamu mendapatkan hadiah:\n` +
       `🎁 <b>${escapeHtml(deliveredName)}</b>\n\n` +
-      `Berikut link akses hadiah kamu:\n` +
-      `🔗 ${escapeHtml(deliveredLink)}\n\n` +
+      `Berikut akses hadiah kamu:\n` +
+      `${linksBlock}\n\n` +
       `<i>Hadiah tersimpan di 🎒 Koleksi Saya & poin masuk ke Leaderboard!</i>`;
   } else {
-    deliveredLink = normalizeUrl(order.target_link);
+    deliveredLinks = deliveredLinks.map(normalizeUrl);
+    const linksBlock =
+      deliveredLinks.length > 0
+        ? deliveredLinks.map((l) => `🔗 ${escapeHtml(l)}`).join("\n")
+        : "<i>(File dikirim langsung di pesan berikutnya)</i>";
+
     buyerText =
       `🎉 <b>PEMBAYARAN DI-ACC! (Pesanan #${order.id})</b>\n\n` +
       `Terima kasih telah membeli <b>${escapeHtml(deliveredName)}</b>!\n` +
-      `Berikut link akses file kamu:\n` +
-      `🔗 ${escapeHtml(deliveredLink)}\n\n` +
+      `Berikut akses file kamu:\n` +
+      `${linksBlock}\n\n` +
       `<i>Link tersimpan otomatis di 🎒 Koleksi Saya & poin masuk ke Leaderboard!</i>`;
   }
 
@@ -890,7 +918,7 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
   const buyerIsReseller = await isReseller(order.buyer_id);
   const omsetTasks = [
     recordPurchaseToLeaderboard(order),
-    addKoleksi(order.buyer_id, deliveredName, deliveredLink),
+    addKoleksi(order.buyer_id, deliveredName, deliveredLinks[0] || ""),
     addStoreOmset(order.total_nominal),
   ];
   if (buyerIsReseller) {
@@ -901,13 +929,20 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
   const updatedAllCnt = await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(order.buyer_id)]);
   await sendTestimonialToChannel(token, order, deliveredName, updatedAllCnt);
 
+  const linkButtonRows = deliveredLinks.slice(0, 8).map((link, i) => [
+    {
+      text: deliveredLinks.length > 1 ? `📂 Buka File ${i + 1}` : "📂 Buka Link File Sekarang",
+      url: link,
+    },
+  ]);
+
   await tgRequest(token, "sendMessage", {
     chat_id: order.buyer_id,
     text: buyerText,
     parse_mode: "HTML",
     reply_markup: {
       inline_keyboard: [
-        [{ text: "📂 Buka Link File Sekarang", url: deliveredLink }],
+        ...linkButtonRows,
         [{ text: "⭐ Beri Rating & Ulasan", callback_data: `rate_init_${order.id}` }],
         [
           { text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" },
@@ -917,7 +952,17 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
     },
   });
 
-  return { deliveredName, deliveredLink };
+  // KIRIM FILE YANG DI-UPLOAD ADMIN LANGSUNG (FOTO/DOKUMEN) KE PEMBELI
+  for (const f of deliveredFiles) {
+    if (!f || !f.file_id) continue;
+    if (f.type === "document") {
+      await tgRequest(token, "sendDocument", { chat_id: order.buyer_id, document: f.file_id });
+    } else {
+      await tgRequest(token, "sendPhoto", { chat_id: order.buyer_id, photo: f.file_id });
+    }
+  }
+
+  return { deliveredName, deliveredLink: deliveredLinks[0] || "" };
 }
 
 function normalizeUrl(rawUrl) {
@@ -1121,8 +1166,45 @@ async function sendMainMenuCard(token, chatId) {
     return;
   }
 
+  const miniCount = katalogList.filter((k) => (k.kategori || "mini") !== "full").length;
+  const fullCount = katalogList.filter((k) => k.kategori === "full").length;
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "╭─── 🛍️ <b>KATALOG PHOTOPACK</b> ───\n" +
+      "│ Mau yang Mini Set atau Full Set?\n" +
+      "│ Pilih kategori di bawah ini dulu ya 👇\n" +
+      "╰─────────────────────",
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `🧩 Mini Set (${miniCount})`, callback_data: "menu_katalog_mini" }],
+        [{ text: `📦 Full Set (${fullCount})`, callback_data: "menu_katalog_full" }],
+        [{ text: "🔥 Lihat Top Bestseller", callback_data: "menu_bestseller" }],
+        [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
+      ],
+    },
+  });
+}
+
+async function sendKatalogListByCategory(token, chatId, kategori) {
+  const katalogList = await getKatalog();
+  const filtered = katalogList.filter((item) => (item.kategori || "mini") === kategori);
+
+  if (filtered.length === 0) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `📂 Belum ada produk di kategori ini. Hubungi @${ADMIN_USERNAME} untuk info stok terbaru.`,
+      reply_markup: {
+        inline_keyboard: [[{ text: "🔙 Kembali ke Kategori", callback_data: "menu_katalog" }]],
+      },
+    });
+    return;
+  }
+
   const rankMap = getRankedKatalog(katalogList);
-  const rows = katalogList.map((item) => {
+  const rows = filtered.map((item) => {
     const sold = Number(item.sold) || 0;
     const rank = rankMap[String(item.id)];
     let prefix = "📸";
@@ -1144,14 +1226,15 @@ async function sendMainMenuCard(token, chatId) {
     ];
   });
   rows.push([
-    { text: "🔥 Lihat Top Bestseller", callback_data: "menu_bestseller" },
-    { text: "🔙 Menu Utama", callback_data: "menu_home" },
+    { text: "🔙 Kembali ke Kategori", callback_data: "menu_katalog" },
+    { text: "🏠 Menu Utama", callback_data: "menu_home" },
   ]);
 
+  const kategoriLabel = kategori === "full" ? "📦 FULL SET" : "🧩 MINI SET";
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
     text:
-      "╭─── 🛍️ <b>KATALOG PHOTOPACK</b> ───\n" +
+      `╭─── 🛍️ <b>KATALOG ${kategoriLabel}</b> ───\n` +
       "│ Pilih judul di bawah untuk melihat\n" +
       "│ <b>foto preview</b> & bayar via Saldo / QRIS:\n" +
       "╰─────────────────────\n" +
@@ -1301,12 +1384,14 @@ async function sendMysteryMenu(token, chatId) {
   const buttons = [];
   showItems.forEach((item, i) => {
     text += `│ <b>${i + 1}.</b> ${escapeHtml(item.nama)} <i>(${item.date})</i>\n`;
-    buttons.push([
-      {
-        text: `📂 Buka: ${item.nama.slice(0, 28)}`,
-        url: normalizeUrl(item.link),
-      },
-    ]);
+    if (item.link) {
+      buttons.push([
+        {
+          text: `📂 Buka: ${item.nama.slice(0, 28)}`,
+          url: normalizeUrl(item.link),
+        },
+      ]);
+    }
   });
   text += "╰───────────────────────\n\nKetuk tombol di bawah untuk membuka ulang file kapan saja 👇";
 
@@ -1491,6 +1576,8 @@ async function sendChannelLainnya(token, chatId) {
       itemNama: "🎲 Mystery Box Gacha Photopack",
       baseNominal: cfg.price || 3000,
       targetLink: "MYSTERY_GACHA",
+      targetLinks: [],
+      targetFiles: [],
       isMystery: true,
     };
   }
@@ -1509,6 +1596,8 @@ async function sendChannelLainnya(token, chatId) {
       itemNama: "Promo Bundling 2 Photopack",
       baseNominal: 5000,
       targetLink: bundle.link,
+      targetLinks: [bundle.link],
+      targetFiles: [],
       isMystery: false,
     };
   }
@@ -1518,12 +1607,21 @@ async function sendChannelLainnya(token, chatId) {
   if (!item) {
     return { ok: false, error: "⚠️ Paket tidak ditemukan atau sudah dihapus." };
   }
+  const itemLinks =
+    Array.isArray(item.links) && item.links.length > 0
+      ? item.links
+      : item.link
+      ? [item.link]
+      : [];
+  const itemFiles = Array.isArray(item.files) ? item.files : [];
   return {
     ok: true,
     itemId: String(item.id),
     itemNama: item.nama,
     baseNominal: parseNominal(item.harga),
-    targetLink: item.link,
+    targetLink: itemLinks[0] || "",
+    targetLinks: itemLinks,
+    targetFiles: itemFiles,
     isMystery: false,
   };
 }
@@ -1544,7 +1642,11 @@ async function sendQrisInvoiceForTarget(token, chatId, user, target) {
     target.baseNominal,
     target.targetLink,
     target.isMystery,
-    target.itemId
+    target.itemId,
+    {
+      target_links: target.targetLinks || [],
+      target_files: target.targetFiles || [],
+    }
   );
 
   const discountLine =
@@ -1805,6 +1907,10 @@ module.exports = async function handler(req, res) {
         await createAndSendDepositInvoice(token, chatId, call.from, nominal);
       } else if (data === "menu_katalog") {
         await sendKatalogMenu(token, chatId);
+      } else if (data === "menu_katalog_mini") {
+        await sendKatalogListByCategory(token, chatId, "mini");
+      } else if (data === "menu_katalog_full") {
+        await sendKatalogListByCategory(token, chatId, "full");
       } else if (data === "menu_bestseller") {
         await sendBestsellerMenu(token, chatId);
       } else if (data === "menu_mystery") {
@@ -1998,6 +2104,8 @@ module.exports = async function handler(req, res) {
             paid_with_saldo: true,
             preset_discount: discount,
             preset_voucher_code: voucherCode,
+            target_links: target.targetLinks || [],
+            target_files: target.targetFiles || [],
           }
         );
 
@@ -3115,7 +3223,10 @@ module.exports = async function handler(req, res) {
             chat_id: chatId,
             text:
               "⚠️ Format kurang lengkap! Kirim foto preview dengan caption:\n" +
-              "<code>/tambah Nama Set | Isi | Harga | Link File Rahasia</code>",
+              "<code>/tambah Nama Set | Isi | Harga | Link1, Link2 | kategori</code>\n\n" +
+              "<i>• Link bisa lebih dari satu, pisahkan dengan koma.\n" +
+              "• Kategori opsional: <code>mini</code> atau <code>full</code> (default: mini).\n" +
+              "• Mau tambah file upload langsung (bukan link)? Pakai <code>/tambahfile [nomor]</code> setelah set ini tersimpan.</i>",
             parse_mode: "HTML",
           });
           return res.status(200).json({ ok: true });
@@ -3126,13 +3237,24 @@ module.exports = async function handler(req, res) {
           photoId = msg.photo[msg.photo.length - 1].file_id;
         }
 
+        const linksArr = parts[3]
+          .split(/[\n,]+/)
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .map(normalizeUrl);
+        const kategoriRaw = (parts[4] || "mini").toLowerCase();
+        const kategori = kategoriRaw.includes("full") ? "full" : "mini";
+
         const katalogList = await getKatalog();
         const newItem = {
           id: Date.now().toString(),
           nama: parts[0],
           isi: parts[1],
           harga: parts[2],
-          link: normalizeUrl(parts[3]),
+          links: linksArr,
+          link: linksArr[0] || "",
+          files: [],
+          kategori,
           photo_id: photoId,
           sold: 0,
         };
@@ -3147,7 +3269,12 @@ module.exports = async function handler(req, res) {
             `• <b>Nama:</b> ${escapeHtml(newItem.nama)}\n` +
             `• <b>Isi:</b> ${escapeHtml(newItem.isi)}\n` +
             `• <b>Harga:</b> ${escapeHtml(newItem.harga)}\n` +
-            `• <b>Link Rahasia:</b> ${escapeHtml(newItem.link)}`,
+            `• <b>Kategori:</b> ${kategori === "full" ? "📦 Full Set" : "🧩 Mini Set"}\n` +
+            `• <b>Jumlah Link:</b> ${linksArr.length}x\n` +
+            (linksArr.length > 0
+              ? linksArr.map((l, i) => `  ${i + 1}. ${escapeHtml(l)}`).join("\n") + "\n"
+              : "") +
+            `\n<i>Mau lampirkan file upload langsung? Kirim foto/dokumen dengan caption <code>/tambahfile ${katalogList.length}</code></i>`,
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
@@ -3166,9 +3293,12 @@ module.exports = async function handler(req, res) {
         if (!arg) {
           let listText = "✏️ <b>DAFTAR SET UNTUK DI-EDIT</b>\n\n";
           katalogList.forEach((item, idx) => {
-            listText += `${idx + 1}. <b>${escapeHtml(item.nama)}</b> (${escapeHtml(item.harga)})\n`;
+            const katLabel = item.kategori === "full" ? "📦" : "🧩";
+            listText += `${idx + 1}. ${katLabel} <b>${escapeHtml(item.nama)}</b> (${escapeHtml(item.harga)})\n`;
           });
-          listText += "\nGunakan: <code>/edit [nomor] | Nama | Isi | Harga | Link</code>";
+          listText +=
+            "\nGunakan: <code>/edit [nomor] | Nama | Isi | Harga | Link1,Link2 | kategori</code>\n" +
+            "<i>Kosongkan bagian yang tidak ingin diubah (tetap pakai tanda | -nya).</i>";
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: listText, parse_mode: "HTML" });
           return res.status(200).json({ ok: true });
         }
@@ -3188,7 +3318,18 @@ module.exports = async function handler(req, res) {
           if (parts[1]) targetItem.nama = parts[1];
           if (parts[2]) targetItem.isi = parts[2];
           if (parts[3]) targetItem.harga = parts[3];
-          if (parts[4]) targetItem.link = normalizeUrl(parts[4]);
+          if (parts[4]) {
+            const linksArr = parts[4]
+              .split(/[\n,]+/)
+              .map((s) => s.trim())
+              .filter(Boolean)
+              .map(normalizeUrl);
+            targetItem.links = linksArr;
+            targetItem.link = linksArr[0] || "";
+          }
+        }
+        if (parts.length >= 6 && parts[5]) {
+          targetItem.kategori = parts[5].toLowerCase().includes("full") ? "full" : "mini";
         }
 
         katalogList[idx] = targetItem;
@@ -3198,6 +3339,130 @@ module.exports = async function handler(req, res) {
           text: `✅ <b>Set #${idx + 1} (${escapeHtml(targetItem.nama)}) diperbarui!</b>`,
           parse_mode: "HTML",
         });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 10B. ADMIN: /tambahfile — lampirkan file upload langsung (foto/dokumen) ke sebuah set
+      if (rawText.startsWith("/tambahfile")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const katalogList = await getKatalog();
+        const idx = parseInt(rawText.replace(/^\/tambahfile\s*/i, "").trim(), 10) - 1;
+
+        if (isNaN(idx) || idx < 0 || idx >= katalogList.length) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "⚠️ Gunakan: kirim foto atau dokumen dengan caption <code>/tambahfile [nomor]</code>\n" +
+              "<i>Contoh: <code>/tambahfile 1</code></i>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        let fileId = "";
+        let fileType = "";
+        if (msg.photo && msg.photo.length > 0) {
+          fileId = msg.photo[msg.photo.length - 1].file_id;
+          fileType = "photo";
+        } else if (msg.document) {
+          fileId = msg.document.file_id;
+          fileType = "document";
+        }
+
+        if (!fileId) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Kirim file-nya (foto atau dokumen) langsung bareng caption <code>/tambahfile [nomor]</code>.",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const targetItem = katalogList[idx];
+        if (!Array.isArray(targetItem.files)) targetItem.files = [];
+        targetItem.files.push({ file_id: fileId, type: fileType });
+        katalogList[idx] = targetItem;
+        await saveKatalog(katalogList);
+
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            `✅ <b>File ditambahkan ke Set #${idx + 1} (${escapeHtml(targetItem.nama)})!</b>\n` +
+            `📎 Total file terlampir sekarang: <b>${targetItem.files.length}</b>\n\n` +
+            "<i>Kirim lagi foto/dokumen lain dengan caption yang sama untuk menambah lebih banyak file.</i>",
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 10C. ADMIN: /hapusfile [nomor_set] [nomor_file] — hapus salah satu file terlampir
+      if (rawText.startsWith("/hapusfile")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const katalogList = await getKatalog();
+        const argParts = rawText.replace(/^\/hapusfile\s*/i, "").trim().split(/\s+/);
+        const idx = parseInt(argParts[0], 10) - 1;
+        const fileIdx = parseInt(argParts[1], 10) - 1;
+
+        if (isNaN(idx) || idx < 0 || idx >= katalogList.length) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Gunakan: <code>/hapusfile [nomor_set] [nomor_file]</code>\n<i>Lihat nomor file lewat /listfile [nomor_set]</i>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const targetItem = katalogList[idx];
+        const files = Array.isArray(targetItem.files) ? targetItem.files : [];
+        if (isNaN(fileIdx) || fileIdx < 0 || fileIdx >= files.length) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `⚠️ Nomor file tidak valid. Set ini punya ${files.length} file terlampir.`,
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        files.splice(fileIdx, 1);
+        targetItem.files = files;
+        katalogList[idx] = targetItem;
+        await saveKatalog(katalogList);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ File ke-${fileIdx + 1} pada Set #${idx + 1} (${escapeHtml(targetItem.nama)}) dihapus.`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 10D. ADMIN: /listfile [nomor_set] — lihat link & file terlampir pada satu set
+      if (rawText.startsWith("/listfile")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const katalogList = await getKatalog();
+        const idx = parseInt(rawText.replace(/^\/listfile\s*/i, "").trim(), 10) - 1;
+
+        if (isNaN(idx) || idx < 0 || idx >= katalogList.length) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Gunakan: <code>/listfile [nomor_set]</code>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const item = katalogList[idx];
+        const links = Array.isArray(item.links) && item.links.length > 0 ? item.links : item.link ? [item.link] : [];
+        const files = Array.isArray(item.files) ? item.files : [];
+
+        let listText =
+          `📎 <b>LINK & FILE — Set #${idx + 1} (${escapeHtml(item.nama)})</b>\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `🔗 <b>Link (${links.length}):</b>\n`;
+        listText += links.length > 0 ? links.map((l, i) => `  ${i + 1}. ${escapeHtml(l)}`).join("\n") : "  <i>(kosong)</i>";
+        listText += `\n\n📁 <b>File Upload (${files.length}):</b>\n`;
+        listText += files.length > 0 ? files.map((f, i) => `  ${i + 1}. ${f.type || "file"}`).join("\n") : "  <i>(kosong)</i>";
+        listText += `\n\n<i>Hapus file: /hapusfile ${idx + 1} [nomor_file]</i>`;
+
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: listText, parse_mode: "HTML" });
         return res.status(200).json({ ok: true });
       }
 
@@ -3278,7 +3543,8 @@ module.exports = async function handler(req, res) {
             text:
               "💡 Gunakan caption perintah saat kirim foto:\n" +
               "• <code>/setbanner</code> | <code>/setqris</code> | <code>/broadcast Pesan</code>\n" +
-              "• <code>/tambah Nama | Isi | Harga | Link</code> | <code>/edit [nomor]</code>",
+              "• <code>/tambah Nama | Isi | Harga | Link</code> | <code>/edit [nomor]</code>\n" +
+              "• <code>/tambahfile [nomor]</code> — lampirkan file ini langsung ke set",
             parse_mode: "HTML",
             reply_to_message_id: msg.message_id,
           });
@@ -3309,6 +3575,7 @@ module.exports = async function handler(req, res) {
               "• <code>/buatvoucher KODE | DISKON | KUOTA</code>\n" +
               "• <code>/setmystery HARGA</code> | <code>/setsold</code> | <code>/resetlb</code>\n" +
               "• <code>/tambah</code> | <code>/edit</code> | <code>/hapus</code> | <code>/setbundle</code>\n" +
+              "• <code>/tambahfile NO</code> | <code>/hapusfile NO NO</code> | <code>/listfile NO</code> — lampirkan banyak file/link\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>";
           }
