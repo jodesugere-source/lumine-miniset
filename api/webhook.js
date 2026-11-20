@@ -4,6 +4,11 @@
 const ADMIN_USERNAME = "Fellstore1"; // Tanpa tanda @
 const LINK_CH_CADANGAN = "https://t.me/+OGXaaPyrnd5kMmY1";
 const LINK_CH_FREE = "https://t.me/+jf3tLqLIG444MjBI";
+
+// ---- PENGATURAN MENU RESELLER (UBAH SESUAI KEBUTUHAN) ----
+const RESELLER_PRICE_LITE = 1200; // harga reseller Paket Lite (retail Rp 2.000)
+const RESELLER_PRICE_STANDAR = 2000; // harga reseller Paket Standar (retail Rp 3.000)
+const RESELLER_MIN_ORDER = 10; // minimal ambil set per order
 const DEFAULT_MACRO_SECRET = "lumineacc2026";
 
 const REDIS_KEY = "lumine_main_katalog";
@@ -696,7 +701,7 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
     const bundle = await getBundle();
     const pool = katalogList.map((k) => ({ id: String(k.id), nama: k.nama, link: k.link }));
     if (bundle.link && bundle.link.trim() !== "") {
-      pool.push({ id: "", nama: "🌟 JACKPOT: Promo Bundling 2 Mini Set", link: bundle.link });
+      pool.push({ id: "", nama: "🌟 JACKPOT: Promo Bundling 2 Photopack", link: bundle.link });
     }
     const won =
       pool.length > 0
@@ -775,6 +780,7 @@ function getCompactReplyKeyboard() {
       [{ text: "🎲 Mystery Box" }, { text: "🎁 Promo 5k" }],
       [{ text: "💰 Saldo & Depo" }, { text: "🎒 Koleksi Saya" }],
       [{ text: "🏆 Leaderboard" }, { text: "💎 Info & Channel" }],
+      [{ text: "🤝 Reseller" }],
     ],
     resize_keyboard: true,
   };
@@ -888,7 +894,7 @@ async function sendMainMenuCard(token, chatId) {
   const banner = await getBanner();
   const mysteryCfg = await getMysteryConfig();
   const cardText =
-    "✨ <b>LUMINE PHOTOPACK | MINI SET</b> ✨\n" +
+    "✨ <b>LUMINE PHOTOPACK</b> ✨\n" +
     "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n\n" +
     "╭─── 💰 <b>DAFTAR HARGA</b> ───\n" +
     "│ • <b>Paket Lite</b> (5–7 Foto) : <code>Rp 2.000</code>\n" +
@@ -903,7 +909,7 @@ async function sendMainMenuCard(token, chatId) {
   const inlineMarkup = {
     inline_keyboard: [
       [
-        { text: "🛍️ Katalog Mini Set", callback_data: "menu_katalog" },
+        { text: "🛍️ Katalog Photopack", callback_data: "menu_katalog" },
         { text: "🔥 Bestseller", callback_data: "menu_bestseller" },
       ],
       [
@@ -923,9 +929,10 @@ async function sendMainMenuCard(token, chatId) {
         { text: "📋 Cara Order", callback_data: "menu_cara" },
       ],
       [
+        { text: "🤝 Menu Reseller", callback_data: "menu_reseller" },
         { text: "🔗 Channel Lainnya", callback_data: "menu_channel" },
-        { text: `💬 Admin (@${ADMIN_USERNAME})`, url: `https://t.me/${ADMIN_USERNAME}` },
       ],
+      [{ text: `💬 Admin (@${ADMIN_USERNAME})`, url: `https://t.me/${ADMIN_USERNAME}` }],
     ],
   };
 
@@ -951,7 +958,7 @@ async function sendMainMenuCard(token, chatId) {
   if (katalogList.length === 0) {
     await tgRequest(token, "sendMessage", {
       chat_id: chatId,
-      text: `📂 Katalog Mini Set sedang diperbarui. Hubungi @${ADMIN_USERNAME} untuk info stok terbaru.`,
+      text: `📂 Katalog Photopack sedang diperbarui. Hubungi @${ADMIN_USERNAME} untuk info stok terbaru.`,
       reply_markup: {
         inline_keyboard: [[{ text: "🔙 Menu Utama", callback_data: "menu_home" }]],
       },
@@ -989,7 +996,7 @@ async function sendMainMenuCard(token, chatId) {
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
     text:
-      "╭─── 🛍️ <b>KATALOG MINI SET</b> ───\n" +
+      "╭─── 🛍️ <b>KATALOG PHOTOPACK</b> ───\n" +
       "│ Pilih judul di bawah untuk melihat\n" +
       "│ <b>foto preview</b> & bayar via Saldo / QRIS:\n" +
       "╰─────────────────────\n" +
@@ -1015,7 +1022,7 @@ async function sendBestsellerMenu(token, chatId) {
       parse_mode: "HTML",
       reply_markup: {
         inline_keyboard: [
-          [{ text: "🛍️ Buka Katalog Mini Set", callback_data: "menu_katalog" }],
+          [{ text: "🛍️ Buka Katalog Photopack", callback_data: "menu_katalog" }],
           [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
         ],
       },
@@ -1076,9 +1083,9 @@ async function sendMysteryMenu(token, chatId) {
     return;
   }
 
-  let prizePreview = `• Salah satu dari <b>${katalogList.length} Koleksi Mini Set</b> (nilai s/d Rp 3.000)\n`;
+  let prizePreview = `• Salah satu dari <b>${katalogList.length} Koleksi Photopack</b> (nilai s/d Rp 3.000)\n`;
   if (bundle.link && bundle.link.trim() !== "") {
-    prizePreview += "• 🌟 <b>GRAND JACKPOT:</b> Promo Bundling 2 Mini Set (nilai Rp 5.000)!\n";
+    prizePreview += "• 🌟 <b>GRAND JACKPOT:</b> Promo Bundling 2 Photopack (nilai Rp 5.000)!\n";
   }
 
   await tgRequest(token, "sendMessage", {
@@ -1161,13 +1168,13 @@ async function sendMysteryMenu(token, chatId) {
 async function sendPromoBundling(token, chatId, replyToMessageId = null) {
   const bundle = await getBundle();
   const promoText =
-    "🎁 <b>PROMO BUNDLING HEMAT — 2 MINI SET</b>\n\n" +
+    "🎁 <b>PROMO BUNDLING HEMAT — 2 PHOTOPACK</b>\n\n" +
     "╭─── 💸 <b>RINCIAN PROMO</b> ───\n" +
     "│ • Harga Normal : <s>Rp 6.000</s>\n" +
     "│ • Harga Promo  : <b>Rp 5.000</b> <i>(Hemat Rp 1.000!)</i>\n" +
     "╰────────────────────\n\n" +
     "📌 <b>Cara Klaim Promo:</b>\n" +
-    "1. Cek judul 2 set yang kamu mau di <b>Katalog Mini Set</b>.\n" +
+    "1. Cek judul 2 set yang kamu mau di <b>Katalog Photopack</b>.\n" +
     "2. Klik tombol <b>Beli Promo</b> di bawah untuk bayar via Saldo atau QRIS.\n" +
     "3. Setelah pembayaran terverifikasi, link akses langsung dikirim otomatis!";
 
@@ -1175,7 +1182,7 @@ async function sendPromoBundling(token, chatId, replyToMessageId = null) {
   if (bundle.link && bundle.link.trim() !== "") {
     buttons.push([
       {
-        text: "⚡ Beli Promo 2 Mini Set (Rp 5.000)",
+        text: "⚡ Beli Promo 2 Photopack (Rp 5.000)",
         callback_data: "buy_bundle",
       },
     ]);
@@ -1195,13 +1202,54 @@ async function sendPromoBundling(token, chatId, replyToMessageId = null) {
   await tgRequest(token, "sendMessage", payload);
 }
 
+async function sendResellerMenu(token, chatId, user) {
+  const userId = (user && user.id) || "-";
+  const uname = user && user.username ? `@${user.username}` : "(tanpa username)";
+  const prefill = encodeURIComponent(
+    `Halo admin, saya mau daftar Reseller Photopack.\nID Telegram: ${userId}\nUsername: ${uname}`
+  );
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "🤝 <b>MENU RESELLER | PHOTOPACK</b>\n" +
+      "<i>Jual ulang foto pack Lumine dengan harga grosir</i>\n\n" +
+      "╭─── 💰 <b>HARGA RESELLER</b> ───\n" +
+      `│ • <b>Paket Lite</b> (5–7 Foto) : <code>${formatRupiah(RESELLER_PRICE_LITE)}</code>\n` +
+      `│ • <b>Paket Standar</b> (8–10 Foto) : <code>${formatRupiah(RESELLER_PRICE_STANDAR)}</code>\n` +
+      `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n` +
+      "╰────────────────────\n\n" +
+      "╭─── 🌟 <b>KEUNTUNGAN</b> ───\n" +
+      "│ ✅ Harga lebih murah dari harga retail\n" +
+      "│ ✅ Koleksi Photopack HD tanpa watermark\n" +
+      "│ ✅ Update set baru dari katalog\n" +
+      "│ ✅ Dibantu langsung oleh admin\n" +
+      "╰─────────────────────\n\n" +
+      "📝 <b>Cara Daftar:</b>\n" +
+      "1. Klik tombol <b>Daftar Reseller</b> di bawah.\n" +
+      "2. Kirim pesan yang sudah terisi otomatis ke admin.\n" +
+      "3. Ikuti arahan admin sampai akun reseller aktif.",
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "📝 Daftar Reseller", url: `https://t.me/${ADMIN_USERNAME}?text=${prefill}` }],
+        [
+          { text: "🛍️ Lihat Katalog", callback_data: "menu_katalog" },
+          { text: "📋 Cara Order", callback_data: "menu_cara" },
+        ],
+        [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
+      ],
+    },
+  });
+}
+
 async function sendCaraOrder(token, chatId) {
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
     text:
       "📋 <b>PANDUAN & ATURAN PEMBELIAN</b>\n\n" +
       "1️⃣ <b>Pilih Paket / Mystery Box</b>\n" +
-      "Buka <b>Katalog Mini Set</b>, <b>🔥 Bestseller</b>, atau <b>Mystery Box</b>, lalu klik tombol beli.\n\n" +
+      "Buka <b>Katalog Photopack</b>, <b>🔥 Bestseller</b>, atau <b>Mystery Box</b>, lalu klik tombol beli.\n\n" +
       "2️⃣ <b>Bayar Pakai Saldo atau QRIS</b>\n" +
       "• <b>Saldo:</b> Isi saldo di menu <b>💰 Saldo & Depo</b> (Auto-ACC QRIS Statis), lalu checkout 1x klik tanpa kode unik.\n" +
       "• <b>QRIS Langsung:</b> Transfer sesuai nominal persis sampai digit terakhir.\n\n" +
@@ -1274,7 +1322,7 @@ async function sendChannelLainnya(token, chatId) {
     return {
       ok: true,
       itemId: "",
-      itemNama: "🎲 Mystery Box Gacha Mini Set",
+      itemNama: "🎲 Mystery Box Gacha Photopack",
       baseNominal: cfg.price || 3000,
       targetLink: "MYSTERY_GACHA",
       isMystery: true,
@@ -1292,7 +1340,7 @@ async function sendChannelLainnya(token, chatId) {
     return {
       ok: true,
       itemId: "",
-      itemNama: "Promo Bundling 2 Mini Set",
+      itemNama: "Promo Bundling 2 Photopack",
       baseNominal: 5000,
       targetLink: bundle.link,
       isMystery: false,
@@ -1605,6 +1653,8 @@ module.exports = async function handler(req, res) {
         await sendUpgradeCh(token, chatId);
       } else if (data === "menu_channel") {
         await sendChannelLainnya(token, chatId);
+      } else if (data === "menu_reseller") {
+        await sendResellerMenu(token, chatId, call.from);
       } else if (data === "menu_voucher") {
         const activeV = await getActiveUserVoucher(callerId);
         await tgRequest(token, "sendMessage", {
@@ -2277,7 +2327,7 @@ module.exports = async function handler(req, res) {
               "📢 <b>FITUR BROADCAST STOK BARU</b>\n\n" +
               `• Total user terdaftar di bot: <b>${userIds.length} User</b>\n\n` +
               "<b>Cara kirim:</b>\n" +
-              "<code>/broadcast Halo guys! Mini Set baru sudah rilis!</code>\n" +
+              "<code>/broadcast Halo guys! Photopack baru sudah rilis!</code>\n" +
               "<i>Bisa juga kirim foto dengan caption <code>/broadcast Pesan...</code></i>",
             parse_mode: "HTML",
           });
@@ -2836,7 +2886,7 @@ module.exports = async function handler(req, res) {
           await sendMainMenuCard(token, chatId);
         } else if (text === "💰 Saldo & Depo" || text === "💰 Saldo & Deposit") {
           await sendSaldoMenu(token, chatId, senderId);
-        } else if (text === "🛍️ Katalog" || text === "🛍️ Katalog Mini Set") {
+        } else if (text === "🛍️ Katalog" || text === "🛍️ Katalog Mini Set" || text === "🛍️ Katalog Set Pool" || text === "🛍️ Katalog Photopack") {
           await sendKatalogMenu(token, chatId);
         } else if (text === "🔥 Bestseller" || text === "/bestseller") {
           await sendBestsellerMenu(token, chatId);
@@ -2859,9 +2909,16 @@ module.exports = async function handler(req, res) {
         } else if (text === "💎 Info & Channel") {
           await sendUpgradeCh(token, chatId);
           await sendChannelLainnya(token, chatId);
+        } else if (text === "🤝 Reseller" || text === "/reseller") {
+          await sendResellerMenu(token, chatId, msg.from);
         } else {
           if (["saldo", "depo", "deposit", "topup", "top up"].some((k) => lowerText.includes(k))) {
             await sendSaldoMenu(token, chatId, senderId);
+            return res.status(200).json({ ok: true });
+          }
+
+          if (["reseller", "grosir", "jadi agen"].some((k) => lowerText.includes(k))) {
+            await sendResellerMenu(token, chatId, msg.from);
             return res.status(200).json({ ok: true });
           }
 
@@ -2898,10 +2955,10 @@ module.exports = async function handler(req, res) {
 
           if (["harga", "berapa", "brp", "list", "daftar"].some((k) => lowerText.includes(k))) {
             replyText =
-              "💰 <b>Info Harga Lumine Mini Set:</b>\n" +
+              "💰 <b>Info Harga Lumine Photopack:</b>\n" +
               "• Paket Lite (5–7 Foto HD) : <b>Rp 2.000</b>\n" +
               "• Paket Standar (8–10 Foto HD) : <b>Rp 3.000</b>\n" +
-              "• 🎁 <b>Promo Bundling 2 Mini Set : Rp 5.000</b>\n" +
+              "• 🎁 <b>Promo Bundling 2 Photopack : Rp 5.000</b>\n" +
               "• 🎲 <b>Mystery Box Gacha : Rp 3.000</b>";
           }
 
