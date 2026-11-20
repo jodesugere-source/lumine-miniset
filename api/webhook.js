@@ -651,7 +651,7 @@ function getWibTimestamp() {
   const min = String(wib.getUTCMinutes()).padStart(2, "0");
   return `${dd}/${mm}/${yyyy} • ${hh}:${min} WIB`;
   }
-   // ==========================================
+  // ==========================================
 // 3. SISTEM LEADERBOARD, TIER & ORDER
 // ==========================================
 function getWibPeriods() {
@@ -1345,8 +1345,8 @@ async function createAndSendResellerRegInvoice(token, chatId, user) {
       ],
     },
   });
-          }
-      async function sendSaldoMenu(token, chatId, userId) {
+      }
+async function sendSaldoMenu(token, chatId, userId) {
   const [saldo, reseller] = await Promise.all([
     getUserSaldo(userId),
     getReseller(userId),
@@ -1634,8 +1634,8 @@ async function sendKoleksiMenu(token, chatId, userId) {
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: rows },
   });
-    }
-   async function sendPromoBundling(token, chatId, replyToMessageId = null) {
+                 }
+    async function sendPromoBundling(token, chatId, replyToMessageId = null) {
   const bundle = await getBundle();
   if (!bundle || !bundle.link || !bundle.link.trim()) {
     await tgRequest(token, "sendMessage", {
@@ -2102,8 +2102,8 @@ module.exports = async function handler(req, res) {
         );
 
         await processAccOrder(token, order);
-   }
-       } else if (data.startsWith("buy_")) {
+                  }
+          } else if (data.startsWith("buy_")) {
         const targetKey = data.replace("buy_", "");
         const target = await resolvePurchaseTarget(targetKey);
         if (!target) {
@@ -2763,8 +2763,8 @@ module.exports = async function handler(req, res) {
           });
         }
         return res.status(200).json({ ok: true });
-          }
-       // ------------------------------------------
+                                        }
+             // ------------------------------------------
     // B. HANDLER PESAN TEKS & FOTO DARI USER
     // ------------------------------------------
     if (update.message) {
@@ -3077,7 +3077,8 @@ module.exports = async function handler(req, res) {
       if (rawText.startsWith("/saldo")) {
         await sendSaldoMenu(token, chatId, senderId);
         return res.status(200).json({ ok: true });
-           // 0A. ADMIN: /setmacro (PENGATURAN & LINK AUTO-ACC MAKRO ANDROID)
+          }
+              // 0A. ADMIN: /setmacro (PENGATURAN & LINK AUTO-ACC MAKRO ANDROID)
       if (rawText.startsWith("/setmacro")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const arg = rawText.replace(/^\/setmacro\s*/i, "").trim();
@@ -3394,7 +3395,7 @@ module.exports = async function handler(req, res) {
         }
         return res.status(200).json({ ok: true });
       }
-            // 4. USER: /voucher KODE
+           // 4. USER: /voucher KODE
       if (rawText.startsWith("/voucher")) {
         const code = rawText.replace(/^\/voucher\s*/i, "").trim().toUpperCase();
         if (!code) {
@@ -3687,8 +3688,8 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
-      }
-            // 11. ADMIN: /hapus
+            }
+              // 11. ADMIN: /hapus
       if (rawText.startsWith("/hapus")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const katalogList = await getKatalog();
@@ -3918,5 +3919,4 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ ok: true });
   }
 };
-            
-          
+                                      
