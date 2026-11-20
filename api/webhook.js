@@ -95,7 +95,37 @@ const REDIS_WD_PENDING_KEY = "lumine_main_wd_pending"; // hash: id WD -> owner
 const REDIS_WD_HIST_PREFIX = "lumine_main_wd_hist_";
 const REDIS_WD_LOCK_PREFIX = "lumine_main_wd_lock_";
 const REDIS_WD_CH_KEY = "lumine_main_wd_channel";
-const REDIS_RESTORE_PENDING_PREFIX = "lumine_main_restore_pending_"; // file restore yg nunggu /restore konfirmasi (TTL 5 menit)
+const REDIS_RESTORE_PENDING_PREFIX = "lumine_main_restore_pending_";
+
+// ---- PENGATURAN CHECK-IN HARIAN ----
+const CHECKIN_ENABLED = true; // false = matikan check-in harian
+const CHECKIN_REWARD_SALDO = 100; // saldo per check-in (Rp100), dipotong dari kas admin
+const REDIS_CHECKIN_PREFIX = "lumine_main_checkin_"; // hash per hari (WIB): id user -> 1
+const REDIS_DEPOSIT_USER_KEY = "lumine_main_depo_users"; // set: id user yang pernah deposit (syarat check-in)
+
+// ---- KLAIM SALDO DARI SUBSCRIBE CHANNEL LUAR (VERIFIKASI BUKTI MANUAL) ----
+const SUB_CLAIM_ENABLED = true; // false = matikan klaim subscribe
+const SUB_CLAIM_REWARD = 3000; // saldo per klaim (Rp3.000), dipotong dari kas admin, hanya bisa dibelanjakan di bot
+const SUB_CLAIM_CHANNEL_NAME = "GANTI NAMA CHANNEL"; // nama channel yang tampil ke pembeli
+const SUB_CLAIM_LINK = "https://GANTI-LINK-SUBSCRIBE"; // link subscribe yang dibuka lewat tombol
+const REDIS_SUB_PENDING_KEY = "lumine_main_sub_pending"; // hash: id user -> "waiting" atau id klaim yang menunggu review
+const REDIS_SUB_CLAIMED_KEY = "lumine_main_sub_claimed"; // hash: id user -> id klaim (sudah pernah klaim, hanya sekali)
+const REDIS_SUB_REQ_KEY = "lumine_main_sub_req"; // hash: id klaim -> JSON data klaim
+const REDIS_SUB_SEQ_KEY = "lumine_main_sub_seq"; // counter id klaim
+
+// ---- SPIN GRATIS HARIAN (wajib sudah check-in hari itu) ----
+const SPIN_ENABLED = true; // false = matikan spin wheel
+const REDIS_SPIN_PREFIX = "lumine_main_spin_"; // hash per hari (WIB): id user -> 1
+const SPIN_SALDO_AMOUNT = 500; // nominal hadiah saldo (dipotong dari kas admin)
+// Peluang dasar. Hadiah yang stoknya kosong (mis. tidak ada katalog Rp50.000) otomatis dikeluarkan
+// dan peluangnya dibagi ulang ke hadiah yang tersedia. Peluang yang tampil selalu sesuai hasil itu.
+const SPIN_PRIZES = [
+  { key: "zonk", chance: 8 },
+  { key: "saldo", chance: 30 },
+  { key: "pack5", chance: 40, price: 5000 },
+  { key: "pack10", chance: 20, price: 10000 },
+  { key: "all50", chance: 2, price: 50000 },
+]; // file restore yg nunggu /restore konfirmasi (TTL 5 menit)
 
 // ---- PENGATURAN WD (TARIK MARGIN) RESELLER ----
 const WD_ENABLED = true; // false = matikan fitur WD
@@ -1683,6 +1713,7 @@ async function processAccOrderCore(token, order) {
   if (order.is_deposit) {
     const depositAmount = Number(order.base_nominal) || 0;
     const newSaldo = await addUserSaldo(order.buyer_id, depositAmount);
+    await redisCommand(["SADD", REDIS_DEPOSIT_USER_KEY, String(order.buyer_id)]);
 
     await tgRequest(token, "sendMessage", {
       chat_id: order.buyer_id,
@@ -1889,6 +1920,459 @@ function getCompactReplyKeyboard() {
     resize_keyboard: true,
   };
 }
+// ---- CHECK-IN HARIAN ----
+// Syarat: pernah belanja (lb_allcnt > 0) atau pernah deposit.
+async function checkinEligible(userId) {
+  const cnt = await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(userId)]);
+  if ((parseInt(cnt, 10) || 0) > 0) return true;
+  const dep = await redisCommand(["SISMEMBER", REDIS_DEPOSIT_USER_KEY, String(userId)]);
+  return Number(dep) === 1;
+}
+
+async function claimDailyCheckin(token, chatId, userId) {
+  const sendMsg = (text, markup) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...(markup ? { reply_markup: markup } : {}),
+    });
+
+  if (!CHECKIN_ENABLED) {
+    return sendMsg("⚠️ Check-in harian sedang tidak aktif.");
+  }
+  if (!(await checkinEligible(userId))) {
+    return sendMsg(
+      "🔒 <b>Check-in harian khusus pembeli.</b>\n" +
+        "Lakukan satu kali pembelian atau deposit saldo dulu, lalu kamu bisa check-in tiap hari dan dapat " +
+        `<b>${formatRupiah(CHECKIN_REWARD_SALDO)}</b>.`
+    );
+  }
+
+  const fundId = await getReferralFundId();
+  if (!fundId) {
+    return sendMsg("⚠️ Check-in belum bisa diproses. Coba lagi nanti ya.");
+  }
+
+  const { dayKey } = getWibPeriods();
+  const key = `${REDIS_CHECKIN_PREFIX}${dayKey}`;
+
+  // Klaim satu kali per user per hari (HSETNX anti klik ganda)
+  const claimed = await redisCommand(["HSETNX", key, String(userId), "1"]);
+  await redisCommand(["EXPIRE", key, String(60 * 60 * 24 * 3)]);
+  if (Number(claimed) !== 1) {
+    return sendMsg("✅ Kamu sudah check-in hari ini. Balik lagi besok ya!");
+  }
+
+  // Potong dari kas admin; kalau kas kurang, batalkan klaim (tidak sampai minus)
+  const d = await deductUserSaldo(fundId, CHECKIN_REWARD_SALDO);
+  if (!d.ok) {
+    await redisCommand(["HDEL", key, String(userId)]);
+    await sendMsg("⚠️ Check-in belum bisa diproses karena saldo kas habis. Coba lagi nanti ya.");
+    await tgRequest(token, "sendMessage", {
+      chat_id: fundId,
+      text:
+        `⚠️ <b>Saldo kas tidak cukup untuk check-in harian!</b>\n` +
+        `💳 Saldo kas: <b>${formatRupiah(d.balance)}</b>\n` +
+        `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  let newSaldo;
+  try {
+    newSaldo = await addUserSaldo(userId, CHECKIN_REWARD_SALDO);
+  } catch (addErr) {
+    // kembalikan kas dan klaim bila gagal menambah saldo user
+    await addUserSaldo(fundId, CHECKIN_REWARD_SALDO);
+    await redisCommand(["HDEL", key, String(userId)]);
+    throw addErr;
+  }
+
+  await sendMsg(
+    `🎉 <b>Check-in berhasil!</b>\n` +
+      `💰 Saldo masuk: <b>+${formatRupiah(CHECKIN_REWARD_SALDO)}</b>\n` +
+      `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>`,
+    { inline_keyboard: [[{ text: "🎡 Spin Gratis Sekarang", callback_data: "spin_info" }]] }
+  );
+}
+
+// ---- SPIN GRATIS HARIAN ----
+// Ambil katalog yang punya link, dikelompokkan per harga (5k, 10k, 50k)
+async function getSpinPool() {
+  const katalog = await getKatalog();
+  const ok = katalog.filter(
+    (k) => (Array.isArray(k.links) && k.links.length > 0) || (typeof k.link === "string" && k.link)
+  );
+  const byPrice = (price) => ok.filter((k) => parseNominal(k.harga) === price);
+  return {
+    pack5: byPrice(5000),
+    pack10: byPrice(10000),
+    all50: byPrice(50000),
+  };
+}
+
+// Peluang nyata setiap hadiah setelah hadiah kosong dikeluarkan
+async function getSpinOdds(fundId, pool) {
+  const fundBal = await getUserSaldo(fundId);
+  const available = SPIN_PRIZES.filter((p) => {
+    if (p.key === "zonk") return true;
+    if (p.key === "saldo") return fundBal >= SPIN_SALDO_AMOUNT;
+    return pool[p.key] && pool[p.key].length > 0;
+  });
+  const total = available.reduce((a, p) => a + p.chance, 0) || 1;
+  return available.map((p) => ({ ...p, real: (p.chance / total) * 100 }));
+}
+
+function pickFromOdds(odds) {
+  const total = odds.reduce((a, p) => a + p.chance, 0);
+  let r = Math.random() * total;
+  for (const p of odds) {
+    if (r < p.chance) return p;
+    r -= p.chance;
+  }
+  return odds[odds.length - 1];
+}
+
+function spinPrizeLabel(key) {
+  if (key === "zonk") return "Zonk, coba lagi besok";
+  if (key === "saldo") return `Saldo ${formatRupiah(SPIN_SALDO_AMOUNT)}`;
+  if (key === "pack5") return "Photopack 5k";
+  if (key === "pack10") return "Photopack 10k";
+  return "All Pack 50k";
+}
+
+async function sendSpinInfo(token, chatId, userId) {
+  const sendMsg = (text, markup) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...(markup ? { reply_markup: markup } : {}),
+    });
+  const backBtn = [[{ text: "🔙 Menu Utama", callback_data: "menu_home" }]];
+
+  if (!SPIN_ENABLED) return sendMsg("⚠️ Spin gratis sedang tidak aktif.", { inline_keyboard: backBtn });
+
+  const { dayKey } = getWibPeriods();
+  const checkedIn = Number(await redisCommand(["HEXISTS", `${REDIS_CHECKIN_PREFIX}${dayKey}`, String(userId)])) === 1;
+  if (!checkedIn) {
+    return sendMsg(
+      "🔒 <b>Spin gratis terbuka setelah check-in.</b>\nCheck-in dulu di menu 💰 Saldo & Depo, lalu spin di sini.",
+      { inline_keyboard: backBtn }
+    );
+  }
+  const spun = Number(await redisCommand(["HEXISTS", `${REDIS_SPIN_PREFIX}${dayKey}`, String(userId)])) === 1;
+  if (spun) {
+    return sendMsg("✅ Kamu sudah spin hari ini. Balik lagi besok ya!", { inline_keyboard: backBtn });
+  }
+
+  const fundId = await getReferralFundId();
+  const pool = await getSpinPool();
+  const odds = fundId ? await getSpinOdds(fundId, pool) : [];
+  const lines = odds.map((p) => `• ${spinPrizeLabel(p.key)} — peluang <b>${p.real.toFixed(1)}%</b>\n`).join("");
+
+  return sendMsg(
+    "🎡 <b>SPIN GRATIS HARIAN</b>\n\n" +
+      "Peluang setiap hadiah:\n" +
+      lines +
+      "\n<i>Gratis 1 spin per hari, setelah check-in. Hadiah pack langsung masuk ke 🎒 Koleksi Saya.</i>",
+    { inline_keyboard: [[{ text: "🎡 Putar Sekarang", callback_data: "spin_go" }], ...backBtn] }
+  );
+}
+
+async function doSpin(token, chatId, userId) {
+  const sendMsg = (text, markup) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...(markup ? { reply_markup: markup } : {}),
+    });
+  const backBtn = { inline_keyboard: [[{ text: "🔙 Menu Utama", callback_data: "menu_home" }]] };
+
+  if (!SPIN_ENABLED) return sendMsg("⚠️ Spin gratis sedang tidak aktif.", backBtn);
+
+  const { dayKey } = getWibPeriods();
+  const checkedIn = Number(await redisCommand(["HEXISTS", `${REDIS_CHECKIN_PREFIX}${dayKey}`, String(userId)])) === 1;
+  if (!checkedIn) return sendMsg("🔒 Check-in dulu ya sebelum spin.", backBtn);
+
+  // Klaim 1 spin per hari (HSETNX anti klik ganda)
+  const spinKey = `${REDIS_SPIN_PREFIX}${dayKey}`;
+  const claimed = await redisCommand(["HSETNX", spinKey, String(userId), "1"]);
+  await redisCommand(["EXPIRE", spinKey, String(60 * 60 * 24 * 3)]);
+  if (Number(claimed) !== 1) {
+    return sendMsg("✅ Kamu sudah spin hari ini. Balik lagi besok ya!", backBtn);
+  }
+
+  const fundId = await getReferralFundId();
+  if (!fundId) {
+    await redisCommand(["HDEL", spinKey, String(userId)]);
+    return sendMsg("⚠️ Spin belum bisa diproses. Coba lagi nanti ya.", backBtn);
+  }
+
+  const pool = await getSpinPool();
+  const odds = await getSpinOdds(fundId, pool);
+  const prize = pickFromOdds(odds);
+
+  try {
+    if (prize.key === "zonk") {
+      return sendMsg("😅 <b>Zonk!</b> Belum beruntung hari ini. Coba lagi besok ya!", backBtn);
+    }
+
+    if (prize.key === "saldo") {
+      const d = await deductUserSaldo(fundId, SPIN_SALDO_AMOUNT);
+      if (!d.ok) {
+        // kas berubah sejak peluang dihitung: anggap zonk, jangan minus
+        return sendMsg("😅 <b>Zonk!</b> Belum beruntung hari ini. Coba lagi besok ya!", backBtn);
+      }
+      let newSaldo;
+      try {
+        newSaldo = await addUserSaldo(userId, SPIN_SALDO_AMOUNT);
+      } catch (addErr) {
+        await addUserSaldo(fundId, SPIN_SALDO_AMOUNT);
+        throw addErr;
+      }
+      return sendMsg(
+        `🎉 <b>Kamu dapat saldo ${formatRupiah(SPIN_SALDO_AMOUNT)}!</b>\n` +
+          `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>`,
+        backBtn
+      );
+    }
+
+    // Hadiah pack: pilih satu item acak dari tier, simpan ke koleksi
+    const items = pool[prize.key];
+    const item = items[Math.floor(Math.random() * items.length)];
+    const link = normalizeUrl(
+      Array.isArray(item.links) && item.links.length > 0 ? item.links[0] : item.link
+    );
+    await addKoleksi(userId, item.nama, link);
+    return sendMsg(
+      `🎁 <b>Kamu dapat ${escapeHtml(item.nama)}!</b>\n\n` +
+        `🔗 ${escapeHtml(link)}\n\n` +
+        `<i>Tersimpan juga di 🎒 Koleksi Saya.</i>`,
+      backBtn
+    );
+  } catch (err) {
+    await redisCommand(["HDEL", spinKey, String(userId)]);
+    throw err;
+  }
+}
+
+// ---- KLAIM SALDO SUBSCRIBE ----
+async function getSubReq(reqId) {
+  const raw = await redisCommand(["HGET", REDIS_SUB_REQ_KEY, String(reqId)]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function saveSubReq(reqId, data) {
+  await redisCommand(["HSET", REDIS_SUB_REQ_KEY, String(reqId), JSON.stringify(data)]);
+}
+
+async function sendSubInfo(token, chatId, userId) {
+  const sendMsg = (text, markup) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...(markup ? { reply_markup: markup } : {}),
+    });
+  const backBtn = [[{ text: "🔙 Menu Utama", callback_data: "menu_home" }]];
+  const uid = String(userId);
+
+  if (!SUB_CLAIM_ENABLED) return sendMsg("⚠️ Klaim saldo subscribe sedang tidak aktif.", { inline_keyboard: backBtn });
+
+  const claimed = Number(await redisCommand(["HEXISTS", REDIS_SUB_CLAIMED_KEY, uid])) === 1;
+  if (claimed) {
+    return sendMsg("✅ Kamu sudah pernah klaim saldo subscribe. Klaim hanya bisa sekali ya.", { inline_keyboard: backBtn });
+  }
+  const pend = await redisCommand(["HGET", REDIS_SUB_PENDING_KEY, uid]);
+  if (pend && pend !== "waiting") {
+    return sendMsg("⏳ Bukti subscribe kamu sedang diverifikasi admin. Mohon tunggu ya.", { inline_keyboard: backBtn });
+  }
+  if (!(await checkinEligible(userId))) {
+    return sendMsg(
+      "🔒 <b>Klaim saldo subscribe khusus pembeli.</b>\nBelanja atau deposit dulu sekali, lalu kamu bisa klaim.",
+      { inline_keyboard: backBtn }
+    );
+  }
+
+  return sendMsg(
+    `🎁 <b>KLAIM SALDO ${formatRupiah(SUB_CLAIM_REWARD)}</b>\n\n` +
+      `1️⃣ Subscribe ke <b>${escapeHtml(SUB_CLAIM_CHANNEL_NAME)}</b> lewat tombol di bawah.\n` +
+      `2️⃣ Kembali ke sini, tekan <b>Sudah Subscribe</b>, lalu kirim screenshot bukti subscribe.\n\n` +
+      `<i>Saldo ini hanya bisa dipakai belanja di bot dan tidak bisa ditarik tunai. Klaim hanya bisa sekali.</i>`,
+    {
+      inline_keyboard: [
+        [{ text: "🔔 Subscribe Sekarang", url: SUB_CLAIM_LINK }],
+        [{ text: "📸 Sudah Subscribe, Kirim Bukti", callback_data: "sub_start" }],
+        ...backBtn,
+      ],
+    }
+  );
+}
+
+async function startSubProof(token, chatId, userId) {
+  const sendMsg = (text) =>
+    tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+  const uid = String(userId);
+
+  if (!SUB_CLAIM_ENABLED) return sendMsg("⚠️ Klaim saldo subscribe sedang tidak aktif.");
+
+  const claimed = Number(await redisCommand(["HEXISTS", REDIS_SUB_CLAIMED_KEY, uid])) === 1;
+  if (claimed) return sendMsg("✅ Kamu sudah pernah klaim saldo subscribe.");
+  const pend = await redisCommand(["HGET", REDIS_SUB_PENDING_KEY, uid]);
+  if (pend && pend !== "waiting") return sendMsg("⏳ Bukti subscribe kamu sedang diverifikasi admin.");
+  if (!(await checkinEligible(userId))) {
+    return sendMsg("🔒 Klaim saldo subscribe khusus pembeli. Belanja atau deposit dulu sekali ya.");
+  }
+
+  await redisCommand(["HSET", REDIS_SUB_PENDING_KEY, uid, "waiting"]);
+  return sendMsg(
+    "📸 Kirim <b>screenshot bukti subscribe</b> sekarang di chat ini.\n" +
+      "<i>Pastikan nama channel dan tombol Subscribe/Subscribed terlihat jelas.</i>"
+  );
+}
+
+async function handleSubProof(token, msg, userId) {
+  const chatId = msg.chat.id;
+  const fileId = msg.photo[msg.photo.length - 1].file_id;
+  const reqId = String(await redisCommand(["INCR", REDIS_SUB_SEQ_KEY]));
+  const name = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Pembeli";
+  const username = (msg.from && msg.from.username) || "";
+
+  await saveSubReq(reqId, {
+    id: reqId,
+    user_id: String(userId),
+    name,
+    username,
+    status: "pending",
+    created: getWibTimestamp(),
+  });
+  await redisCommand(["HSET", REDIS_SUB_PENDING_KEY, String(userId), reqId]);
+
+  const qris = await getQris();
+  const adminChat = qris && qris.admin_chat_id;
+  if (adminChat) {
+    await tgRequest(token, "sendPhoto", {
+      chat_id: adminChat,
+      photo: fileId,
+      caption:
+        `🎁 <b>KLAIM SUBSCRIBE #${reqId}</b>\n` +
+        `👤 ${escapeHtml(name)}${username ? ` (@${escapeHtml(username)})` : ""}\n` +
+        `🆔 <code>${escapeHtml(String(userId))}</code>\n` +
+        `📺 ${escapeHtml(SUB_CLAIM_CHANNEL_NAME)}\n` +
+        `💰 Hadiah: <b>${formatRupiah(SUB_CLAIM_REWARD)}</b>`,
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ ACC", callback_data: `subacc_${reqId}` },
+            { text: "❌ Tolak", callback_data: `subrej_${reqId}` },
+          ],
+        ],
+      },
+    });
+  } else {
+    console.error("Klaim subscribe: admin_chat_id belum diset, bukti tidak terkirim ke admin.");
+  }
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: "📨 Bukti kamu sudah dikirim. Admin akan memverifikasi, dan saldo masuk setelah di-ACC.",
+    parse_mode: "HTML",
+  });
+}
+
+async function processSubReview(token, chatId, messageId, reqId, isAcc) {
+  const req = await getSubReq(reqId);
+  if (!req || req.status !== "pending") {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `⚠️ Klaim #${escapeHtml(String(reqId))} tidak ditemukan atau sudah diproses.`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const userId = req.user_id;
+  const fundId = await getReferralFundId();
+
+  if (isAcc) {
+    if (!fundId) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: chatId,
+        text: "⚠️ Kas admin belum diset, klaim belum bisa di-ACC.",
+      });
+      return;
+    }
+    const d = await deductUserSaldo(fundId, SUB_CLAIM_REWARD);
+    if (!d.ok) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: chatId,
+        text:
+          `⚠️ <b>Saldo kas tidak cukup untuk ACC klaim #${reqId}.</b>\n` +
+          `💳 Saldo kas: <b>${formatRupiah(d.balance)}</b>\n` +
+          `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>, lalu tekan ACC lagi.`,
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    let newSaldo;
+    try {
+      newSaldo = await addUserSaldo(userId, SUB_CLAIM_REWARD);
+    } catch (addErr) {
+      await addUserSaldo(fundId, SUB_CLAIM_REWARD);
+      throw addErr;
+    }
+
+    req.status = "acc";
+    await saveSubReq(reqId, req);
+    await redisCommand(["HSET", REDIS_SUB_CLAIMED_KEY, userId, reqId]);
+    await redisCommand(["HDEL", REDIS_SUB_PENDING_KEY, userId]);
+
+    await tgRequest(token, "sendMessage", {
+      chat_id: userId,
+      text:
+        `🎉 <b>Klaim saldo subscribe berhasil!</b>\n` +
+        `💰 Saldo masuk: <b>+${formatRupiah(SUB_CLAIM_REWARD)}</b>\n` +
+        `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>\n\n` +
+        `<i>Saldo ini hanya bisa dipakai belanja di bot.</i>`,
+      parse_mode: "HTML",
+    });
+  } else {
+    req.status = "rejected";
+    await saveSubReq(reqId, req);
+    await redisCommand(["HDEL", REDIS_SUB_PENDING_KEY, userId]);
+
+    await tgRequest(token, "sendMessage", {
+      chat_id: userId,
+      text:
+        "❌ Bukti subscribe kamu belum bisa diterima.\n" +
+        "Pastikan screenshot jelas, lalu kirim ulang lewat menu 💰 Saldo & Depo > 🎁 Klaim Saldo Subscribe.",
+      parse_mode: "HTML",
+    });
+  }
+
+  await tgRequest(token, "editMessageCaption", {
+    chat_id: chatId,
+    message_id: messageId,
+    caption:
+      `${isAcc ? "✅ <b>DI-ACC</b>" : "❌ <b>DITOLAK</b>"} klaim subscribe #${escapeHtml(String(reqId))}\n` +
+      `👤 ${escapeHtml(req.name)}${req.username ? ` (@${escapeHtml(req.username)})` : ""}\n` +
+      `🆔 <code>${escapeHtml(String(userId))}</code>`,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [] },
+  });
+}
+
 async function sendSaldoMenu(token, chatId, userId) {
   const [saldo, allCnt] = await Promise.all([
     getUserSaldo(userId),
@@ -1916,6 +2400,15 @@ async function sendSaldoMenu(token, chatId, userId) {
         [
           { text: "➕ Rp 25.000", callback_data: "depo_25000" },
           { text: "➕ Rp 50.000", callback_data: "depo_50000" },
+        ],
+        [
+          { text: "✅ Check-in Harian (+Rp100)", callback_data: "checkin" },
+        ],
+        [
+          { text: "🎡 Spin Gratis Harian", callback_data: "spin_info" },
+        ],
+        [
+          { text: "🎁 Klaim Saldo Subscribe", callback_data: "sub_info" },
         ],
         [
           { text: "🛍️ Belanja Pakai Saldo", callback_data: "menu_katalog" },
@@ -4646,6 +5139,16 @@ module.exports = async function handler(req, res) {
         await sendMainMenuCard(token, chatId);
       } else if (data === "menu_saldo") {
         await sendSaldoMenu(token, chatId, callerId);
+      } else if (data === "checkin") {
+        await claimDailyCheckin(token, chatId, callerId);
+      } else if (data === "sub_info") {
+        await sendSubInfo(token, chatId, callerId);
+      } else if (data === "sub_start") {
+        await startSubProof(token, chatId, callerId);
+      } else if (data === "spin_info") {
+        await sendSpinInfo(token, chatId, callerId);
+      } else if (data === "spin_go") {
+        await doSpin(token, chatId, callerId);
       } else if (data.startsWith("depo_")) {
         const nominal = parseInt(data.replace("depo_", ""), 10) || 0;
         await createAndSendDepositInvoice(token, chatId, call.from, nominal);
@@ -5109,6 +5612,11 @@ module.exports = async function handler(req, res) {
             parse_mode: "HTML",
           });
         }
+      } else if (data.startsWith("subacc_") || data.startsWith("subrej_")) {
+        if (!isCallerAdmin) return res.status(200).json({ ok: true });
+        const isAccSub = data.startsWith("subacc_");
+        const reqIdSub = data.replace(isAccSub ? "subacc_" : "subrej_", "");
+        await processSubReview(token, chatId, messageId, reqIdSub, isAccSub);
       } else if (data.startsWith("wdacc_") || data.startsWith("wdrej_")) {
         if (!isCallerAdmin) return res.status(200).json({ ok: true });
         const isAcc = data.startsWith("wdacc_");
@@ -6731,6 +7239,15 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
+      }
+
+      // 12B. BUKTI SUBSCRIBE UNTUK KLAIM SALDO (hanya saat user sedang menunggu)
+      if (msg.photo && msg.photo.length > 0 && !isAdmin) {
+        const subState = await redisCommand(["HGET", REDIS_SUB_PENDING_KEY, String(senderId)]);
+        if (subState === "waiting") {
+          await handleSubProof(token, msg, senderId);
+          return res.status(200).json({ ok: true });
+        }
       }
 
       // 13. FOTO TANPA CAPTION PERINTAH
