@@ -5774,6 +5774,80 @@ async function removeMitra(token, uid) {
   return true;
 }
 
+// ==========================================
+// HADIAH MITRA TERBAIK BULANAN (SALDO, ADA MINIMAL KOMISI)
+// ==========================================
+const MITRA_TOP_ENABLED = true;
+const MITRA_TOP_REWARD = [10000, 5000, 3000]; // saldo untuk peringkat 1, 2, 3
+const MITRA_TOP_MIN_KOMISI = 20000; // minimal komisi bulan itu agar berhak dapat hadiah (Rp)
+const REDIS_MITRA_TOP_LOCK_PREFIX = "lumine_main_mitra_top_"; // kunci anti-dobel per bulan
+
+function prevMonthKeyWib() {
+  const d = new Date(Date.now() + 7 * 3600 * 1000);
+  d.setUTCDate(1);
+  d.setUTCMonth(d.getUTCMonth() - 1);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+}
+
+// Jalan di update pertama setelah pergantian bulan, sekali per bulan
+async function maybeAwardMitraTop(token) {
+  if (!MITRA_TOP_ENABLED) return;
+  const monthKey = prevMonthKeyWib();
+  const locked = await redisCommand([
+    "SET",
+    REDIS_MITRA_TOP_LOCK_PREFIX + monthKey,
+    "1",
+    "NX",
+    "EX",
+    String(60 * 60 * 24 * 400),
+  ]);
+  if (!locked) return;
+
+  const raw = await redisCommand(["HGETALL", REDIS_MITRA_MONTH_PREFIX + monthKey]);
+  const entries = [];
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      entries.push({ uid: String(raw[i]), total: parseInt(raw[i + 1], 10) || 0 });
+    }
+  }
+  const winners = entries
+    .filter((e) => e.total >= MITRA_TOP_MIN_KOMISI)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, MITRA_TOP_REWARD.length);
+
+  if (!winners.length) return;
+
+  const medals = ["🥇", "🥈", "🥉"];
+  const lines = [];
+  for (let i = 0; i < winners.length; i++) {
+    const w = winners[i];
+    const hadiah = MITRA_TOP_REWARD[i];
+    await addUserSaldo(w.uid, hadiah);
+    lines.push(`${medals[i]} <code>${w.uid}</code> — komisi ${formatRupiah(w.total)} ➜ +${formatRupiah(hadiah)}`);
+    await tgRequest(token, "sendMessage", {
+      chat_id: w.uid,
+      parse_mode: "HTML",
+      text:
+        `🏆 <b>Selamat! Kamu Mitra Terbaik ${medals[i]} bulan ${escapeHtml(monthKey)}</b>\n\n` +
+        `Total komisimu: <code>${formatRupiah(w.total)}</code>\n` +
+        `🎁 Bonus saldo: <code>+${formatRupiah(hadiah)}</code>\n\n` +
+        `Terus share linkmu ya! 💜`,
+    });
+  }
+
+  const qris = await getQris();
+  if (qris && qris.admin_chat_id) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: qris.admin_chat_id,
+      parse_mode: "HTML",
+      text:
+        `🏆 <b>Hadiah Mitra Terbaik ${escapeHtml(monthKey)}</b>\n` +
+        `Minimal komisi: ${formatRupiah(MITRA_TOP_MIN_KOMISI)}\n\n` +
+        lines.join("\n"),
+    });
+  }
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -6649,6 +6723,13 @@ module.exports = async function handler(req, res) {
       if (msg.chat && msg.chat.type === "private") {
         const addedRes = await redisCommand(["SADD", REDIS_USERS_KEY, String(chatId)]);
         isNewUser = Number(addedRes) === 1;
+      }
+
+      // Hadiah mitra terbaik bulan lalu (sekali per bulan)
+      try {
+        await maybeAwardMitraTop(token);
+      } catch (mtErr) {
+        console.error("Hadiah mitra terbaik error:", mtErr);
       }
 
       // Ringkasan harian untuk admin (sekali per hari)
