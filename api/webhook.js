@@ -5983,74 +5983,126 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      // 9. ADMIN: /tambah
+      // 9. ADMIN: /tambah (mendukung multi-set per baris untuk nama set yang beda-beda)
       if (rawText.startsWith("/tambah")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const content = rawText.replace(/^\/tambah\s*/i, "").trim();
-        const parts = content.split("|").map((p) => p.trim());
-
-        if (parts.length < 4 || !parts[0] || !parts[1] || !parts[2] || !parts[3]) {
-          await tgRequest(token, "sendMessage", {
-            chat_id: chatId,
-            text:
-              "⚠️ Format kurang lengkap! Kirim foto preview dengan caption:\n" +
-              "<code>/tambah Nama Set | Isi | Harga | Link1, Link2 | kategori</code>\n\n" +
-              "<i>• Link bisa lebih dari satu, pisahkan dengan koma.\n" +
-              "• Kategori opsional: <code>mini</code> atau <code>full</code> (default: mini).\n" +
-              "• Mau tambah file upload langsung (bukan link)? Pakai <code>/tambahfile [nomor]</code> setelah set ini tersimpan.</i>",
-            parse_mode: "HTML",
-          });
-          return res.status(200).json({ ok: true });
-        }
+        const rawLines = content
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter(Boolean);
 
         let photoId = "";
         if (msg.photo && msg.photo.length > 0) {
           photoId = msg.photo[msg.photo.length - 1].file_id;
         }
 
-        const linksArr = parts[3]
-          .split(/[\n,]+/)
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .map(normalizeUrl);
-        const kategoriRaw = (parts[4] || "mini").toLowerCase();
-        const kategori = kategoriRaw.includes("full") ? "full" : "mini";
-        const creator = (parts[5] || "").replace(/\s+/g, " ").trim().slice(0, 60);
+        const parsedEntries = [];
+        for (const line of rawLines) {
+          const parts = line.split("|").map((p) => p.trim());
+          if (parts.length < 4 || !parts[0] || !parts[1] || !parts[2] || !parts[3]) {
+            await tgRequest(token, "sendMessage", {
+              chat_id: chatId,
+              text:
+                "⚠️ Format kurang lengkap! Kirim foto preview dengan caption:\n" +
+                "<code>/tambah Nama Set | Isi | Harga | Link1, Link2 | kategori | Creator</code>\n\n" +
+                "<b>Tambah banyak set dengan nama beda sekaligus (1 baris = 1 set):</b>\n" +
+                "<code>/tambah Set A | 20 Foto | 5000 | https://link1 | mini\n" +
+                "Set B | 40 Foto | 10000 | https://link2, https://link3 | full</code>\n\n" +
+                "<i>• Link dalam satu set bisa lebih dari satu, pisahkan dengan koma.\n" +
+                "• Kategori opsional: <code>mini</code> atau <code>full</code> (default: mini).\n" +
+                "• Creator opsional di kolom ke-6.</i>",
+              parse_mode: "HTML",
+            });
+            return res.status(200).json({ ok: true });
+          }
+
+          const linksArr = parts[3]
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .map(normalizeUrl);
+          const kategoriRaw = (parts[4] || "mini").toLowerCase();
+          const kategori = kategoriRaw.includes("full") ? "full" : "mini";
+          const creator = (parts[5] || "").replace(/\s+/g, " ").trim().slice(0, 60);
+
+          parsedEntries.push({
+            nama: parts[0],
+            isi: parts[1],
+            harga: parts[2],
+            links: linksArr,
+            link: linksArr[0] || "",
+            files: [],
+            kategori,
+            creator,
+            photo_id: photoId,
+            sold: 0,
+          });
+        }
+
+        if (parsedEntries.length === 0) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "⚠️ Format kurang lengkap! Gunakan:\n" +
+              "<code>/tambah Nama Set | Isi | Harga | Link1, Link2 | kategori</code>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
 
         const katalogList = await getKatalog();
-        const newItem = {
-          id: Date.now().toString(),
-          nama: parts[0],
-          isi: parts[1],
-          harga: parts[2],
-          links: linksArr,
-          link: linksArr[0] || "",
-          files: [],
-          kategori,
-          creator,
-          photo_id: photoId,
-          sold: 0,
-        };
+        const baseId = Date.now();
+        const addedItems = [];
 
-        katalogList.push(newItem);
+        parsedEntries.forEach((entry, idx) => {
+          const item = {
+            id: `${baseId}_${idx}`,
+            ...entry,
+          };
+          katalogList.push(item);
+          addedItems.push({ index: katalogList.length, item });
+        });
+
         await saveKatalog(katalogList);
 
-        await tgRequest(token, "sendMessage", {
-          chat_id: chatId,
-          text:
-            `✅ <b>Berhasil ditambahkan ke Katalog!</b>\n` +
-            `• <b>Nama:</b> ${escapeHtml(newItem.nama)}\n` +
-            (creator ? `• <b>Creator:</b> 👤 ${escapeHtml(creator)}\n` : "") +
-            `• <b>Isi:</b> ${escapeHtml(newItem.isi)}\n` +
-            `• <b>Harga:</b> ${escapeHtml(newItem.harga)}\n` +
-            `• <b>Kategori:</b> ${kategori === "full" ? "📦 Full Set" : "🧩 Mini Set"}\n` +
-            `• <b>Jumlah Link:</b> ${linksArr.length}x\n` +
-            (linksArr.length > 0
-              ? linksArr.map((l, i) => `  ${i + 1}. ${escapeHtml(l)}`).join("\n") + "\n"
-              : "") +
-            `\n<i>Mau lampirkan file upload langsung? Kirim foto/dokumen dengan caption <code>/tambahfile ${katalogList.length}</code></i>`,
-          parse_mode: "HTML",
-        });
+        if (addedItems.length === 1) {
+          const { index: setIdx, item: newItem } = addedItems[0];
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              `✅ <b>Berhasil ditambahkan ke Katalog!</b>\n` +
+              `• <b>Nama:</b> ${escapeHtml(newItem.nama)}\n` +
+              (newItem.creator ? `• <b>Creator:</b> 👤 ${escapeHtml(newItem.creator)}\n` : "") +
+              `• <b>Isi:</b> ${escapeHtml(newItem.isi)}\n` +
+              `• <b>Harga:</b> ${escapeHtml(newItem.harga)}\n` +
+              `• <b>Kategori:</b> ${newItem.kategori === "full" ? "📦 Full Set" : "🧩 Mini Set"}\n` +
+              `• <b>Jumlah Link:</b> ${newItem.links.length}x\n` +
+              (newItem.links.length > 0
+                ? newItem.links.map((l, i) => `  ${i + 1}. ${escapeHtml(l)}`).join("\n") + "\n"
+                : "") +
+              `\n<i>Mau lampirkan file upload langsung? Kirim foto/dokumen dengan caption <code>/tambahfile ${setIdx}</code></i>`,
+            parse_mode: "HTML",
+          });
+        } else {
+          const summaryLines = addedItems
+            .map(
+              ({ index: setIdx, item }) =>
+                `${setIdx}. <b>${escapeHtml(item.nama)}</b> — ${escapeHtml(item.harga)} (${
+                  item.kategori === "full" ? "📦 Full" : "🧩 Mini"
+                }, ${item.links.length} link)`
+            )
+            .join("\n");
+
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              `✅ <b>${addedItems.length} Set Berhasil Ditambahkan ke Katalog!</b>\n\n` +
+              `${summaryLines}\n\n` +
+              `<i>Mau lampirkan file upload ke set tertentu? Pakai <code>/tambahfile [nomor]</code></i>`,
+            parse_mode: "HTML",
+          });
+        }
         return res.status(200).json({ ok: true });
       }
 
