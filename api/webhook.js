@@ -1721,11 +1721,9 @@ function normalizeUrl(rawUrl) {
 function getCompactReplyKeyboard() {
   return {
     keyboard: [
-      [{ text: "🛍️ Katalog" }, { text: "🔥 Bestseller" }],
-      [{ text: "🎲 Mystery Box" }],
-      [{ text: "💰 Saldo & Depo" }, { text: "🎒 Koleksi Saya" }],
-      [{ text: "🏆 Leaderboard" }, { text: "💎 Info & Channel" }],
-      [{ text: "🤝 Reseller" }],
+      [{ text: "🛍️ Katalog" }, { text: "💰 Saldo & Depo" }],
+      [{ text: "🎒 Koleksi Saya" }, { text: "🎲 Mystery Box" }],
+      [{ text: "☰ Lainnya" }],
     ],
     resize_keyboard: true,
   };
@@ -1753,10 +1751,6 @@ async function sendSaldoMenu(token, chatId, userId) {
         [
           { text: "➕ Rp 5.000", callback_data: "depo_5000" },
           { text: "➕ Rp 10.000", callback_data: "depo_10000" },
-        ],
-        [
-          { text: "➕ Rp 15.000", callback_data: "depo_15000" },
-          { text: "➕ Rp 20.000", callback_data: "depo_20000" },
         ],
         [
           { text: "➕ Rp 25.000", callback_data: "depo_25000" },
@@ -1841,37 +1835,28 @@ async function sendMainMenuCard(token, chatId) {
   const cardText =
     "✨ <b>LUMINE PHOTOPACK</b> ✨\n" +
     "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n\n" +
-    "╭─── 💰 <b>DAFTAR HARGA</b> ───\n" +
-    `│ • <b>Paket Standar</b> : <code>${formatRupiah(RETAIL_PRICE_LITE)}</code>\n` +
-    `│ • <b>Paket Premium</b> : <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
-    `│ • 🎲 <b>Mystery Box Gacha</b> : <code>${formatRupiah(mysteryCfg.price || 3000)}</code>\n` +
-    "╰────────────────────\n\n" +
-    "💳 Bisa <b>Deposit Saldo (Auto-ACC)</b> untuk checkout 1x klik tanpa kode unik!\n" +
-    "🎟️ Punya kode voucher? Ketik <code>/voucher KODE</code> sebelum checkout!\n\n" +
-    "Silakan pilih menu di bawah ini 👇";
+    `• <b>Standar:</b> <code>${formatRupiah(RETAIL_PRICE_LITE)}</code> | <b>Premium:</b> <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
+    `• <b>Mystery Box:</b> <code>${formatRupiah(mysteryCfg.price || 3000)}</code>\n\n` +
+    "Pilih menu di bawah 👇";
 
   const inlineMarkup = {
     inline_keyboard: [
       [
-        { text: "🛍️ Katalog Photopack", callback_data: "menu_katalog" },
+        { text: "🛍️ Katalog", callback_data: "menu_katalog" },
         { text: "🔥 Bestseller", callback_data: "menu_bestseller" },
       ],
-      [{ text: "🎲 Mystery Box", callback_data: "menu_mystery" }],
       [
-        { text: "💰 Saldo & Deposit", callback_data: "menu_saldo" },
+        { text: "💰 Saldo & Depo", callback_data: "menu_saldo" },
         { text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" },
       ],
       [
+        { text: "🎲 Mystery Box", callback_data: "menu_mystery" },
         { text: "🏆 Leaderboard", callback_data: "menu_lb" },
-        { text: "🎟️ Pakai Voucher", callback_data: "menu_voucher" },
       ],
       [
-        { text: "📋 Cara Order", callback_data: "menu_cara" },
-        { text: "🤝 Menu Reseller", callback_data: "menu_reseller" },
+        { text: "☰ Menu Lainnya", callback_data: "menu_lainnya" },
+        { text: "💬 Admin", url: `https://t.me/${ADMIN_USERNAME}` },
       ],
-      [{ text: "🎁 Undang Teman (Bonus Saldo)", callback_data: "menu_undang" }],
-      [{ text: "🔗 Channel Lainnya", callback_data: "menu_channel" }],
-      [{ text: `💬 Admin (@${ADMIN_USERNAME})`, url: `https://t.me/${ADMIN_USERNAME}` }],
     ],
   };
 
@@ -2362,6 +2347,32 @@ async function sendChannelLainnya(token, chatId) {
     reply_markup: { inline_keyboard: rows },
   });
     }
+
+async function sendMoreMenu(token, chatId) {
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: "☰ <b>MENU LAINNYA</b>\n\nPilih fitur atau informasi tambahan:",
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "🎟️ Pakai Voucher", callback_data: "menu_voucher" },
+          { text: "🎁 Undang Teman", callback_data: "menu_undang" },
+        ],
+        [
+          { text: "🤝 Reseller", callback_data: "menu_reseller" },
+          { text: "📋 Cara Order", callback_data: "menu_cara" },
+        ],
+        [
+          { text: "🔗 Channel Resmi", callback_data: "menu_channel" },
+          { text: `💬 Admin`, url: `https://t.me/${ADMIN_USERNAME}` },
+        ],
+        [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
+      ],
+    },
+  });
+}
+
     async function resolvePurchaseTarget(targetKey) {
   if (targetKey === "mystery") {
     const cfg = await getMysteryConfig();
@@ -3110,7 +3121,7 @@ function getRbReplyKeyboard() {
   return {
     keyboard: [
       [{ text: "🛍️ Katalog" }, { text: "🔥 Bestseller" }],
-      [{ text: "📋 Cara Order" }, { text: "🏠 Menu Utama" }],
+      [{ text: "🏠 Menu Utama" }],
     ],
     resize_keyboard: true,
   };
@@ -4458,6 +4469,8 @@ module.exports = async function handler(req, res) {
         await sendKatalogMenu(token, chatId);
       } else if (data === "menu_cara") {
         await sendCaraOrder(token, chatId);
+      } else if (data === "menu_lainnya") {
+        await sendMoreMenu(token, chatId);
       } else if (data === "menu_channel") {
         await sendChannelLainnya(token, chatId);
       } else if (data === "menu_undang") {
@@ -6362,6 +6375,8 @@ module.exports = async function handler(req, res) {
           await sendKoleksiMenu(token, chatId, senderId);
         } else if (text === "📋 Cara Order" || text === "📋 Cara Beli & Aturan") {
           await sendCaraOrder(token, chatId);
+        } else if (text === "☰ Lainnya" || text === "Menu Lainnya") {
+          await sendMoreMenu(token, chatId);
         } else if (text === "💎 Info & Channel") {
           await sendChannelLainnya(token, chatId);
         } else if (text === "/undang" || text === "/referral") {
