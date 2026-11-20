@@ -2,8 +2,8 @@
 // 1. PENGATURAN UTAMA (BOT UTAMA — FULL FITUR + AUTO-ACC MAKRO + DEPO SALDO)
 // ==========================================
 const ADMIN_USERNAME = "Fellstore1"; // Tanpa tanda @
-const LINK_CH_CADANGAN = "https://t.me/+OGXaaPyrnd5kMmY1";
-const LINK_CH_FREE = "https://t.me/+jf3tLqLIG444MjBI";
+const LINK_CH_CADANGAN = "https://t.me/+Pd0EmIbh4g9kZjU1";
+const LINK_CH_FREE = "https://t.me/+fjB1pH3w7wIyNzVl";
 
 // ---- PENGATURAN MENU RESELLER (UBAH SESUAI KEBUTUHAN) ----
 const RETAIL_PRICE_LITE = 5000; // harga retail Paket Standar (nama tampilan; variabel LITE = paket Rp 5.000)
