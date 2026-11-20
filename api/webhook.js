@@ -1100,7 +1100,7 @@ module.exports = async function handler(req, res) {
     (req.query && String(req.query.autoacc) === "1") ||
     (req.body && typeof req.body === "object" && String(req.body.autoacc) === "1");
 
-  if (isAutoAccCall) {
+    if (isAutoAccCall) {
     try {
       const macroCfg = await getMacroConfig();
       if (!macroCfg.enabled) {
@@ -1132,15 +1132,33 @@ module.exports = async function handler(req, res) {
         bodyObj.text,
       ]
         .filter(Boolean)
-        .join(" ");
+        .join(" ")
+        .trim();
 
       const nominals = extractNominalsFromNotif(rawNotif);
       const matchedOrder = await findPendingOrderByNominals(nominals);
+      const qris = await getQris();
 
       if (!matchedOrder) {
+        // Kirim log debug ke Admin agar terlihat teks asli notif GoPay yang masuk ke Vercel
+        if (qris && qris.admin_chat_id) {
+          const debugText = escapeHtml(rawNotif || "(KOSONG / TIDAK TERBACA)");
+          const debugNums = nominals.length > 0 ? nominals.join(", ") : "Tidak ada angka";
+          await tgRequest(token, "sendMessage", {
+            chat_id: qris.admin_chat_id,
+            text:
+              `🔍 <b>LOG MAKRO MASUK (BELUM COCOK)</b>\n\n` +
+              `📲 <b>Isi Notif:</b> <i>"${debugText}"</i>\n` +
+              `🔢 <b>Angka Terbaca:</b> <code>${escapeHtml(debugNums)}</code>\n\n` +
+              `<i>Pastikan ada pesanan pending dengan total transfer yang sama persis.</i>`,
+            parse_mode: "HTML",
+          });
+        }
+
         return res.status(200).json({
           ok: true,
           matched: false,
+          raw_notif: rawNotif,
           extracted_nominals: nominals,
           message: "Tidak ada pesanan aktif dengan nominal tersebut.",
         });
@@ -1148,7 +1166,6 @@ module.exports = async function handler(req, res) {
 
       const { deliveredName } = await processAccOrder(token, matchedOrder);
 
-      const qris = await getQris();
       if (qris && qris.admin_chat_id) {
         const mysteryNote = matchedOrder.is_mystery
           ? `\n🎲 <b>Hadiah Gacha:</b> ${escapeHtml(deliveredName)}`
