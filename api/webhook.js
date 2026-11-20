@@ -11,6 +11,15 @@ const RETAIL_PRICE_STANDAR = 10000; // harga retail Paket Premium (variabel STAN
 const RESELLER_PRICE_LITE = 3500; // harga modal reseller Paket Standar (retail Rp 5.000)
 const RESELLER_PRICE_STANDAR = 7000; // harga modal reseller Paket Premium (retail Rp 10.000)
 const RESELLER_MIN_ORDER = 10; // minimal ambil set per order
+
+// ---- PENGATURAN RESELLER PREM (BELI SENDIRI LEWAT BOT) ----
+// User bayar harga paket -> otomatis jadi reseller + dapat saldo awal gratis yang DIPOTONG dari saldo kas admin.
+const RESELLER_PREM_ENABLED = true; // false = matikan menu Reseller Prem
+const RESELLER_PREM_PRICE = 30000; // harga paket Reseller Prem
+const RESELLER_PREM_BONUS_SALDO = 15000; // saldo awal gratis untuk pembeli (dari kas admin)
+const RESELLER_PREM_FROM_ADMIN_SALDO = true; // true = bonus dipotong dari saldo kas admin; false = bonus langsung ditambah tanpa potong
+const RESELLER_PREM_TARGET = "resprem"; // kunci internal (callback buy_resprem), jangan diubah
+const REDIS_RESPREM_BONUS_KEY = "lumine_main_resprem_bonus"; // hash: id user -> id order (bonus sudah dicairkan, anti dobel)
 const DEFAULT_MACRO_SECRET = "lumineacc2026"; // nilai LAMA — sekarang DITOLAK sebagai secret (ganti lewat /setmacro KODEBARU)
 const nodeCrypto = require("crypto");
 const REDIS_ADMIN_ID_KEY = "lumine_main_admin_id"; // ID numerik admin (dikunci otomatis saat pertama kali admin chat)
@@ -1310,6 +1319,7 @@ async function clearUpsellOffer(userId) {
 
 // Pilih diskon terbaik (tidak ditumpuk): voucher aktif ATAU penawaran upsell untuk set tsb.
 async function resolveBestDiscount(userId, itemId, baseNominal) {
+  if (String(itemId) === RESELLER_PREM_TARGET) return { source: "", discount: 0, code: "" };
   const maxCut = Math.max(0, baseNominal - 500);
 
   let voucherDisc = 0;
@@ -1555,6 +1565,116 @@ async function processAccOrder(token, order) {
   return result;
 }
 
+// Potong bonus Reseller Prem dari saldo kas admin. Tidak memblokir bonus (pembeli sudah bayar),
+// jadi saldo kas boleh minus sebagai tanda admin perlu isi ulang.
+async function chargeFundForResellerPrem(token, buyerName) {
+  if (!RESELLER_PREM_FROM_ADMIN_SALDO || !(RESELLER_PREM_BONUS_SALDO > 0)) return null;
+  const fundId = await getReferralFundId();
+  if (!fundId) return null;
+
+  const after = parseInt(
+    await redisCommand(["HINCRBY", REDIS_SALDO_KEY, String(fundId), -Math.round(RESELLER_PREM_BONUS_SALDO)]),
+    10
+  );
+  if (isNaN(after)) return null;
+  const before = after + Math.round(RESELLER_PREM_BONUS_SALDO);
+
+  if (before >= 0 && after < 0) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: fundId,
+      text:
+        `🚨 <b>Saldo kas MINUS ${formatRupiah(Math.abs(after))}!</b>\n` +
+        `Bonus Reseller Prem <b>${escapeHtml(buyerName || "Reseller")}</b> (${formatRupiah(RESELLER_PREM_BONUS_SALDO)}) sudah dipotong.\n` +
+        `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>`,
+      parse_mode: "HTML",
+    });
+  } else if (before >= REFERRAL_FUND_LOW_WARN && after < REFERRAL_FUND_LOW_WARN) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: fundId,
+      text:
+        `🔔 <b>Saldo kas tinggal ${formatRupiah(after)}.</b>\n` +
+        `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>`,
+      parse_mode: "HTML",
+    });
+  }
+  return { fundId, balance: after };
+}
+
+async function processResellerPremOrder(token, order) {
+  const buyerId = String(order.buyer_id);
+  const alreadyReseller = await isReseller(buyerId);
+  if (!alreadyReseller) {
+    await addReseller(buyerId, order.buyer_name);
+  }
+
+  // Bonus saldo awal: cair satu kali per user (aman walau ACC terpanggil dua kali)
+  const claimed = await redisCommand(["HSETNX", REDIS_RESPREM_BONUS_KEY, buyerId, String(order.id)]);
+  let bonusGiven = 0;
+  let newSaldo = await getUserSaldo(buyerId);
+  let fund = null;
+  if (Number(claimed) === 1 && RESELLER_PREM_BONUS_SALDO > 0) {
+    try {
+      fund = await chargeFundForResellerPrem(token, order.buyer_name);
+      newSaldo = await addUserSaldo(buyerId, RESELLER_PREM_BONUS_SALDO);
+      bonusGiven = RESELLER_PREM_BONUS_SALDO;
+    } catch (bonusErr) {
+      // kembalikan kas & klaim bila gagal menambah saldo user
+      if (fund) await addUserSaldo(fund.fundId, RESELLER_PREM_BONUS_SALDO);
+      await redisCommand(["HDEL", REDIS_RESPREM_BONUS_KEY, buyerId]);
+      throw bonusErr;
+    }
+  }
+
+  try {
+    await addStoreOmset(order.total_nominal);
+  } catch (omsetErr) {
+    console.error("Omset Reseller Prem error:", omsetErr);
+  }
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: order.buyer_id,
+    text:
+      `💎 <b>SELAMAT! RESELLER PREM AKTIF (Pesanan #${order.id})</b>\n\n` +
+      `🤝 Akunmu sekarang resmi jadi <b>Reseller</b> Lumine Photopack Store.\n` +
+      (bonusGiven > 0
+        ? `🎁 <b>Saldo Awal Gratis:</b> +<code>${formatRupiah(bonusGiven)}</code>\n`
+        : "") +
+      `💳 <b>Saldo Kamu Sekarang:</b> <code>${formatRupiah(newSaldo)}</code>\n\n` +
+      `<i>Buka menu Reseller untuk cek tier, omset, dan buat bot toko sendiri.</i>`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🤝 Menu Reseller", callback_data: "menu_reseller" }],
+        [
+          { text: "🛍️ Belanja Katalog", callback_data: "menu_katalog" },
+          { text: "💰 Cek Saldo", callback_data: "menu_saldo" },
+        ],
+      ],
+    },
+  });
+
+  // Notifikasi ke admin (kas yang keluar)
+  const qris = await getQris();
+  const adminChat = (qris && qris.admin_chat_id) || (fund && fund.fundId);
+  if (adminChat) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: adminChat,
+      text:
+        `💎 <b>RESELLER PREM BARU (#${order.id})</b>\n\n` +
+        `👤 <b>Pembeli:</b> ${escapeHtml(order.buyer_name)} (${escapeHtml(order.buyer_username)})\n` +
+        `💰 <b>Bayar:</b> <code>${formatRupiah(order.total_nominal)}</code>\n` +
+        (bonusGiven > 0
+          ? `🎁 <b>Bonus saldo awal:</b> <code>${formatRupiah(bonusGiven)}</code>` +
+            (fund ? ` (kas sekarang: <code>${formatRupiah(fund.balance)}</code>)` : "") + `\n`
+          : `ℹ️ Bonus saldo awal tidak diberikan (sudah pernah cair untuk user ini).\n`) +
+        `✅ <i>Status reseller aktif otomatis.</i>`,
+      parse_mode: "HTML",
+    });
+  }
+
+  return { deliveredName: `Reseller Prem (bonus saldo ${formatRupiah(bonusGiven)})`, deliveredLink: "" };
+}
+
 async function processAccOrderCore(token, order) {
   order.status = "acc";
   await saveOrder(order.id, order);
@@ -1587,6 +1707,11 @@ async function processAccOrderCore(token, order) {
       deliveredName: `Deposit Saldo (+${formatRupiah(depositAmount)})`,
       deliveredLink: "",
     };
+  }
+
+  // KHUSUS ORDER RESELLER PREM (jadi reseller + saldo awal dari kas admin)
+  if (order.is_resprem) {
+    return await processResellerPremOrder(token, order);
   }
 
   if (order.voucher_code) {
@@ -2292,6 +2417,14 @@ async function sendResellerMenu(token, chatId, user) {
   const statusLine = statusReseller
     ? "✅ <b>Status Kamu: Reseller Aktif</b>\n\n"
     : "";
+  const premBlock =
+    !statusReseller && RESELLER_PREM_ENABLED
+      ? "╭─── 💎 <b>RESELLER PREM</b> ───\n" +
+        `│ 💰 Harga: <b>${formatRupiah(RESELLER_PREM_PRICE)}</b>\n` +
+        `│ 🎁 Gratis saldo awal: <b>${formatRupiah(RESELLER_PREM_BONUS_SALDO)}</b>\n` +
+        "│ ⚡ Aktif otomatis setelah bayar (tanpa chat admin)\n" +
+        "╰─────────────────────\n\n"
+      : "";
 
   const keyboardRows = [];
   if (statusReseller) {
@@ -2300,6 +2433,14 @@ async function sendResellerMenu(token, chatId, user) {
       keyboardRows.push([{ text: "💳 WD Margin", callback_data: "reseller_wd" }]);
     }
   } else {
+    if (RESELLER_PREM_ENABLED) {
+      keyboardRows.push([
+        {
+          text: `💎 Beli Reseller Prem ${formatRupiah(RESELLER_PREM_PRICE)} (Gratis Saldo ${formatRupiah(RESELLER_PREM_BONUS_SALDO)})`,
+          callback_data: `buy_${RESELLER_PREM_TARGET}`,
+        },
+      ]);
+    }
     keyboardRows.push([{ text: "📝 Daftar Reseller", url: `https://t.me/${ADMIN_USERNAME}?text=${prefill}` }]);
   }
   keyboardRows.push([
@@ -2314,6 +2455,7 @@ async function sendResellerMenu(token, chatId, user) {
       "🤝 <b>MENU RESELLER | PHOTOPACK</b>\n" +
       "<i>Jual ulang foto pack Lumine dengan harga grosir</i>\n\n" +
       statusLine +
+      premBlock +
       tierBlock +
       botBlock +
       "╭─── 🌟 <b>KEUNTUNGAN</b> ───\n" +
@@ -2409,7 +2551,26 @@ async function sendMoreMenu(token, chatId) {
   });
 }
 
-    async function resolvePurchaseTarget(targetKey) {
+    async function resolvePurchaseTarget(targetKey, userId) {
+  if (targetKey === RESELLER_PREM_TARGET) {
+    if (!RESELLER_PREM_ENABLED) {
+      return { ok: false, error: "⚠️ Reseller Prem sedang tidak tersedia." };
+    }
+    if (userId && (await isReseller(userId))) {
+      return { ok: false, error: "✅ Kamu sudah terdaftar sebagai Reseller. Buka menu 🤝 Reseller untuk cek status & omset." };
+    }
+    return {
+      ok: true,
+      itemId: RESELLER_PREM_TARGET,
+      itemNama: "💎 Reseller Prem",
+      baseNominal: RESELLER_PREM_PRICE,
+      targetLink: "",
+      targetLinks: [],
+      targetFiles: [],
+      isMystery: false,
+      extra: { is_resprem: true },
+    };
+  }
   if (targetKey === "mystery") {
     const cfg = await getMysteryConfig();
     const katalogList = await getKatalog();
@@ -2472,6 +2633,7 @@ async function sendQrisInvoiceForTarget(token, chatId, user, target) {
     {
       target_links: target.targetLinks || [],
       target_files: target.targetFiles || [],
+      ...(target.extra || {}),
     }
   );
 
@@ -4335,12 +4497,16 @@ module.exports = async function handler(req, res) {
       if (qris && qris.admin_chat_id) {
         const extraNote = matchedOrder.is_deposit
           ? `\n💳 <b>Jenis:</b> Deposit Saldo (+${formatRupiah(matchedOrder.base_nominal)})`
+          : matchedOrder.is_resprem
+          ? `\n💎 <b>Jenis:</b> Reseller Prem (+bonus saldo ${formatRupiah(RESELLER_PREM_BONUS_SALDO)})`
           : matchedOrder.is_mystery
           ? `\n🎲 <b>Hadiah Gacha:</b> ${escapeHtml(deliveredName)}`
           : "";
         const notifSnippet = escapeHtml(rawNotif.slice(0, 140));
         const footerNote = matchedOrder.is_deposit
           ? "✅ <i>Saldo otomatis ditambahkan ke akun pembeli!</i>"
+          : matchedOrder.is_resprem
+          ? "✅ <i>Status reseller & saldo awal otomatis aktif!</i>"
           : "✅ <i>Link otomatis terkirim ke pembeli, Bestseller, Leaderboard & Testimoni!</i>";
 
         await tgRequest(token, "sendMessage", {
@@ -4627,7 +4793,7 @@ module.exports = async function handler(req, res) {
           }
                 } else if (data.startsWith("buyqris_")) {
         const targetKey = data.replace("buyqris_", "");
-        const target = await resolvePurchaseTarget(targetKey);
+        const target = await resolvePurchaseTarget(targetKey, callerId);
         if (!target.ok) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: target.error });
           return res.status(200).json({ ok: true });
@@ -4635,7 +4801,7 @@ module.exports = async function handler(req, res) {
         await sendQrisInvoiceForTarget(token, chatId, call.from, target);
       } else if (data.startsWith("paysaldo_")) {
         const targetKey = data.replace("paysaldo_", "");
-        const target = await resolvePurchaseTarget(targetKey);
+        const target = await resolvePurchaseTarget(targetKey, callerId);
         if (!target.ok) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: target.error });
           return res.status(200).json({ ok: true });
@@ -4686,6 +4852,7 @@ module.exports = async function handler(req, res) {
             skip_discount_lookup: true,
             target_links: target.targetLinks || [],
             target_files: target.targetFiles || [],
+            ...(target.extra || {}),
           }
         );
 
@@ -4710,7 +4877,7 @@ module.exports = async function handler(req, res) {
         }
       } else if (data.startsWith("buy_")) {
         const targetKey = data.replace("buy_", "");
-        const target = await resolvePurchaseTarget(targetKey);
+        const target = await resolvePurchaseTarget(targetKey, callerId);
         if (!target.ok) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: target.error });
           return res.status(200).json({ ok: true });
@@ -4875,11 +5042,15 @@ module.exports = async function handler(req, res) {
         const { deliveredName } = accResult;
         const adminExtraNote = order.is_deposit
           ? `\n💳 <b>Saldo Masuk:</b> +${formatRupiah(order.base_nominal)}`
+          : order.is_resprem
+          ? `\n💎 <b>Jenis:</b> Reseller Prem (+bonus saldo ${formatRupiah(RESELLER_PREM_BONUS_SALDO)})`
           : order.is_mystery
           ? `\n🎲 <b>Hadiah Gacha Didapat:</b> ${escapeHtml(deliveredName)}`
           : "";
         const adminFooter = order.is_deposit
           ? "💳 <i>Saldo otomatis ditambahkan ke akun pembeli!</i>"
+          : order.is_resprem
+          ? "💎 <i>Status reseller & saldo awal otomatis aktif!</i>"
           : order.rbot_owner
           ? "🤖 <i>Link terkirim lewat bot reseller & margin reseller tercatat!</i>"
           : "🔥 <i>Link terkirim, Bestseller & Leaderboard terupdate!</i>";
