@@ -86,6 +86,7 @@ const REDIS_WD_PENDING_KEY = "lumine_main_wd_pending"; // hash: id WD -> owner
 const REDIS_WD_HIST_PREFIX = "lumine_main_wd_hist_";
 const REDIS_WD_LOCK_PREFIX = "lumine_main_wd_lock_";
 const REDIS_WD_CH_KEY = "lumine_main_wd_channel";
+const REDIS_RESTORE_PENDING_PREFIX = "lumine_main_restore_pending_"; // file restore yg nunggu /restore konfirmasi (TTL 5 menit)
 
 // ---- PENGATURAN WD (TARIK MARGIN) RESELLER ----
 const WD_ENABLED = true; // false = matikan fitur WD
@@ -973,6 +974,41 @@ function getWibTimestamp() {
   const hh = String(wib.getUTCHours()).padStart(2, "0");
   const min = String(wib.getUTCMinutes()).padStart(2, "0");
   return `${dd}/${mm}/${yyyy} • ${hh}:${min} WIB`;
+}
+
+// Versi timestamp yang aman dipakai sebagai nama file (tanpa karakter "/", ":", "•").
+function getWibFileStamp() {
+  const wib = new Date(Date.now() + 7 * 3600 * 1000);
+  const dd = String(wib.getUTCDate()).padStart(2, "0");
+  const mm = String(wib.getUTCMonth() + 1).padStart(2, "0");
+  const yyyy = wib.getUTCFullYear();
+  const hh = String(wib.getUTCHours()).padStart(2, "0");
+  const min = String(wib.getUTCMinutes()).padStart(2, "0");
+  return `${yyyy}${mm}${dd}-${hh}${min}`;
+}
+
+// Upload teks (mis. JSON backup) langsung sebagai dokumen ke Telegram, tanpa perlu file_id
+// yang sudah ada (beda dari tgRequest biasa yang cuma kirim JSON payload ke Bot API).
+async function sendJsonDocument(token, chatId, filename, textContent, caption) {
+  try {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (caption) {
+      form.append("caption", caption.slice(0, 1024));
+      form.append("parse_mode", "HTML");
+    }
+    form.append("document", new Blob([textContent], { type: "application/json" }), filename);
+
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json();
+    return Boolean(data && data.ok);
+  } catch (e) {
+    console.error("sendJsonDocument error:", e);
+    return false;
+  }
 }
 // ==========================================
 // 3. SISTEM LEADERBOARD, TIER & ORDER
@@ -5983,6 +6019,153 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 8B. ADMIN: /backup — ekspor seluruh katalog jadi file JSON yang dikirim ke chat admin.
+      // Katalog cuma hidup di Redis, jadi kalau ke-reset/salah /hapus, ini satu-satunya jalan balikin.
+      if (rawText.startsWith("/backup")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+
+        const katalogList = await getKatalog();
+        const payload = JSON.stringify(
+          { exported_at: getWibTimestamp(), total: katalogList.length, katalog: katalogList },
+          null,
+          2
+        );
+        const filename = `backup-katalog-${getWibFileStamp()}.json`;
+        const sent = await sendJsonDocument(
+          token,
+          chatId,
+          filename,
+          payload,
+          `📦 <b>Backup Katalog</b>\nTotal: <b>${katalogList.length} set</b>\nWaktu: ${getWibTimestamp()}\n\n` +
+            "<i>Simpan file ini baik-baik (misal forward ke Saved Messages). Kalau katalog ke-reset atau salah kehapus, upload lagi file ini dengan caption /restore.</i>"
+        );
+        if (!sent) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Gagal membuat file backup. Coba lagi beberapa saat lagi.",
+          });
+        }
+        return res.status(200).json({ ok: true });
+      }
+
+      // 8C. ADMIN: /restore — balikin katalog dari file JSON hasil /backup.
+      // Alur 2 langkah biar nggak kepencet nggak sengaja: upload file dulu -> baru /restore konfirmasi.
+      if (/^\/restore\b/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+
+        const restoreKey = REDIS_RESTORE_PENDING_PREFIX + String(chatId);
+        const isConfirm = /konfirmasi/i.test(rawText);
+
+        if (isConfirm) {
+          const pendingRaw = await redisCommand(["GET", restoreKey]);
+          if (!pendingRaw) {
+            await tgRequest(token, "sendMessage", {
+              chat_id: chatId,
+              text:
+                "⚠️ Tidak ada file restore yang nunggu konfirmasi (mungkin sudah lewat 5 menit).\n" +
+                "Upload lagi file JSON backup-nya dengan caption <code>/restore</code>.",
+              parse_mode: "HTML",
+            });
+            return res.status(200).json({ ok: true });
+          }
+
+          let parsedList = null;
+          try {
+            const parsed = JSON.parse(pendingRaw);
+            parsedList = Array.isArray(parsed) ? parsed : null;
+          } catch {
+            parsedList = null;
+          }
+
+          if (!parsedList) {
+            await redisCommand(["DEL", restoreKey]);
+            await tgRequest(token, "sendMessage", {
+              chat_id: chatId,
+              text: "⚠️ File restore yang tersimpan ternyata rusak/tidak valid. Dibatalkan, silakan upload ulang.",
+            });
+            return res.status(200).json({ ok: true });
+          }
+
+          // Jaga-jaga: backup dulu katalog yang LAMA sebelum ditimpa, biar kalau file restore
+          // ternyata salah, admin masih bisa balikin lagi dari sini.
+          const oldKatalog = await getKatalog();
+          const oldPayload = JSON.stringify(
+            { exported_at: getWibTimestamp(), total: oldKatalog.length, katalog: oldKatalog },
+            null,
+            2
+          );
+          await sendJsonDocument(
+            token,
+            chatId,
+            `auto-backup-sebelum-restore-${getWibFileStamp()}.json`,
+            oldPayload,
+            `🗂️ Backup otomatis katalog LAMA (${oldKatalog.length} set) sebelum ditimpa oleh /restore.`
+          );
+
+          await saveKatalog(parsedList);
+          await redisCommand(["DEL", restoreKey]);
+
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              `✅ <b>Restore berhasil!</b>\n` +
+              `Katalog sekarang: <b>${parsedList.length} set</b> (sebelumnya <b>${oldKatalog.length} set</b>).\n` +
+              "Katalog lama sudah dikirim sebagai file terpisah di atas, kalau-kalau perlu dibalikin lagi.",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        // Bukan konfirmasi -> harus ada file JSON terlampir (dikirim dengan caption /restore).
+        if (!msg.document) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "♻️ <b>RESTORE KATALOG DARI BACKUP</b>\n" +
+              "Kirim file JSON hasil <code>/backup</code> dengan caption <code>/restore</code>.\n" +
+              "Setelah filenya terbaca, konfirmasi dengan <code>/restore konfirmasi</code> (berlaku 5 menit).",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        try {
+          const info = await tgRequest(token, "getFile", { file_id: msg.document.file_id });
+          if (!info || !info.ok || !info.result || !info.result.file_path) {
+            throw new Error("getFile gagal");
+          }
+          const dl = await fetch(`https://api.telegram.org/file/bot${token}/${info.result.file_path}`);
+          if (!dl.ok) throw new Error("download file gagal");
+          const fileText = await dl.text();
+          const json = JSON.parse(fileText);
+          const list = Array.isArray(json) ? json : Array.isArray(json && json.katalog) ? json.katalog : null;
+
+          if (!list) throw new Error("format JSON tidak dikenali");
+
+          await redisCommand(["SET", restoreKey, JSON.stringify(list), "EX", "300"]);
+          const currentCount = (await getKatalog()).length;
+
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              `📦 File backup terbaca: <b>${list.length} set</b>.\n` +
+              `📋 Katalog saat ini: <b>${currentCount} set</b>.\n\n` +
+              "⚠️ <b>Ini akan MENIMPA seluruh katalog saat ini.</b> Katalog lama otomatis dibackup dulu sebelum ditimpa.\n" +
+              "Ketik <code>/restore konfirmasi</code> dalam 5 menit untuk lanjut, atau abaikan pesan ini untuk batal.",
+            parse_mode: "HTML",
+          });
+        } catch (e) {
+          console.error("Restore parse error:", e);
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "⚠️ Gagal membaca file ini. Pastikan file JSON hasil dari <code>/backup</code> bot ini (bukan file lain), lalu kirim ulang dengan caption <code>/restore</code>.",
+            parse_mode: "HTML",
+          });
+        }
+        return res.status(200).json({ ok: true });
+      }
+
       // 9. ADMIN: /tambah — bisa 1 set (+ foto preview) atau BANYAK set sekaligus (1 baris = 1 set)
       // Catatan: pakai (?!file) supaya "/tambahfile" tidak ikut tertangkap di sini.
       if (/^\/tambah(?!file)/i.test(rawText)) {
@@ -6435,7 +6618,8 @@ module.exports = async function handler(req, res) {
               "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
               "• <code>/listmargin</code> | <code>/bayarmargin ID NOMINAL</code> — margin bot reseller\n" +
               "• <code>/listwd</code> — WD reseller pending (ACC/Tolak lewat tombol)\n" +
-              "• <code>/setwdch</code> — channel bukti WD (default: Channel Testimoni)";
+              "• <code>/setwdch</code> — channel bukti WD (default: Channel Testimoni)\n" +
+              "• <code>/backup</code> — ekspor katalog ke file JSON | <code>/restore</code> — balikin dari file JSON";
           }
 
           await tgRequest(token, "sendMessage", {
