@@ -6104,6 +6104,17 @@ module.exports = async function handler(req, res) {
         callback_query_id: call.id,
       });
 
+      // NAVIGASI: menu yang sedang tampil diganti, bukan ditumpuk chat baru.
+      // Hanya tombol navigasi yang di-whitelist. Tombol bayar, WD, ACC admin, dan lainnya TIDAK dihapus.
+      const NAV_PREFIXES = ["menu_", "detail_", "lb_", "rhome", "rkat", "rcreator", "rbest", "rcara", "wlr_"];
+      if (NAV_PREFIXES.some((p) => data && data.startsWith(p))) {
+        try {
+          await tgRequest(token, "deleteMessage", { chat_id: chatId, message_id: messageId });
+        } catch (delErr) {
+          console.error("Gagal hapus pesan navigasi:", delErr);
+        }
+      }
+
       if (data && data.startsWith("guide:")) {
         await sendPanduan(token, chatId, data.slice(6), messageId);
         return res.status(200).json({ ok: true });
@@ -6862,6 +6873,19 @@ module.exports = async function handler(req, res) {
         out += `\n\n📊 Total komisi semua mitra: <code>${formatRupiah(totalKomisi)}</code>`;
         if (pairs.length > 30) out += `\n<i>(menampilkan 30 pertama)</i>`;
         await tgRequest(token, "sendMessage", { chat_id: chatId, text: out, parse_mode: "HTML", reply_to_message_id: msg.message_id });
+        return res.status(200).json({ ok: true });
+      }
+
+      // CEK ID
+      if (/^\/id(\s|$)/i.test(rawText)) {
+        const uname = msg.from && msg.from.username ? `@${escapeHtml(msg.from.username)}` : "Tanpa username";
+        const nama = escapeHtml([msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "-");
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: `🆔 <b>Profil Telegram kamu</b>\n\n👤 Nama : ${nama}\n🔖 Username : ${uname}\n🔢 ID : <code>${senderId}</code>\n\n<i>Ketuk ID di atas untuk menyalin.</i>`,
+          reply_to_message_id: msg.message_id,
+        });
         return res.status(200).json({ ok: true });
       }
 
@@ -8431,7 +8455,7 @@ module.exports = async function handler(req, res) {
 
         if (text === "/start" || startRefMatch || startMitraMatch) {
           const buyerName = escapeHtml((msg.from && msg.from.first_name) || "Kak");
-          let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.`;
+          let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.\n🆔 ID kamu: <code>${senderId}</code>`;
 
           if (isAdmin) {
             headerText +=
