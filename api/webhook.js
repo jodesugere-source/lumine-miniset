@@ -29,6 +29,14 @@ const REDIS_USER_VOUCHER_PREFIX = "lumine_main_uv_";
 const REDIS_KOLEKSI_PREFIX = "lumine_main_koleksi_";
 const REDIS_MYSTERY_KEY = "lumine_main_mystery";
 const REDIS_SALDO_KEY = "lumine_main_saldo";
+const REDIS_RESELLER_KEY = "lumine_main_reseller";
+const REDIS_RESELLER_OMSET_KEY = "lumine_main_reseller_omset";
+const REDIS_RESELLER_OMSET_CNT_KEY = "lumine_main_reseller_omset_cnt";
+const REDIS_STORE_OMSET_KEY = "lumine_main_store_omset";
+const REDIS_STORE_OMSET_CNT_KEY = "lumine_main_store_omset_cnt";
+const REDIS_RATING_KEY = "lumine_main_rating_list";
+const REDIS_RATING_SUMMARY_KEY = "lumine_main_rating_summary";
+const REDIS_RATING_PENDING_KEY = "lumine_main_rating_pending";
 
 function escapeHtml(str) {
   return String(str || "")
@@ -88,7 +96,147 @@ async function deductUserSaldo(userId, amount) {
   }
   return { ok: true, balance: after };
     }
-    async function getKatalog() {
+
+// ---- MANAJEMEN RESELLER (ADD / DELETE / LIST / OMSET) ----
+async function getResellerMap() {
+  const raw = await redisCommand(["HGETALL", REDIS_RESELLER_KEY]);
+  const map = {};
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      try {
+        map[raw[i]] = JSON.parse(raw[i + 1]);
+      } catch {
+        map[raw[i]] = { nama: raw[i + 1] };
+      }
+    }
+  }
+  return map;
+}
+
+async function isReseller(userId) {
+  const raw = await redisCommand(["HGET", REDIS_RESELLER_KEY, String(userId)]);
+  return Boolean(raw);
+}
+
+async function addReseller(userId, nama) {
+  const data = { nama: nama || "Reseller", joined: getWibTimestamp() };
+  await redisCommand(["HSET", REDIS_RESELLER_KEY, String(userId), JSON.stringify(data)]);
+  return data;
+}
+
+async function removeReseller(userId) {
+  const res = await redisCommand(["HDEL", REDIS_RESELLER_KEY, String(userId)]);
+  await redisCommand(["HDEL", REDIS_RESELLER_OMSET_KEY, String(userId)]);
+  await redisCommand(["HDEL", REDIS_RESELLER_OMSET_CNT_KEY, String(userId)]);
+  return parseInt(res, 10) > 0;
+}
+
+async function getResellerOmset(userId) {
+  const [rp, cnt] = await Promise.all([
+    redisCommand(["HGET", REDIS_RESELLER_OMSET_KEY, String(userId)]),
+    redisCommand(["HGET", REDIS_RESELLER_OMSET_CNT_KEY, String(userId)]),
+  ]);
+  return { rupiah: parseInt(rp, 10) || 0, count: parseInt(cnt, 10) || 0 };
+}
+
+async function addResellerOmset(userId, nominal) {
+  await Promise.all([
+    redisCommand(["HINCRBY", REDIS_RESELLER_OMSET_KEY, String(userId), Math.round(Number(nominal) || 0)]),
+    redisCommand(["HINCRBY", REDIS_RESELLER_OMSET_CNT_KEY, String(userId), 1]),
+  ]);
+}
+
+async function addStoreOmset(nominal) {
+  await Promise.all([
+    redisCommand(["INCRBY", REDIS_STORE_OMSET_KEY, Math.round(Number(nominal) || 0)]),
+    redisCommand(["INCR", REDIS_STORE_OMSET_CNT_KEY]),
+  ]);
+}
+
+async function getStoreOmset() {
+  const [rp, cnt] = await Promise.all([
+    redisCommand(["GET", REDIS_STORE_OMSET_KEY]),
+    redisCommand(["GET", REDIS_STORE_OMSET_CNT_KEY]),
+  ]);
+  return { rupiah: parseInt(rp, 10) || 0, count: parseInt(cnt, 10) || 0 };
+}
+
+// ---- RATING & ULASAN PEMBELI (BINTANG 1-5 + KOMENTAR) ----
+async function setPendingRating(userId, orderId, stars) {
+  await redisCommand([
+    "HSET",
+    REDIS_RATING_PENDING_KEY,
+    String(userId),
+    JSON.stringify({ order_id: orderId, stars }),
+  ]);
+}
+
+async function getPendingRating(userId) {
+  const raw = await redisCommand(["HGET", REDIS_RATING_PENDING_KEY, String(userId)]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function clearPendingRating(userId) {
+  await redisCommand(["HDEL", REDIS_RATING_PENDING_KEY, String(userId)]);
+}
+
+async function saveRating(orderId, userId, buyerName, stars, komentar) {
+  const raw = await redisCommand(["GET", REDIS_RATING_KEY]);
+  let list = [];
+  if (raw) {
+    try {
+      list = JSON.parse(raw);
+    } catch {
+      list = [];
+    }
+  }
+  list.unshift({
+    order_id: orderId,
+    buyer_id: userId,
+    buyer_name: buyerName,
+    stars: Math.min(5, Math.max(1, Number(stars) || 5)),
+    komentar: komentar || "",
+    waktu: getWibTimestamp(),
+  });
+  if (list.length > 100) list.length = 100;
+  await Promise.all([
+    redisCommand(["SET", REDIS_RATING_KEY, JSON.stringify(list)]),
+    redisCommand(["HINCRBY", REDIS_RATING_SUMMARY_KEY, "total_stars", Math.min(5, Math.max(1, Number(stars) || 5))]),
+    redisCommand(["HINCRBY", REDIS_RATING_SUMMARY_KEY, "total_count", 1]),
+  ]);
+}
+
+async function getRatingSummary() {
+  const raw = await redisCommand(["HGETALL", REDIS_RATING_SUMMARY_KEY]);
+  let totalStars = 0;
+  let totalCount = 0;
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      if (raw[i] === "total_stars") totalStars = parseInt(raw[i + 1], 10) || 0;
+      if (raw[i] === "total_count") totalCount = parseInt(raw[i + 1], 10) || 0;
+    }
+  }
+  const avg = totalCount > 0 ? totalStars / totalCount : 0;
+  return { avg, totalCount };
+}
+
+async function getRecentRatings(limit = 10) {
+  const raw = await redisCommand(["GET", REDIS_RATING_KEY]);
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw);
+    return list.slice(0, limit);
+  } catch {
+    return [];
+  }
+}
+
+async function getKatalog() {
   const raw = await redisCommand(["GET", REDIS_KEY]);
   if (!raw) return [];
   try {
@@ -739,10 +887,16 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
     }
   }
 
-  await Promise.all([
+  const buyerIsReseller = await isReseller(order.buyer_id);
+  const omsetTasks = [
     recordPurchaseToLeaderboard(order),
     addKoleksi(order.buyer_id, deliveredName, deliveredLink),
-  ]);
+    addStoreOmset(order.total_nominal),
+  ];
+  if (buyerIsReseller) {
+    omsetTasks.push(addResellerOmset(order.buyer_id, order.total_nominal));
+  }
+  await Promise.all(omsetTasks);
 
   const updatedAllCnt = await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(order.buyer_id)]);
   await sendTestimonialToChannel(token, order, deliveredName, updatedAllCnt);
@@ -754,6 +908,7 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
     reply_markup: {
       inline_keyboard: [
         [{ text: "📂 Buka Link File Sekarang", url: deliveredLink }],
+        [{ text: "⭐ Beri Rating & Ulasan", callback_data: `rate_init_${order.id}` }],
         [
           { text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" },
           { text: "🏆 Leaderboard", callback_data: "menu_lb" },
@@ -1209,11 +1364,29 @@ async function sendResellerMenu(token, chatId, user) {
     `Halo admin, saya mau daftar Reseller Photopack.\nID Telegram: ${userId}\nUsername: ${uname}`
   );
 
+  const statusReseller = await isReseller(userId);
+  const statusLine = statusReseller
+    ? "✅ <b>Status Kamu: Reseller Aktif</b>\n\n"
+    : "";
+
+  const keyboardRows = [];
+  if (statusReseller) {
+    keyboardRows.push([{ text: "📊 Cek Omset Saya", callback_data: "reseller_omset_self" }]);
+  } else {
+    keyboardRows.push([{ text: "📝 Daftar Reseller", url: `https://t.me/${ADMIN_USERNAME}?text=${prefill}` }]);
+  }
+  keyboardRows.push([
+    { text: "🛍️ Lihat Katalog", callback_data: "menu_katalog" },
+    { text: "📋 Cara Order", callback_data: "menu_cara" },
+  ]);
+  keyboardRows.push([{ text: "🔙 Menu Utama", callback_data: "menu_home" }]);
+
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
     text:
       "🤝 <b>MENU RESELLER | PHOTOPACK</b>\n" +
       "<i>Jual ulang foto pack Lumine dengan harga grosir</i>\n\n" +
+      statusLine +
       "╭─── 💰 <b>HARGA RESELLER</b> ───\n" +
       `│ • <b>Paket Lite</b> (5–7 Foto) : <code>${formatRupiah(RESELLER_PRICE_LITE)}</code>\n` +
       `│ • <b>Paket Standar</b> (8–10 Foto) : <code>${formatRupiah(RESELLER_PRICE_STANDAR)}</code>\n` +
@@ -1225,21 +1398,14 @@ async function sendResellerMenu(token, chatId, user) {
       "│ ✅ Update set baru dari katalog\n" +
       "│ ✅ Dibantu langsung oleh admin\n" +
       "╰─────────────────────\n\n" +
-      "📝 <b>Cara Daftar:</b>\n" +
-      "1. Klik tombol <b>Daftar Reseller</b> di bawah.\n" +
-      "2. Kirim pesan yang sudah terisi otomatis ke admin.\n" +
-      "3. Ikuti arahan admin sampai akun reseller aktif.",
+      (statusReseller
+        ? "📊 Klik <b>Cek Omset Saya</b> untuk lihat total omset & transaksi reseller kamu."
+        : "📝 <b>Cara Daftar:</b>\n" +
+          "1. Klik tombol <b>Daftar Reseller</b> di bawah.\n" +
+          "2. Kirim pesan yang sudah terisi otomatis ke admin.\n" +
+          "3. Ikuti arahan admin sampai akun reseller aktif."),
     parse_mode: "HTML",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "📝 Daftar Reseller", url: `https://t.me/${ADMIN_USERNAME}?text=${prefill}` }],
-        [
-          { text: "🛍️ Lihat Katalog", callback_data: "menu_katalog" },
-          { text: "📋 Cara Order", callback_data: "menu_cara" },
-        ],
-        [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
-      ],
-    },
+    reply_markup: { inline_keyboard: keyboardRows },
   });
 }
 
@@ -2064,6 +2230,65 @@ module.exports = async function handler(req, res) {
             `💰 Nominal: ${formatRupiah(order.total_nominal)}`,
           parse_mode: "HTML",
         });
+      } else if (data === "reseller_omset_self") {
+        const statusReseller = await isReseller(callerId);
+        if (!statusReseller) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "❌ Kamu belum terdaftar sebagai Reseller. Daftar dulu lewat menu 🤝 Reseller ya!",
+            parse_mode: "HTML",
+          });
+        } else {
+          const omset = await getResellerOmset(callerId);
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "📊 <b>OMSET RESELLER KAMU</b>\n" +
+              "━━━━━━━━━━━━━━━━━━━━\n" +
+              `💰 <b>Total Omset:</b> <code>${formatRupiah(omset.rupiah)}</code>\n` +
+              `🧾 <b>Total Transaksi:</b> <b>${omset.count}x</b>`,
+            parse_mode: "HTML",
+          });
+        }
+      } else if (data.startsWith("rate_init_")) {
+        const orderId = data.replace("rate_init_", "");
+        const order = await getOrder(orderId);
+        if (!order || String(order.buyer_id) !== String(callerId)) {
+          return res.status(200).json({ ok: true });
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `⭐ <b>Beri Rating untuk Pesanan #${orderId}</b>\nPilih jumlah bintang:`,
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "⭐1", callback_data: `rate_star_${orderId}_1` },
+                { text: "⭐2", callback_data: `rate_star_${orderId}_2` },
+                { text: "⭐3", callback_data: `rate_star_${orderId}_3` },
+                { text: "⭐4", callback_data: `rate_star_${orderId}_4` },
+                { text: "⭐5", callback_data: `rate_star_${orderId}_5` },
+              ],
+            ],
+          },
+        });
+      } else if (data.startsWith("rate_star_")) {
+        const partsRate = data.replace("rate_star_", "").split("_");
+        const orderId = partsRate[0];
+        const stars = parseInt(partsRate[1], 10) || 5;
+        const order = await getOrder(orderId);
+        if (!order || String(order.buyer_id) !== String(callerId)) {
+          return res.status(200).json({ ok: true });
+        }
+        await setPendingRating(callerId, orderId, stars);
+        await tgRequest(token, "editMessageText", {
+          chat_id: chatId,
+          message_id: messageId,
+          text:
+            `⭐ <b>Kamu memilih ${stars}/5 bintang untuk Pesanan #${orderId}</b>\n\n` +
+            `Sekarang ketik komentar/ulasan singkat kamu (atau ketik <code>-</code> jika tanpa komentar).`,
+          parse_mode: "HTML",
+        });
       }
 
       return res.status(200).json({ ok: true });
@@ -2085,6 +2310,45 @@ module.exports = async function handler(req, res) {
 
       const rawText = (msg.text || msg.caption || "").trim();
       const lowerText = rawText.toLowerCase();
+
+      // RATING: TANGKAP KOMENTAR SETELAH PILIH BINTANG
+      if (msg.text && !rawText.startsWith("/")) {
+        const pendingRate = await getPendingRating(senderId);
+        if (pendingRate) {
+          const komentar = rawText === "-" ? "" : rawText.slice(0, 300);
+          const buyerFullName =
+            [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Pembeli";
+          const starsText = "⭐".repeat(Math.min(5, Math.max(1, pendingRate.stars)));
+
+          await saveRating(pendingRate.order_id, senderId, buyerFullName, pendingRate.stars, komentar);
+          await clearPendingRating(senderId);
+
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              `🙏 <b>Terima kasih atas rating & ulasannya!</b>\n\n` +
+              `${starsText} (${pendingRate.stars}/5)\n` +
+              (komentar ? `💬 "${escapeHtml(komentar)}"\n\n` : "\n") +
+              `Masukanmu sangat berarti buat Lumine Photopack Store! 💜`,
+            parse_mode: "HTML",
+          });
+
+          const testi = await getTestiConfig();
+          if (testi && testi.channel_id) {
+            await tgRequest(token, "sendMessage", {
+              chat_id: testi.channel_id,
+              text:
+                `⭐ <b>RATING BARU DARI PEMBELI</b>\n` +
+                `━━━━━━━━━━━━━━━━━━━━\n` +
+                `👤 ${escapeHtml(maskUsername(msg.from.username ? `@${msg.from.username}` : "Tanpa Username"))}\n` +
+                `${starsText} (${pendingRate.stars}/5)\n` +
+                (komentar ? `💬 <i>"${escapeHtml(komentar)}"</i>` : "<i>(tanpa komentar)</i>"),
+              parse_mode: "HTML",
+            });
+          }
+          return res.status(200).json({ ok: true });
+        }
+      }
 
       // ADMIN: /addsaldo & /ceksaldo
       if (rawText.startsWith("/addsaldo")) {
@@ -2135,6 +2399,177 @@ module.exports = async function handler(req, res) {
           text: `💳 Saldo user <code>${escapeHtml(targetUid)}</code>: <b>${formatRupiah(userBal)}</b>`,
           parse_mode: "HTML",
         });
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /addreseller
+      if (rawText.startsWith("/addreseller")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const parts = rawText.replace(/^\/addreseller\s*/i, "").trim().split(/\s+/);
+        const targetUid = parts[0];
+        const targetNama = parts.slice(1).join(" ") || "Reseller";
+
+        if (!targetUid || isNaN(parseInt(targetUid, 10))) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "⚠️ Format salah!\n" +
+              "Gunakan: <code>/addreseller [user_id] [nama]</code>\n" +
+              "<i>Contoh: <code>/addreseller 123456789 Budi Store</code></i>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        await addReseller(targetUid, targetNama);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            `✅ <b>Reseller Baru Ditambahkan!</b>\n` +
+            `• <b>User ID:</b> <code>${escapeHtml(targetUid)}</code>\n` +
+            `• <b>Nama:</b> ${escapeHtml(targetNama)}`,
+          parse_mode: "HTML",
+        });
+
+        await tgRequest(token, "sendMessage", {
+          chat_id: targetUid,
+          text:
+            "🎉 <b>Selamat! Kamu resmi jadi Reseller Lumine Photopack Store.</b>\n" +
+            "Cek menu 🤝 Reseller untuk lihat harga grosir & omset kamu ya!",
+          parse_mode: "HTML",
+        }).catch(() => {});
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /delreseller
+      if (rawText.startsWith("/delreseller")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const targetUid = rawText.replace(/^\/delreseller\s*/i, "").trim();
+        if (!targetUid) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Gunakan: <code>/delreseller [user_id]</code>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const removedOk = await removeReseller(targetUid);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: removedOk
+            ? `✅ Reseller <code>${escapeHtml(targetUid)}</code> berhasil dihapus.`
+            : `⚠️ User <code>${escapeHtml(targetUid)}</code> tidak terdaftar sebagai reseller.`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /listreseller
+      if (rawText.startsWith("/listreseller")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const resellerMap = await getResellerMap();
+        const ids = Object.keys(resellerMap);
+        if (ids.length === 0) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "📂 Belum ada reseller terdaftar.",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        let listText = "🤝 <b>DAFTAR RESELLER</b>\n━━━━━━━━━━━━━━━━━━━━\n";
+        for (const uid of ids) {
+          const info = resellerMap[uid] || {};
+          const omset = await getResellerOmset(uid);
+          listText +=
+            `• <b>${escapeHtml(info.nama || "Reseller")}</b> (<code>${escapeHtml(uid)}</code>)\n` +
+            `  💰 Omset: <code>${formatRupiah(omset.rupiah)}</code> • 🧾 ${omset.count}x transaksi\n`;
+        }
+        listText += `\nTotal: <b>${ids.length} reseller</b>`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: listText, parse_mode: "HTML" });
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /omsetreseller [user_id] — cek omset reseller tertentu
+      if (rawText.startsWith("/omsetreseller")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const targetUid = rawText.replace(/^\/omsetreseller\s*/i, "").trim();
+        if (!targetUid) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Gunakan: <code>/omsetreseller [user_id]</code>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const resellerMap = await getResellerMap();
+        const info = resellerMap[targetUid];
+        if (!info) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `⚠️ User <code>${escapeHtml(targetUid)}</code> tidak terdaftar sebagai reseller.`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const omset = await getResellerOmset(targetUid);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            `📊 <b>OMSET RESELLER</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `👤 <b>${escapeHtml(info.nama || "Reseller")}</b> (<code>${escapeHtml(targetUid)}</code>)\n` +
+            `💰 <b>Total Omset:</b> <code>${formatRupiah(omset.rupiah)}</code>\n` +
+            `🧾 <b>Total Transaksi:</b> <b>${omset.count}x</b>`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /omsettoko — cek omset keseluruhan toko (punya sendiri)
+      if (rawText.startsWith("/omsettoko")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const storeOmset = await getStoreOmset();
+        const ratingSummary = await getRatingSummary();
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            `📈 <b>OMSET TOKO (KESELURUHAN)</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `💰 <b>Total Omset:</b> <code>${formatRupiah(storeOmset.rupiah)}</code>\n` +
+            `🧾 <b>Total Transaksi:</b> <b>${storeOmset.count}x</b>\n` +
+            `⭐ <b>Rating Toko:</b> ${
+              ratingSummary.totalCount > 0
+                ? `${ratingSummary.avg.toFixed(1)}/5 (${ratingSummary.totalCount} ulasan)`
+                : "Belum ada rating"
+            }`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /listrating — lihat ulasan terbaru dari pembeli
+      if (rawText.startsWith("/listrating")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const recent = await getRecentRatings(10);
+        const summary = await getRatingSummary();
+        if (recent.length === 0) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "📂 Belum ada rating dari pembeli.",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        let listText =
+          `⭐ <b>RATING TOKO: ${summary.avg.toFixed(1)}/5</b> (${summary.totalCount} ulasan)\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n`;
+        recent.forEach((r) => {
+          listText +=
+            `#${r.order_id} • ${"⭐".repeat(r.stars)} — ${escapeHtml(r.buyer_name)}\n` +
+            (r.komentar ? `💬 "${escapeHtml(r.komentar)}"\n` : "") +
+            `\n`;
+        });
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: listText, parse_mode: "HTML" });
         return res.status(200).json({ ok: true });
       }
 
@@ -2873,7 +3308,9 @@ module.exports = async function handler(req, res) {
               "• <code>/setbanner</code> | <code>/setqris</code> | <code>/settesti</code> | <code>/broadcast</code>\n" +
               "• <code>/buatvoucher KODE | DISKON | KUOTA</code>\n" +
               "• <code>/setmystery HARGA</code> | <code>/setsold</code> | <code>/resetlb</code>\n" +
-              "• <code>/tambah</code> | <code>/edit</code> | <code>/hapus</code> | <code>/setbundle</code>";
+              "• <code>/tambah</code> | <code>/edit</code> | <code>/hapus</code> | <code>/setbundle</code>\n" +
+              "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
+              "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>";
           }
 
           await tgRequest(token, "sendMessage", {
