@@ -25,6 +25,10 @@ const UPSELL_ENABLED = true; // false = matikan fitur upsell
 const UPSELL_DISCOUNT_PERCENT = 10; // diskon untuk set tawaran
 const UPSELL_WINDOW_MINUTES = 10; // lama penawaran berlaku
 
+// ---- BOT RESELLER (WHITE-LABEL) ----
+const RESELLER_BOT_MAX_PRICE = 4000; // harga jual MAKSIMAL yang boleh dipasang reseller di bot mereka
+const RESELLER_BOT_ITEMS_PER_PAGE = 8; // jumlah set per halaman katalog bot reseller
+
 const REDIS_KEY = "lumine_main_katalog";
 const REDIS_BUNDLE_KEY = "lumine_main_bundle";
 const REDIS_QRIS_KEY = "lumine_main_qris";
@@ -52,6 +56,12 @@ const REDIS_RATING_KEY = "lumine_main_rating_list";
 const REDIS_RATING_SUMMARY_KEY = "lumine_main_rating_summary";
 const REDIS_RATING_PENDING_KEY = "lumine_main_rating_pending";
 const REDIS_UPSELL_PREFIX = "lumine_main_upsell_";
+const REDIS_RBOT_KEY = "lumine_main_rbots";
+const REDIS_RBOT_MARGIN_KEY = "lumine_main_rb_margin";
+const REDIS_RBOT_PAID_KEY = "lumine_main_rb_margin_paid";
+const REDIS_RBOT_SALES_PREFIX = "lumine_main_rb_sales_";
+const REDIS_RBOT_FILECACHE_KEY = "lumine_main_rb_filecache";
+const REDIS_RBOT_LOCK_PREFIX = "lumine_main_rb_lock_";
 
 function escapeHtml(str) {
   return String(str || "")
@@ -143,6 +153,11 @@ async function removeReseller(userId) {
   const res = await redisCommand(["HDEL", REDIS_RESELLER_KEY, String(userId)]);
   await redisCommand(["HDEL", REDIS_RESELLER_OMSET_KEY, String(userId)]);
   await redisCommand(["HDEL", REDIS_RESELLER_OMSET_CNT_KEY, String(userId)]);
+  try {
+    await removeResellerBot(userId);
+  } catch (e) {
+    console.error("removeResellerBot gagal:", e);
+  }
   return parseInt(res, 10) > 0;
 }
 
@@ -1732,6 +1747,16 @@ async function sendResellerMenu(token, chatId, user) {
     const myOmset = await getResellerOmset(userId);
     tierBlock = buildMyTierBlock(myOmset, getResellerTierInfo(myOmset.rupiah));
   }
+  let botBlock = "";
+  if (statusReseller) {
+    const myBot = await getResellerBot(userId);
+    botBlock = myBot
+      ? `🤖 <b>Bot Toko Kamu:</b> @${escapeHtml(myBot.username)} ${myBot.active === false ? "(nonaktif)" : "(aktif)"}\n` +
+        "<i>Atur harga jual di bot itu: /hargaku • /setharga • /margin</i>\n\n"
+      : "🤖 <b>Punya bot toko sendiri!</b>\n" +
+        "Buat bot di @BotFather, lalu kirim <code>/daftarbot TOKEN_BOT</code> ke sini. " +
+        `Harga jual kamu yang atur (maks ${formatRupiah(RESELLER_BOT_MAX_PRICE)}), untung dicatat otomatis.\n\n`;
+  }
   const statusLine = statusReseller
     ? "✅ <b>Status Kamu: Reseller Aktif</b>\n\n"
     : "";
@@ -1755,9 +1780,11 @@ async function sendResellerMenu(token, chatId, user) {
       "<i>Jual ulang foto pack Lumine dengan harga grosir</i>\n\n" +
       statusLine +
       tierBlock +
+      botBlock +
       "╭─── 🌟 <b>KEUNTUNGAN</b> ───\n" +
       "│ ✅ Harga lebih murah dari harga retail\n" +
       "│ ✅ Naik tier otomatis → harga makin murah\n" +
+      "│ ✅ Bisa punya bot toko sendiri (harga jual atur sendiri)\n" +
       "│ ✅ Koleksi Photopack HD tanpa watermark\n" +
       "│ ✅ Update set baru dari katalog\n" +
       "│ ✅ Dibantu langsung oleh admin\n" +
@@ -1951,6 +1978,991 @@ async function sendQrisInvoiceForTarget(token, chatId, user, target) {
   // ==========================================
 // 5. HANDLER UTAMA SERVERLESS VERCEL (WEBHOOK + AUTO-ACC MAKRO)
 // ==========================================
+// ==========================================
+// 4B. BOT RESELLER (WHITE-LABEL): reseller punya bot toko sendiri
+//     Pembeli bayar ke QRIS admin (Auto-ACC makro tetap jalan), margin reseller
+//     dicatat otomatis & dibayar manual oleh admin (/bayarmargin).
+// ==========================================
+function parseCommand(text) {
+  const t = String(text || "").trim();
+  const first = t.split(/\s+/)[0] || "";
+  return {
+    cmd: first.toLowerCase().replace(/@[a-z0-9_]+$/i, ""),
+    arg: t.slice(first.length).trim(),
+  };
+}
+
+async function getResellerBot(ownerId) {
+  const raw = await redisCommand(["HGET", REDIS_RBOT_KEY, String(ownerId)]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function saveResellerBot(ownerId, cfg) {
+  await redisCommand(["HSET", REDIS_RBOT_KEY, String(ownerId), JSON.stringify(cfg)]);
+}
+
+async function getAllResellerBots() {
+  const raw = await redisCommand(["HGETALL", REDIS_RBOT_KEY]);
+  const map = {};
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      try {
+        map[raw[i]] = JSON.parse(raw[i + 1]);
+      } catch {
+        // abaikan data rusak
+      }
+    }
+  }
+  return map;
+}
+
+async function removeResellerBot(ownerId) {
+  const rb = await getResellerBot(ownerId);
+  if (!rb) return false;
+  try {
+    await tgRequest(rb.token, "deleteWebhook", {});
+  } catch (e) {
+    console.error("deleteWebhook gagal:", e);
+  }
+  await redisCommand(["HDEL", REDIS_RBOT_KEY, String(ownerId)]);
+  return true;
+}
+
+async function getResellerMargin(ownerId) {
+  const [e, p] = await Promise.all([
+    redisCommand(["HGET", REDIS_RBOT_MARGIN_KEY, String(ownerId)]),
+    redisCommand(["HGET", REDIS_RBOT_PAID_KEY, String(ownerId)]),
+  ]);
+  const earned = parseInt(e, 10) || 0;
+  const paid = parseInt(p, 10) || 0;
+  return { earned, paid, owed: Math.max(0, earned - paid) };
+}
+
+async function getResellerSales(ownerId) {
+  const raw = await redisCommand(["GET", `${REDIS_RBOT_SALES_PREFIX}${ownerId}`]);
+  if (!raw) return [];
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+async function logResellerSale(ownerId, entry) {
+  const list = await getResellerSales(ownerId);
+  list.unshift(entry);
+  if (list.length > 20) list.length = 20;
+  await redisCommand(["SET", `${REDIS_RBOT_SALES_PREFIX}${ownerId}`, JSON.stringify(list)]);
+}
+
+async function buildMarginText(ownerId) {
+  const [m, sales] = await Promise.all([getResellerMargin(ownerId), getResellerSales(ownerId)]);
+  let text =
+    "💸 <b>MARGIN KAMU</b>\n" +
+    "━━━━━━━━━━━━━━━━━━━━\n" +
+    `📈 <b>Total Untung:</b> <code>${formatRupiah(m.earned)}</code>\n` +
+    `✅ <b>Sudah Dibayar Admin:</b> <code>${formatRupiah(m.paid)}</code>\n` +
+    `⏳ <b>Belum Dibayar:</b> <code>${formatRupiah(m.owed)}</code>\n`;
+  if (sales.length > 0) {
+    text += "\n🧾 <b>Penjualan Terakhir:</b>\n";
+    for (const s of sales.slice(0, 8)) {
+      text +=
+        `#${s.id} • ${escapeHtml(s.item)}\n` +
+        `   jual ${formatRupiah(s.sell)} − modal ${formatRupiah(s.modal)} = <b>+${formatRupiah(s.margin)}</b>\n`;
+    }
+  } else {
+    text += "\n<i>Belum ada penjualan.</i>";
+  }
+  return text;
+}
+
+// Harga modal reseller per set, mengikuti tier & harga retail set tersebut.
+function getResellerModalPrice(retailPrice, tier) {
+  const retail = Number(retailPrice) || 0;
+  if (retail <= 2000) return Math.min(retail, tier.price_lite);
+  if (retail <= 3000) return tier.price_standar;
+  return Math.round((retail * tier.price_standar) / 3000 / 50) * 50;
+}
+
+// Daftar set yang dijual di bot reseller + harga modal / jual / margin.
+async function getResellerBotItems(ownerId, rb) {
+  const [katalog, omset] = await Promise.all([getKatalog(), getResellerOmset(ownerId)]);
+  const tier = getResellerTierInfo(omset.rupiah).tier;
+  const prices = (rb && rb.prices) || {};
+  const items = [];
+
+  for (const k of katalog) {
+    if (!k || !k.id) continue;
+    const links =
+      Array.isArray(k.links) && k.links.length > 0 ? k.links : k.link ? [k.link] : [];
+    const files = Array.isArray(k.files) ? k.files : [];
+    if (links.length === 0 && files.length === 0) continue;
+
+    const retail = parseNominal(k.harga);
+    const modal = getResellerModalPrice(retail, tier);
+    if (modal >= RESELLER_BOT_MAX_PRICE) continue; // tidak ada ruang margin
+
+    const custom = Number(prices[String(k.id)]);
+    const wanted = custom > 0 ? custom : retail;
+    const sell = Math.min(RESELLER_BOT_MAX_PRICE, Math.max(modal, wanted));
+
+    items.push({
+      id: String(k.id),
+      nama: k.nama,
+      isi: k.isi || "",
+      photo_id: k.photo_id || "",
+      links,
+      files,
+      retail,
+      modal,
+      sell,
+      margin: sell - modal,
+    });
+  }
+  return { items, tier };
+}
+
+async function sendLongText(token, chatId, text) {
+  const chunks = [];
+  let cur = "";
+  for (const line of String(text).split("\n")) {
+    if ((cur + line + "\n").length > 3500) {
+      chunks.push(cur);
+      cur = "";
+    }
+    cur += line + "\n";
+  }
+  if (cur.trim()) chunks.push(cur);
+  for (const c of chunks) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: c, parse_mode: "HTML" });
+  }
+}
+
+// file_id Telegram terikat ke bot yang menerimanya. Agar file/foto/QRIS dari bot utama
+// bisa tampil di bot reseller, file diunduh lewat bot utama lalu diunggah ulang
+// (hasil file_id baru disimpan sebagai cache supaya cuma sekali upload per bot).
+async function sendFileViaResellerBot(mainToken, rb, method, chatId, fileId, extra = {}) {
+  try {
+    const field = method === "sendDocument" ? "document" : "photo";
+    const cacheField = `${rb.bot_id}:${fileId}`;
+
+    const cached = await redisCommand(["HGET", REDIS_RBOT_FILECACHE_KEY, cacheField]);
+    if (cached) {
+      const r = await tgRequest(rb.token, method, { chat_id: chatId, [field]: cached, ...extra });
+      if (r && r.ok) return true;
+    }
+
+    const info = await tgRequest(mainToken, "getFile", { file_id: fileId });
+    if (!info || !info.ok || !info.result || !info.result.file_path) return false;
+
+    const dl = await fetch(`https://api.telegram.org/file/bot${mainToken}/${info.result.file_path}`);
+    if (!dl.ok) return false;
+    const buf = await dl.arrayBuffer();
+
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    for (const [k, v] of Object.entries(extra)) {
+      form.append(k, typeof v === "object" ? JSON.stringify(v) : String(v));
+    }
+    const filename = info.result.file_path.split("/").pop() || (field === "photo" ? "photo.jpg" : "file");
+    form.append(field, new Blob([buf]), filename);
+
+    const res = await fetch(`https://api.telegram.org/bot${rb.token}/${method}`, {
+      method: "POST",
+      body: form,
+    });
+    const data = await res.json();
+    if (!data || !data.ok) return false;
+
+    const newId =
+      field === "photo"
+        ? ((data.result.photo || []).slice(-1)[0] || {}).file_id
+        : (data.result.document || {}).file_id;
+    if (newId) await redisCommand(["HSET", REDIS_RBOT_FILECACHE_KEY, cacheField, newId]);
+    return true;
+  } catch (e) {
+    console.error("sendFileViaResellerBot error:", e);
+    return false;
+  }
+}
+
+async function getOrderBotToken(mainToken, order) {
+  if (order && order.rbot_owner) {
+    const rb = await getResellerBot(order.rbot_owner);
+    if (rb && rb.token) return rb.token;
+  }
+  return mainToken;
+}
+
+async function processAnyOrder(token, order) {
+  if (order && order.rbot_owner) return processResellerBotOrder(token, order);
+  return processAccOrder(token, order);
+}
+
+async function processResellerBotOrder(mainToken, order) {
+  // Kunci agar tidak diproses dua kali (makro + klik ACC manual bersamaan)
+  const lock = await redisCommand([
+    "SET",
+    `${REDIS_RBOT_LOCK_PREFIX}${order.id}`,
+    "1",
+    "NX",
+    "EX",
+    "86400",
+  ]);
+  if (!lock) return { deliveredName: order.item_nama, deliveredLink: "", duplicate: true };
+
+  const ownerId = order.rbot_owner;
+  const rb = await getResellerBot(ownerId);
+  const buyerToken = (rb && rb.token) || mainToken;
+
+  order.status = "acc";
+  await saveOrder(order.id, order);
+
+  const links = (
+    Array.isArray(order.target_links) && order.target_links.length > 0
+      ? order.target_links
+      : order.target_link
+      ? [order.target_link]
+      : []
+  ).map(normalizeUrl);
+  const files = Array.isArray(order.target_files) ? order.target_files : [];
+
+  const linksBlock =
+    links.length > 0
+      ? links.map((l) => `🔗 ${escapeHtml(l)}`).join("\n")
+      : "<i>(File dikirim langsung di pesan berikutnya)</i>";
+
+  await tgRequest(buyerToken, "sendMessage", {
+    chat_id: order.buyer_id,
+    text:
+      `🎉 <b>PEMBAYARAN DI-ACC! (Pesanan #${order.id})</b>\n\n` +
+      `Terima kasih telah membeli <b>${escapeHtml(order.item_nama)}</b>!\n` +
+      `Berikut akses file kamu:\n${linksBlock}`,
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: links.slice(0, 8).map((link, i) => [
+        { text: links.length > 1 ? `📂 Buka File ${i + 1}` : "📂 Buka Link File Sekarang", url: link },
+      ]),
+    },
+  });
+
+  if (rb) {
+    for (const f of files) {
+      if (!f || !f.file_id) continue;
+      const method = f.type === "document" ? "sendDocument" : "sendPhoto";
+      const ok = await sendFileViaResellerBot(mainToken, rb, method, order.buyer_id, f.file_id);
+      if (!ok) {
+        await tgRequest(buyerToken, "sendMessage", {
+          chat_id: order.buyer_id,
+          text: `⚠️ Salah satu file gagal terkirim otomatis. Hubungi admin @${ADMIN_USERNAME} dengan menyebut order #${order.id}.`,
+        });
+      }
+    }
+  }
+
+  // Counter terjual (ikut ranking Bestseller)
+  try {
+    const katalogList = await getKatalog();
+    const idx = katalogList.findIndex((k) => String(k.id) === String(order.item_id));
+    if (idx !== -1) {
+      katalogList[idx].sold = (Number(katalogList[idx].sold) || 0) + 1;
+      await saveKatalog(katalogList);
+    }
+  } catch (e) {
+    console.error("update sold gagal:", e);
+  }
+
+  const margin = Number(order.margin) || 0;
+  const modal = Number(order.modal) || 0;
+
+  await addStoreOmset(order.total_nominal);
+  if (margin > 0) {
+    await redisCommand(["HINCRBY", REDIS_RBOT_MARGIN_KEY, String(ownerId), margin]);
+  }
+  await logResellerSale(ownerId, {
+    id: order.id,
+    item: order.item_nama,
+    sell: Number(order.sell_price) || 0,
+    modal,
+    margin,
+    date: getWibTimestamp(),
+  });
+
+  // Notifikasi ke reseller (lewat bot utama) + cek naik tier
+  try {
+    const omsetResult = await addResellerOmset(ownerId, modal);
+    const m = await getResellerMargin(ownerId);
+    await tgRequest(mainToken, "sendMessage", {
+      chat_id: ownerId,
+      text:
+        `💸 <b>PENJUALAN BARU (#${order.id})</b>\n` +
+        `📦 ${escapeHtml(order.item_nama)}\n` +
+        `💰 Jual ${formatRupiah(order.sell_price)} − modal ${formatRupiah(modal)} = <b>+${formatRupiah(margin)}</b>\n` +
+        `⏳ Margin belum dibayar: <code>${formatRupiah(m.owed)}</code>`,
+      parse_mode: "HTML",
+    });
+    await notifyResellerTierUp(
+      mainToken,
+      { buyer_id: ownerId, buyer_name: (rb && rb.owner_name) || "Reseller" },
+      omsetResult
+    );
+  } catch (e) {
+    console.error("notif reseller gagal:", e);
+  }
+
+  return { deliveredName: order.item_nama, deliveredLink: links[0] || "" };
+}
+
+// ---- ETALASE BOT RESELLER (SISI PEMBELI) ----
+function rbShopName(rb) {
+  return rb.nama_toko ? rb.nama_toko : `Toko @${rb.username}`;
+}
+
+async function rbEditOrSend(ctx, chatId, messageId, text, replyMarkup) {
+  if (messageId) {
+    const r = await tgRequest(ctx.token, "editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+    if (r && r.ok) return;
+  }
+  await tgRequest(ctx.token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: replyMarkup,
+  });
+}
+
+async function rbEditCaptionOrText(ctx, chatId, messageId, text) {
+  const r = await tgRequest(ctx.token, "editMessageCaption", {
+    chat_id: chatId,
+    message_id: messageId,
+    caption: text,
+    parse_mode: "HTML",
+  });
+  if (r && r.ok) return;
+  await tgRequest(ctx.token, "editMessageText", {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: "HTML",
+  });
+}
+
+async function sendRbCatalog(ctx, chatId, page, messageId) {
+  const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+  if (items.length === 0) {
+    await rbEditOrSend(
+      ctx,
+      chatId,
+      messageId,
+      "📂 Katalog sedang diperbarui. Coba lagi nanti ya 🙏",
+      undefined
+    );
+    return;
+  }
+
+  const totalPages = Math.max(1, Math.ceil(items.length / RESELLER_BOT_ITEMS_PER_PAGE));
+  const p = Math.min(Math.max(0, parseInt(page, 10) || 0), totalPages - 1);
+  const slice = items.slice(p * RESELLER_BOT_ITEMS_PER_PAGE, (p + 1) * RESELLER_BOT_ITEMS_PER_PAGE);
+
+  const rows = slice.map((x) => [
+    {
+      text: `${x.nama} — ${formatRupiah(x.sell)}`.slice(0, 60),
+      callback_data: `ritem_${x.id}`,
+    },
+  ]);
+  if (totalPages > 1) {
+    const nav = [];
+    if (p > 0) nav.push({ text: "⬅️ Sebelumnya", callback_data: `rpage_${p - 1}` });
+    nav.push({ text: `${p + 1}/${totalPages}`, callback_data: `rpage_${p}` });
+    if (p < totalPages - 1) nav.push({ text: "Berikutnya ➡️", callback_data: `rpage_${p + 1}` });
+    rows.push(nav);
+  }
+
+  await rbEditOrSend(
+    ctx,
+    chatId,
+    messageId,
+    `🛍️ <b>${escapeHtml(rbShopName(ctx.rb))}</b>\n` +
+      "<i>Photopack HD • Tanpa Watermark</i>\n\n" +
+      `Pilih set yang kamu mau 👇${totalPages > 1 ? ` (hal ${p + 1}/${totalPages})` : ""}`,
+    { inline_keyboard: rows }
+  );
+}
+
+async function sendRbItemDetail(ctx, chatId, itemId) {
+  const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+  const x = items.find((i) => i.id === String(itemId));
+  if (!x) {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: "⚠️ Set ini sudah tidak tersedia.",
+    });
+    return;
+  }
+
+  const caption =
+    `✨ <b>${escapeHtml(x.nama)}</b>\n\n` +
+    (x.isi ? `📦 <b>Isi :</b> ${escapeHtml(x.isi)}\n` : "") +
+    `💰 <b>Harga :</b> <code>${formatRupiah(x.sell)}</code>\n\n` +
+    "💳 Bayar via QRIS. File dikirim otomatis setelah pembayaran terverifikasi.";
+  const replyMarkup = {
+    inline_keyboard: [
+      [{ text: `🛒 Beli Sekarang (${formatRupiah(x.sell)})`, callback_data: `rbuy_${x.id}` }],
+      [{ text: "🔙 Kembali ke Katalog", callback_data: "rpage_0" }],
+    ],
+  };
+
+  let sent = false;
+  if (x.photo_id) {
+    sent = await sendFileViaResellerBot(ctx.mainToken, ctx.rb, "sendPhoto", chatId, x.photo_id, {
+      caption,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  }
+  if (!sent) {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: caption,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  }
+}
+
+async function sendRbInvoice(ctx, chatId, user, itemId) {
+  const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+  const x = items.find((i) => i.id === String(itemId));
+  if (!x) {
+    await tgRequest(ctx.token, "sendMessage", { chat_id: chatId, text: "⚠️ Set ini sudah tidak tersedia." });
+    return;
+  }
+
+  const qris = await getQris();
+  if (!qris || !qris.file_id || !qris.admin_chat_id) {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: "⚠️ Pembayaran QRIS sedang disiapkan. Coba lagi beberapa saat lagi ya 🙏",
+    });
+    return;
+  }
+
+  const order = await createOrder(user, x.nama, x.sell, x.links[0] || "", false, x.id, {
+    target_links: x.links,
+    target_files: x.files,
+    skip_discount_lookup: true,
+    rbot_owner: String(ctx.ownerId),
+    rbot_bot_id: ctx.rb.bot_id,
+    rbot_username: ctx.rb.username,
+    rbot_nama: rbShopName(ctx.rb),
+    sell_price: x.sell,
+    modal: x.modal,
+    margin: x.margin,
+  });
+
+  const caption =
+    `🧾 <b>INVOICE PESANAN #${order.id}</b>\n\n` +
+    `📦 <b>Paket:</b> ${escapeHtml(order.item_nama)}\n` +
+    `💵 <b>Harga:</b> ${formatRupiah(order.base_nominal)}\n` +
+    `🔢 <b>Kode Unik:</b> +${formatRupiah(order.kode_unik)}\n` +
+    "━━━━━━━━━━━━━━━━━━━━\n" +
+    `💰 <b>TOTAL TRANSFER: <code>${formatRupiah(order.total_nominal)}</code></b>\n` +
+    "━━━━━━━━━━━━━━━━━━━━\n\n" +
+    `⚠️ <b>PENTING:</b> Scan QRIS di atas dan transfer <b>TEPAT sampai digit terakhir</b> (<b>${formatRupiah(order.total_nominal)}</b>) agar sistem otomatis memverifikasi pembayaranmu.\n\n` +
+    "Setelah transfer berhasil, file otomatis dikirim atau klik tombol <b>Konfirmasi Pembayaran</b> 👇";
+  const replyMarkup = {
+    inline_keyboard: [
+      [{ text: "✅ Konfirmasi Pembayaran", callback_data: `rconfirm_${order.id}` }],
+      [{ text: "❌ Batalkan Pesanan", callback_data: `rcancel_${order.id}` }],
+    ],
+  };
+
+  const sent = await sendFileViaResellerBot(ctx.mainToken, ctx.rb, "sendPhoto", chatId, qris.file_id, {
+    caption,
+    parse_mode: "HTML",
+    reply_markup: replyMarkup,
+  });
+  if (!sent) {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: caption + "\n\n⚠️ <i>Gambar QRIS gagal dimuat, hubungi admin @" + ADMIN_USERNAME + ".</i>",
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  }
+}
+
+async function handleRbCallback(ctx, call) {
+  const callerId = call.from.id;
+  const chatId = call.message && call.message.chat && call.message.chat.id;
+  const messageId = call.message && call.message.message_id;
+  const data = call.data || "";
+
+  await tgRequest(ctx.token, "answerCallbackQuery", { callback_query_id: call.id });
+  if (!chatId) return;
+
+  if (data.startsWith("rpage_")) {
+    await sendRbCatalog(ctx, chatId, data.replace("rpage_", ""), messageId);
+  } else if (data.startsWith("ritem_")) {
+    await sendRbItemDetail(ctx, chatId, data.replace("ritem_", ""));
+  } else if (data.startsWith("rbuy_")) {
+    await sendRbInvoice(ctx, chatId, call.from, data.replace("rbuy_", ""));
+  } else if (data.startsWith("rcancel_")) {
+    const orderId = data.replace("rcancel_", "");
+    const order = await getOrder(orderId);
+    if (!order || String(order.buyer_id) !== String(callerId) || order.rbot_owner !== String(ctx.ownerId)) return;
+    if (order.status === "pending") {
+      order.status = "cancelled";
+      await saveOrder(orderId, order);
+    }
+    await rbEditCaptionOrText(
+      ctx,
+      chatId,
+      messageId,
+      `🚫 <b>Order #${escapeHtml(orderId)} dibatalkan.</b>\nSilakan pilih lagi lewat /start.`
+    );
+  } else if (data.startsWith("rconfirm_")) {
+    const orderId = data.replace("rconfirm_", "");
+    const order = await getOrder(orderId);
+    if (!order) {
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text: "⚠️ Pesanan sudah kedaluwarsa. Silakan buat pesanan baru.",
+      });
+      return;
+    }
+    if (String(order.buyer_id) !== String(callerId) || order.rbot_owner !== String(ctx.ownerId)) return;
+    if (order.status !== "pending") return;
+
+    order.status = "waiting_acc";
+    await saveOrder(orderId, order);
+
+    await rbEditCaptionOrText(
+      ctx,
+      chatId,
+      messageId,
+      `⏳ <b>MENUNGGU VERIFIKASI (Order #${order.id})</b>\n\n` +
+        `📦 Item: ${escapeHtml(order.item_nama)}\n` +
+        `💰 Nominal: <b>${formatRupiah(order.total_nominal)}</b>\n\n` +
+        "Konfirmasi kamu sudah masuk. File akan otomatis dikirim ke chat ini setelah dana terdeteksi!"
+    );
+
+    const qris = await getQris();
+    if (qris && qris.admin_chat_id) {
+      await tgRequest(ctx.mainToken, "sendMessage", {
+        chat_id: qris.admin_chat_id,
+        text:
+          `🔔 <b>PESANAN MASUK #${order.id}</b> 🤖 <i>(Bot Reseller)</i>\n\n` +
+          `🏪 <b>Toko:</b> ${escapeHtml(order.rbot_nama)} (@${escapeHtml(order.rbot_username)}) • Reseller <code>${escapeHtml(order.rbot_owner)}</code>\n` +
+          `👤 <b>Pembeli:</b> ${escapeHtml(order.buyer_name)} (${escapeHtml(order.buyer_username)})\n` +
+          `📦 <b>Item:</b> ${escapeHtml(order.item_nama)}\n` +
+          `💰 <b>Nominal Wajib Masuk:</b> <code>${formatRupiah(order.total_nominal)}</code>\n` +
+          `💸 <b>Margin Reseller:</b> ${formatRupiah(order.margin)} <i>(jual ${formatRupiah(order.sell_price)} − modal ${formatRupiah(order.modal)})</i>\n\n` +
+          "⚡ <i>Jika Auto-ACC Makro aktif, otomatis lunas saat notif HP masuk (atau klik ACC manual di bawah):</i>",
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: `✅ ACC #${order.id} (Kirim Link)`, callback_data: `acc_${order.id}` },
+              { text: `❌ Tolak #${order.id}`, callback_data: `reject_${order.id}` },
+            ],
+          ],
+        },
+      });
+    }
+  }
+}
+
+async function handleRbMessage(ctx, msg) {
+  if (!msg.chat || msg.chat.type !== "private" || !msg.from) return;
+  const chatId = msg.chat.id;
+  const isOwner = String(msg.from.id) === String(ctx.ownerId);
+  const { cmd, arg } = parseCommand(msg.text || "");
+
+  // ---- PERINTAH PEMILIK TOKO ----
+  if (isOwner && cmd === "/hargaku") {
+    const { items, tier } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+    let text =
+      "💲 <b>HARGA JUAL TOKO KAMU</b>\n" +
+      `🏅 Tier: ${tier.name}\n` +
+      `Batas: minimal harga modal • maksimal <b>${formatRupiah(RESELLER_BOT_MAX_PRICE)}</b>\n` +
+      "━━━━━━━━━━━━━━━━━━━━\n";
+    if (items.length === 0) text += "<i>Belum ada set yang bisa dijual.</i>\n";
+    items.forEach((x, i) => {
+      text +=
+        `${i + 1}. <b>${escapeHtml(x.nama)}</b>\n` +
+        `   Modal ${formatRupiah(x.modal)} • Jual <code>${formatRupiah(x.sell)}</code> • Untung ${formatRupiah(x.margin)}\n`;
+    });
+    text +=
+      "\nUbah harga:\n<code>/setharga NO HARGA</code>\n<code>/setharga semua HARGA</code>";
+    await sendLongText(ctx.token, chatId, text);
+    return;
+  }
+
+  if (isOwner && cmd === "/setharga") {
+    const parts = arg.split(/\s+/);
+    const target = (parts[0] || "").toLowerCase();
+    const price = parseInt(String(parts[1] || "").replace(/\D/g, ""), 10);
+    if (!target || !price) {
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text:
+          "⚠️ Format: <code>/setharga NO HARGA</code> atau <code>/setharga semua HARGA</code>\nLihat nomor set di /hargaku",
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+    const rb = ctx.rb;
+    rb.prices = rb.prices || {};
+
+    if (target === "semua") {
+      let adjusted = 0;
+      for (const x of items) {
+        const clamped = Math.min(RESELLER_BOT_MAX_PRICE, Math.max(x.modal, price));
+        if (clamped !== price) adjusted++;
+        rb.prices[x.id] = clamped;
+      }
+      await saveResellerBot(ctx.ownerId, rb);
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text:
+          `✅ Harga <b>${formatRupiah(price)}</b> diterapkan ke ${items.length} set.` +
+          (adjusted > 0
+            ? `\nℹ️ ${adjusted} set disesuaikan otomatis ke batas modal/maksimal.`
+            : "") +
+          "\nCek hasilnya di /hargaku",
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    const idx = parseInt(target, 10) - 1;
+    if (isNaN(idx) || idx < 0 || idx >= items.length) {
+      await tgRequest(ctx.token, "sendMessage", { chat_id: chatId, text: "⚠️ Nomor set tidak valid. Lihat /hargaku" });
+      return;
+    }
+    const x = items[idx];
+    if (price < x.modal) {
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text: `⚠️ Harga terlalu rendah. Minimal <b>${formatRupiah(x.modal)}</b> (modal tier kamu).`,
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    if (price > RESELLER_BOT_MAX_PRICE) {
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text: `⚠️ Harga terlalu tinggi. Maksimal <b>${formatRupiah(RESELLER_BOT_MAX_PRICE)}</b>.`,
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    rb.prices[x.id] = price;
+    await saveResellerBot(ctx.ownerId, rb);
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        `✅ <b>${escapeHtml(x.nama)}</b> sekarang dijual <b>${formatRupiah(price)}</b>\n` +
+        `💸 Untung per penjualan: <b>${formatRupiah(price - x.modal)}</b>`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  if (isOwner && cmd === "/setnama") {
+    const nama = arg.replace(/\s+/g, " ").slice(0, 40);
+    if (!nama) {
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text: "⚠️ Format: <code>/setnama NAMA TOKO</code>",
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    ctx.rb.nama_toko = nama;
+    await saveResellerBot(ctx.ownerId, ctx.rb);
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: `✅ Nama toko diubah jadi <b>${escapeHtml(nama)}</b>`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  if (isOwner && cmd === "/margin") {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: await buildMarginText(ctx.ownerId),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // ---- ETALASE UNTUK SEMUA ORANG ----
+  if (isOwner && cmd === "/start") {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "🛠️ <b>Panel Pemilik Toko</b> <i>(hanya kamu yang melihat ini)</i>\n" +
+        "• <code>/hargaku</code> — lihat & cek harga jual\n" +
+        "• <code>/setharga NO HARGA</code> — ubah harga satu set\n" +
+        "• <code>/setharga semua HARGA</code> — samakan harga semua set\n" +
+        "• <code>/setnama NAMA TOKO</code> — ganti nama toko\n" +
+        "• <code>/margin</code> — lihat untung & pembayaran dari admin",
+      parse_mode: "HTML",
+    });
+  }
+
+  await sendRbCatalog(ctx, chatId, 0, null);
+}
+
+async function handleResellerBotRequest(req, res, mainToken, ownerId) {
+  if (req.method !== "POST") return res.status(200).send("ok");
+  try {
+    const rb = await getResellerBot(ownerId);
+    if (!rb) return res.status(200).json({ ok: true });
+
+    const headerSecret = String(req.headers["x-telegram-bot-api-secret-token"] || "");
+    if (!headerSecret || headerSecret !== rb.secret) {
+      return res.status(401).json({ ok: false });
+    }
+    if (rb.active === false) return res.status(200).json({ ok: true });
+    if (!(await isReseller(ownerId))) return res.status(200).json({ ok: true });
+
+    const update = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const ctx = { mainToken, rb, ownerId: String(ownerId), token: rb.token };
+
+    if (update.callback_query) {
+      await handleRbCallback(ctx, update.callback_query);
+    } else if (update.message) {
+      await handleRbMessage(ctx, update.message);
+    }
+    return res.status(200).json({ ok: true });
+  } catch (err) {
+    console.error("Reseller Bot Error:", err);
+    return res.status(200).json({ ok: true });
+  }
+}
+
+// ---- PERINTAH DI BOT UTAMA: DAFTAR/KELOLA BOT RESELLER + ADMIN ----
+// return true bila perintah sudah ditangani.
+async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) {
+  const { cmd, arg } = parseCommand(rawText);
+  const chatId = msg.chat.id;
+  const uid = msg.from && msg.from.id;
+  const reply = (text) =>
+    tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+
+  // ----- reseller -----
+  if (cmd === "/daftarbot") {
+    if (!msg.chat || msg.chat.type !== "private") return true;
+    // hapus pesan berisi token (best-effort)
+    tgRequest(token, "deleteMessage", { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
+
+    if (!(await isReseller(uid))) {
+      await reply("❌ Fitur ini khusus reseller. Daftar dulu lewat menu 🤝 Reseller ya!");
+      return true;
+    }
+    if (await getResellerBot(uid)) {
+      await reply("⚠️ Kamu sudah punya bot toko. Lihat /botku atau hapus dulu dengan /hapusbot.");
+      return true;
+    }
+    const botToken = arg.trim();
+    if (!/^\d{6,12}:[A-Za-z0-9_-]{30,}$/.test(botToken)) {
+      await reply(
+        "⚠️ Format token tidak valid.\n\n<b>Cara:</b>\n1. Buka @BotFather → <code>/newbot</code>\n2. Salin token bot kamu\n3. Kirim: <code>/daftarbot TOKEN_BOT</code>"
+      );
+      return true;
+    }
+    if (botToken === token) {
+      await reply("⚠️ Token itu tidak bisa dipakai.");
+      return true;
+    }
+    const me = await tgRequest(botToken, "getMe", {});
+    if (!me || !me.ok || !me.result) {
+      await reply("⚠️ Token tidak valid / bot tidak ditemukan. Cek lagi token dari @BotFather.");
+      return true;
+    }
+    const all = await getAllResellerBots();
+    if (Object.values(all).some((b) => String(b.bot_id) === String(me.result.id))) {
+      await reply("⚠️ Bot itu sudah terdaftar. Pakai bot lain.");
+      return true;
+    }
+
+    const secret = require("crypto").randomBytes(24).toString("hex");
+    const hookUrl = `https://${req.headers.host}/api/webhook?rb=${uid}`;
+    const wh = await tgRequest(botToken, "setWebhook", {
+      url: hookUrl,
+      secret_token: secret,
+      allowed_updates: ["message", "callback_query"],
+      drop_pending_updates: true,
+    });
+    if (!wh || !wh.ok) {
+      await reply(`⚠️ Gagal memasang webhook bot: ${escapeHtml((wh && wh.description) || "tidak diketahui")}`);
+      return true;
+    }
+
+    await saveResellerBot(uid, {
+      token: botToken,
+      bot_id: me.result.id,
+      username: me.result.username || "",
+      secret,
+      nama_toko: "",
+      prices: {},
+      active: true,
+      owner_name: [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Reseller",
+      created: getWibTimestamp(),
+    });
+
+    await reply(
+      `✅ <b>Bot toko aktif!</b>\n\n` +
+        `🤖 @${escapeHtml(me.result.username || "")}\n` +
+        `🔗 https://t.me/${escapeHtml(me.result.username || "")}\n\n` +
+        "<b>Atur toko kamu di bot itu</b> (kirim perintah dari akun ini):\n" +
+        "• <code>/hargaku</code> — lihat modal & harga jual\n" +
+        "• <code>/setharga NO HARGA</code> — atur harga jual\n" +
+        "• <code>/setnama NAMA TOKO</code>\n" +
+        "• <code>/margin</code> — untung kamu\n\n" +
+        `ℹ️ Harga jual minimal = modal tier kamu, maksimal ${formatRupiah(RESELLER_BOT_MAX_PRICE)}.`
+    );
+    return true;
+  }
+
+  if (cmd === "/botku") {
+    if (!(await isReseller(uid))) {
+      await reply("❌ Kamu belum terdaftar sebagai reseller.");
+      return true;
+    }
+    const rb = await getResellerBot(uid);
+    await reply(
+      rb
+        ? `🤖 <b>Bot Toko Kamu</b>\n@${escapeHtml(rb.username)} — ${rb.active === false ? "⛔ nonaktif (hubungi admin)" : "✅ aktif"}\n🏪 ${escapeHtml(rbShopName(rb))}\n\nAtur harga di bot itu: /hargaku • /setharga • /margin`
+        : "Kamu belum punya bot toko. Kirim <code>/daftarbot TOKEN_BOT</code> (token dari @BotFather)."
+    );
+    return true;
+  }
+
+  if (cmd === "/margin") {
+    if (!(await isReseller(uid))) {
+      await reply("❌ Kamu belum terdaftar sebagai reseller.");
+      return true;
+    }
+    await reply(await buildMarginText(uid));
+    return true;
+  }
+
+  if (cmd === "/hapusbot") {
+    const targetId = isAdmin && /^\d+$/.test(arg) ? arg : String(uid);
+    const ok = await removeResellerBot(targetId);
+    await reply(ok ? `✅ Bot toko <code>${escapeHtml(targetId)}</code> dihapus.` : "⚠️ Tidak ada bot toko yang terdaftar.");
+    return true;
+  }
+
+  // ----- admin -----
+  const adminCmds = ["/listbot", "/matikanbot", "/aktifkanbot", "/listmargin", "/bayarmargin"];
+  if (!adminCmds.includes(cmd)) return false;
+  if (!isAdmin) return true;
+
+  if (cmd === "/listbot") {
+    const all = await getAllResellerBots();
+    const ids = Object.keys(all);
+    if (ids.length === 0) {
+      await reply("📂 Belum ada bot reseller.");
+      return true;
+    }
+    let text = "🤖 <b>DAFTAR BOT RESELLER</b>\n━━━━━━━━━━━━━━━━━━━━\n";
+    for (const id of ids) {
+      const b = all[id];
+      const m = await getResellerMargin(id);
+      text +=
+        `• @${escapeHtml(b.username)} — ${b.active === false ? "⛔" : "✅"}\n` +
+        `  👤 ${escapeHtml(b.owner_name || "-")} (<code>${escapeHtml(id)}</code>)\n` +
+        `  💸 Margin belum dibayar: <code>${formatRupiah(m.owed)}</code>\n`;
+    }
+    await sendLongText(token, chatId, text);
+    return true;
+  }
+
+  if (cmd === "/matikanbot" || cmd === "/aktifkanbot") {
+    const rb = /^\d+$/.test(arg) ? await getResellerBot(arg) : null;
+    if (!rb) {
+      await reply(`⚠️ Gunakan: <code>${cmd} ID_RESELLER</code> (lihat /listbot)`);
+      return true;
+    }
+    rb.active = cmd === "/aktifkanbot";
+    await saveResellerBot(arg, rb);
+    await reply(`✅ Bot @${escapeHtml(rb.username)} ${rb.active ? "diaktifkan" : "dinonaktifkan"}.`);
+    return true;
+  }
+
+  if (cmd === "/listmargin") {
+    const all = await getAllResellerBots();
+    const rows = [];
+    for (const id of Object.keys(all)) {
+      const m = await getResellerMargin(id);
+      if (m.owed > 0) rows.push({ id, name: all[id].owner_name || "-", owed: m.owed });
+    }
+    rows.sort((a, b) => b.owed - a.owed);
+    if (rows.length === 0) {
+      await reply("✅ Tidak ada margin reseller yang belum dibayar.");
+      return true;
+    }
+    let text = "💸 <b>MARGIN BELUM DIBAYAR</b>\n━━━━━━━━━━━━━━━━━━━━\n";
+    let total = 0;
+    for (const r of rows) {
+      total += r.owed;
+      text += `• ${escapeHtml(r.name)} (<code>${escapeHtml(r.id)}</code>): <b>${formatRupiah(r.owed)}</b>\n`;
+    }
+    text += `\nTotal: <b>${formatRupiah(total)}</b>\nBayar: <code>/bayarmargin ID NOMINAL</code>`;
+    await sendLongText(token, chatId, text);
+    return true;
+  }
+
+  if (cmd === "/bayarmargin") {
+    const parts = arg.split(/\s+/);
+    const targetId = parts[0];
+    const nominal = parseInt(String(parts[1] || "").replace(/\D/g, ""), 10);
+    if (!targetId || !/^\d+$/.test(targetId) || !nominal) {
+      await reply("⚠️ Gunakan: <code>/bayarmargin ID NOMINAL</code> (lihat /listmargin)");
+      return true;
+    }
+    const m = await getResellerMargin(targetId);
+    if (nominal > m.owed) {
+      await reply(`⚠️ Nominal melebihi margin yang belum dibayar (${formatRupiah(m.owed)}).`);
+      return true;
+    }
+    await redisCommand(["HINCRBY", REDIS_RBOT_PAID_KEY, targetId, nominal]);
+    const after = await getResellerMargin(targetId);
+    await reply(
+      `✅ Pembayaran margin <b>${formatRupiah(nominal)}</b> dicatat untuk <code>${escapeHtml(targetId)}</code>.\nSisa belum dibayar: <b>${formatRupiah(after.owed)}</b>`
+    );
+    await tgRequest(token, "sendMessage", {
+      chat_id: targetId,
+      text:
+        `✅ <b>MARGIN DIBAYAR!</b>\nAdmin sudah membayar margin kamu sebesar <b>${formatRupiah(nominal)}</b>.\n` +
+        `⏳ Sisa belum dibayar: <code>${formatRupiah(after.owed)}</code>`,
+      parse_mode: "HTML",
+    });
+    return true;
+  }
+
+  return false;
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -2026,7 +3038,7 @@ module.exports = async function handler(req, res) {
         });
       }
 
-      const { deliveredName } = await processAccOrder(token, matchedOrder);
+      const { deliveredName } = await processAnyOrder(token, matchedOrder);
 
       if (qris && qris.admin_chat_id) {
         const extraNote = matchedOrder.is_deposit
@@ -2062,6 +3074,11 @@ module.exports = async function handler(req, res) {
       console.error("Auto-ACC Macro Error:", macroErr);
       return res.status(200).json({ ok: false, error: String(macroErr.message || macroErr) });
     }
+  }
+
+  // BOT RESELLER: update dari bot toko milik reseller (?rb=ID_RESELLER)
+  if (req.query && req.query.rb) {
+    return handleResellerBotRequest(req, res, token, String(req.query.rb));
   }
 
   if (req.method === "GET") {
@@ -2532,7 +3549,7 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        const { deliveredName } = await processAccOrder(token, order);
+        const { deliveredName } = await processAnyOrder(token, order);
         const adminExtraNote = order.is_deposit
           ? `\n💳 <b>Saldo Masuk:</b> +${formatRupiah(order.base_nominal)}`
           : order.is_mystery
@@ -2540,6 +3557,8 @@ module.exports = async function handler(req, res) {
           : "";
         const adminFooter = order.is_deposit
           ? "💳 <i>Saldo otomatis ditambahkan ke akun pembeli!</i>"
+          : order.rbot_owner
+          ? "🤖 <i>Link terkirim lewat bot reseller & margin reseller tercatat!</i>"
           : "🔥 <i>Link terkirim, Bestseller & Leaderboard terupdate!</i>";
 
         await tgRequest(token, "editMessageText", {
@@ -2565,7 +3584,7 @@ module.exports = async function handler(req, res) {
         order.status = "rejected";
         await saveOrder(orderId, order);
 
-        await tgRequest(token, "sendMessage", {
+        await tgRequest(await getOrderBotToken(token, order), "sendMessage", {
           chat_id: order.buyer_id,
           text:
             `❌ <b>ORDER #${order.id} DITOLAK</b>\n\n` +
@@ -2703,6 +3722,12 @@ module.exports = async function handler(req, res) {
           }
           return res.status(200).json({ ok: true });
         }
+      }
+
+      // BOT RESELLER: /daftarbot /botku /margin /hapusbot + admin /listbot /matikanbot /aktifkanbot /listmargin /bayarmargin
+      if (rawText.startsWith("/")) {
+        const rbHandled = await handleResellerBotMainCommands(token, req, msg, rawText, isAdmin);
+        if (rbHandled) return res.status(200).json({ ok: true });
       }
 
       // ADMIN: /addsaldo & /ceksaldo
@@ -3826,7 +4851,9 @@ module.exports = async function handler(req, res) {
               "• <code>/tambah</code> | <code>/edit</code> | <code>/hapus</code> | <code>/setbundle</code>\n" +
               "• <code>/tambahfile NO</code> | <code>/hapusfile NO NO</code> | <code>/listfile NO</code> — lampirkan banyak file/link\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
-              "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>";
+              "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
+              "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
+              "• <code>/listmargin</code> | <code>/bayarmargin ID NOMINAL</code> — margin bot reseller";
           }
 
           await tgRequest(token, "sendMessage", {
