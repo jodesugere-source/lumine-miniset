@@ -73,6 +73,7 @@ const REDIS_RATING_KEY = "lumine_main_rating_list";
 const REDIS_RATING_SUMMARY_KEY = "lumine_main_rating_summary";
 const REDIS_RATING_PENDING_KEY = "lumine_main_rating_pending";
 const REDIS_UPSELL_PREFIX = "lumine_main_upsell_";
+const REDIS_FIRST_BUYER_CFG_KEY = "lumine_main_first_buyer_cfg";
 const REDIS_RBOT_KEY = "lumine_main_rbots";
 const REDIS_RBOT_MARGIN_KEY = "lumine_main_rb_margin";
 const REDIS_RBOT_PAID_KEY = "lumine_main_rb_margin_paid";
@@ -108,6 +109,124 @@ const REDIS_REF_MONTH_PREFIX = "lumine_main_ref_month_"; // hash per bulan: id p
 
 // ---- FITUR BARU: /stat, /profil & VERIFIKASI JOIN CHANNEL ----
 const REDIS_REQ_CH_KEY = "lumine_main_req_channel";
+const REDIS_ONBOARD_PREFIX = "lumine_main_onboard_";
+
+const ONBOARD_STEPS = [
+  {
+    title: "1/6 • Pilih & Intip Set",
+    body:
+      "Buka <b>🛍️ Katalog</b> atau <b>🔥 Bestseller</b>, pilih kategori (🧩 Mini Set / 📦 Full Set) atau Creator, lalu ketuk judulnya untuk cek preview, detail isi, dan harga sebelum bayar.",
+  },
+  {
+    title: "2/6 • Bayar Pakai Saldo atau QRIS",
+    body:
+      "• <b>Saldo (⚡ Instan):</b> Isi saldo lewat <b>💰 Saldo & Depo</b> (Auto-ACC QRIS Statis), lalu checkout 1x klik tanpa kode unik.\n" +
+      "• <b>QRIS Langsung:</b> Transfer <b>pas sampai digit terakhir</b> sesuai invoice agar terbaca otomatis.",
+  },
+  {
+    title: "3/6 • Terima File & Simpan Koleksi",
+    body:
+      "Setelah pembayaran terverifikasi, link/file langsung dikirim otomatis dan tersimpan permanen di <b>🎒 Koleksi Saya</b>. Kalau butuh akses ulang, ambil dari sana tanpa bayar lagi.",
+  },
+  {
+    title: "4/6 • Anti Salah Paham (Wajib Baca)",
+    body:
+      "• <b>Nominal tidak pas?</b> Pembayaran bisa gagal terdeteksi otomatis—selalu transfer sesuai total invoice.\n" +
+      "• <b>Link/file belum muncul?</b> Cek <b>🎒 Koleksi Saya</b> dulu; kalau masih kendala, hubungi admin sambil kirim <b>ID order</b> & bukti bayar.\n" +
+      "• <b>Produk digital:</b> Pastikan sudah cocok dengan preview/isi set sebelum checkout karena akses file bersifat final.",
+  },
+  {
+    title: "5/6 • Voucher, Channel & Akun",
+    body:
+      "• Pakai <code>/voucher KODE</code> sebelum checkout untuk potongan harga.\n" +
+      "• Pantau set terbaru & info resmi di <b>🔗 Channel Resmi</b>.\n" +
+      "• Cek status akun di <b>👤 Profil Saya</b> dan bagikan kode di <b>🎁 Undang Teman</b>.",
+  },
+  {
+    title: "6/6 • Cek Singkat Sebelum Belanja",
+    body:
+      "Pastikan 3 hal ini sudah aman:\n" +
+      "1. Nominal QRIS <b>pas</b> (atau pakai <b>Saldo</b> agar lebih praktis).\n" +
+      "2. Riwayat & akses file ada di <b>🎒 Koleksi Saya</b>.\n" +
+      "3. Kendala apa pun langsung sertakan <b>ID order</b> saat chat admin.",
+  },
+];
+
+async function getUserOnboardStep(userId) {
+  const raw = await redisCommand(["GET", `${REDIS_ONBOARD_PREFIX}${userId}`]);
+  const idx = parseInt(raw, 10);
+  if (isNaN(idx) || idx < 0) return 0;
+  return Math.min(idx, ONBOARD_STEPS.length - 1);
+}
+
+async function setUserOnboardStep(userId, stepIdx) {
+  const clamped = Math.min(Math.max(0, Number(stepIdx) || 0), ONBOARD_STEPS.length - 1);
+  await redisCommand([
+    "SET",
+    `${REDIS_ONBOARD_PREFIX}${userId}`,
+    String(clamped),
+    "EX",
+    "2592000",
+  ]);
+}
+
+function buildOnboardPayload(stepIdx) {
+  const idx = Math.min(Math.max(0, Number(stepIdx) || 0), ONBOARD_STEPS.length - 1);
+  const step = ONBOARD_STEPS[idx];
+  const isLast = idx === ONBOARD_STEPS.length - 1;
+
+  const text =
+    `🧭 <b>ASISTEN PANDUAN (${escapeHtml(step.title)})</b>\n` +
+    "━━━━━━━━━━━━━━━━━━━━\n\n" +
+    `${step.body}\n\n` +
+    (isLast
+      ? "<i>Panduan selesai! Kamu siap mulai belanja atau cek fitur lain.</i>"
+      : "<i>Gunakan tombol di bawah untuk lanjut atau lewati panduan.</i>");
+
+  const navRow = [];
+  if (idx > 0) {
+    navRow.push({ text: "⬅️ Kembali", callback_data: `onboard_step_${idx - 1}` });
+  }
+  if (!isLast) {
+    navRow.push({ text: "Lanjut ➡️", callback_data: `onboard_step_${idx + 1}` });
+  } else {
+    navRow.push({ text: "🔄 Mulai Ulang", callback_data: "onboard_step_0" });
+  }
+
+  const rows = [navRow];
+  if (isLast) {
+    rows.push([
+      { text: "🛍️ Mulai Belanja", callback_data: "menu_katalog" },
+      { text: "💰 Saldo & Depo", callback_data: "menu_saldo" },
+    ]);
+    rows.push([{ text: "🏠 Menu Utama", callback_data: "menu_home" }]);
+  } else {
+    rows.push([{ text: "⏭️ Lewati ke Menu Utama", callback_data: "onboard_skip" }]);
+  }
+
+  return { text, reply_markup: { inline_keyboard: rows } };
+}
+
+async function sendOnboardingGuide(token, chatId, userId, stepIdx = 0, editMessageId = null) {
+  await setUserOnboardStep(userId, stepIdx);
+  const payload = buildOnboardPayload(stepIdx);
+  if (editMessageId) {
+    const edited = await tgRequest(token, "editMessageText", {
+      chat_id: chatId,
+      message_id: editMessageId,
+      text: payload.text,
+      parse_mode: "HTML",
+      reply_markup: payload.reply_markup,
+    });
+    if (edited && edited.ok) return;
+  }
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: payload.text,
+    parse_mode: "HTML",
+    reply_markup: payload.reply_markup,
+  });
+}
 
 async function getRequiredChannel() {
   const raw = await redisCommand(["GET", REDIS_REQ_CH_KEY]);
@@ -1460,6 +1579,53 @@ async function clearUpsellOffer(userId) {
   await redisCommand(["DEL", `${REDIS_UPSELL_PREFIX}${userId}`]);
 }
 
+async function getFirstBuyerConfig() {
+  const raw = await redisCommand(["GET", REDIS_FIRST_BUYER_CFG_KEY]);
+  if (!raw) {
+    return { enabled: true, percent: 20, maxCut: 5000 };
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      enabled: parsed.enabled !== undefined ? Boolean(parsed.enabled) : true,
+      percent: Math.min(80, Math.max(1, Number(parsed.percent) || 20)),
+      maxCut: Math.max(500, Number(parsed.maxCut) || 5000),
+    };
+  } catch (_) {
+    return { enabled: true, percent: 20, maxCut: 5000 };
+  }
+}
+
+async function saveFirstBuyerConfig(cfg) {
+  const safeCfg = {
+    enabled: Boolean(cfg.enabled),
+    percent: Math.min(80, Math.max(1, Number(cfg.percent) || 20)),
+    maxCut: Math.max(500, Number(cfg.maxCut) || 5000),
+  };
+  await redisCommand(["SET", REDIS_FIRST_BUYER_CFG_KEY, JSON.stringify(safeCfg)]);
+  return safeCfg;
+}
+
+async function isFirstTimeBuyer(userId) {
+  if (!userId) return false;
+  const [cntRaw, koleksi] = await Promise.all([
+    redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(userId)]),
+    getKoleksi(userId),
+  ]);
+  const cnt = parseInt(cntRaw, 10) || 0;
+  const hasKoleksi = Array.isArray(koleksi) && koleksi.length > 0;
+  return cnt === 0 && !hasKoleksi;
+}
+
+function calcFirstBuyerDiscount(baseNominal, cfg) {
+  if (!cfg || !cfg.enabled) return 0;
+  const price = Number(baseNominal) || 0;
+  if (price <= 500) return 0;
+  const byPercent = Math.floor((price * (Number(cfg.percent) || 20)) / 100);
+  const capped = Math.min(byPercent, Number(cfg.maxCut) || 5000);
+  return Math.min(capped, Math.max(0, price - 500));
+}
+
 async function resolveBestDiscount(userId, itemId, baseNominal) {
   const maxCut = Math.max(0, baseNominal - 500);
 
@@ -1477,8 +1643,17 @@ async function resolveBestDiscount(userId, itemId, baseNominal) {
     upsellDisc = Math.min(calcUpsellDiscount(baseNominal, offer.percent), maxCut);
   }
 
-  if (upsellDisc > 0 && upsellDisc >= voucherDisc) {
+  let firstBuyerDisc = 0;
+  const firstCfg = await getFirstBuyerConfig();
+  if (firstCfg.enabled && (await isFirstTimeBuyer(userId))) {
+    firstBuyerDisc = Math.min(calcFirstBuyerDiscount(baseNominal, firstCfg), maxCut);
+  }
+
+  if (upsellDisc > 0 && upsellDisc >= voucherDisc && upsellDisc >= firstBuyerDisc) {
     return { source: "upsell", discount: upsellDisc, code: "UPSELL" };
+  }
+  if (firstBuyerDisc > 0 && firstBuyerDisc >= voucherDisc) {
+    return { source: "first_buyer", discount: firstBuyerDisc, code: `FIRST${firstCfg.percent}` };
   }
   if (voucherDisc > 0) {
     return { source: "voucher", discount: voucherDisc, code: voucher.code };
@@ -1494,9 +1669,15 @@ async function consumeDiscountSource(userId, source) {
 function buildDiscountLine(source, code, discount) {
   if (!(discount > 0)) return "";
   if (source === "upsell") {
-    return `🔥 <b>Diskon Spesial (Upsell):</b> -${formatRupiah(discount)}\n`;
+    return `🔥 <b>Diskon Spesial (Upsell):</b> -${formatRupiah(discount)}
+`;
   }
-  return `🎟️ <b>Voucher (${escapeHtml(code)}):</b> -${formatRupiah(discount)}\n`;
+  if (source === "first_buyer") {
+    return `🔥 <b>Harga Spesial Pembeli Pertama:</b> -${formatRupiah(discount)}
+`;
+  }
+  return `🎟️ <b>Voucher (${escapeHtml(code)}):</b> -${formatRupiah(discount)}
+`;
 }
 
 async function sendUpsellOffer(token, order, ctx) {
@@ -2549,12 +2730,15 @@ async function sendMoreMenu(token, chatId) {
           { text: "🤝 Reseller", callback_data: "menu_reseller" },
         ],
         [
+          { text: "🧭 Asisten Panduan", callback_data: "menu_panduan" },
           { text: "📋 Cara Order", callback_data: "menu_cara" },
+        ],
+        [
           { text: "🔗 Channel Resmi", callback_data: "menu_channel" },
+          { text: "🏠 Menu Utama", callback_data: "menu_home" },
         ],
         [
           { text: `💬 Admin`, url: `https://t.me/${ADMIN_USERNAME}` },
-          { text: "🔙 Menu Utama", callback_data: "menu_home" },
         ],
       ],
     },
@@ -4640,6 +4824,14 @@ module.exports = async function handler(req, res) {
         await sendKoleksiMenu(token, chatId, callerId);
       } else if (data === "menu_promo") {
         await sendKatalogMenu(token, chatId);
+      } else if (data === "menu_panduan") {
+        await sendOnboardingGuide(token, chatId, callerId, 0);
+      } else if (data.startsWith("onboard_step_")) {
+        const nextStep = parseInt(data.replace("onboard_step_", ""), 10) || 0;
+        await sendOnboardingGuide(token, chatId, callerId, nextStep, messageId);
+      } else if (data === "onboard_skip") {
+        await setUserOnboardStep(callerId, ONBOARD_STEPS.length - 1);
+        await sendMainMenuCard(token, chatId);
       } else if (data === "menu_cara") {
         await sendCaraOrder(token, chatId);
       } else if (data === "menu_lainnya") {
@@ -4884,16 +5076,22 @@ module.exports = async function handler(req, res) {
         if (saldo >= effectivePrice) {
           const sisaSaldo = saldo - effectivePrice;
           const voucherLine = buildDiscountLine(bestDiscount.source, bestDiscount.code, discount);
+          const estimasiBlock =
+            "╭─── ⏳ <b>SIMULASI SALDO SETELAH CHECKOUT</b> ───\n" +
+            `│ • <b>Saldo Aktif Sekarang :</b> <code>${formatRupiah(saldo)}</code>\n` +
+            `│ • <b>Potongan Checkout    :</b> -<code>${formatRupiah(effectivePrice)}</code>\n` +
+            `│ • <b>Estimasi Sisa Saldo  :</b> <code>${formatRupiah(sisaSaldo)}</code>\n` +
+            "╰────────────────────────────────────\n\n";
 
           await tgRequest(token, "sendMessage", {
             chat_id: chatId,
             text:
-              `⚡ <b>PILIH METODE PEMBAYARAN</b>\n\n` +
+              "⚡ <b>KONFIRMASI PEMBAYARAN SALDO</b>\n\n" +
               `📦 <b>Paket:</b> ${escapeHtml(target.itemNama)}\n` +
               voucherLine +
-              `💰 <b>Total Bayar:</b> <code>${formatRupiah(effectivePrice)}</code>\n` +
-              `💳 <b>Saldo Kamu:</b> <code>${formatRupiah(saldo)}</code> <i>(Sisa: ${formatRupiah(sisaSaldo)})</i>\n\n` +
-              `Saldo kamu mencukupi! Pilih bayar instan pakai saldo atau via QRIS 👇`,
+              `💰 <b>Total Bayar:</b> <code>${formatRupiah(effectivePrice)}</code>\n\n` +
+              estimasiBlock +
+              "Saldo kamu mencukupi! Konfirmasi pembayaran instan pakai saldo atau pilih QRIS 👇",
             parse_mode: "HTML",
             reply_markup: {
               inline_keyboard: [
@@ -5699,6 +5897,70 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      if (rawText.startsWith("/setfirstbuyer")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const argStr = rawText.replace(/^\/setfirstbuyer\s*/i, "").trim();
+        const currentCfg = await getFirstBuyerConfig();
+
+        if (!argStr) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "🔥 <b>PENGATURAN HARGA SPESIAL PEMBELI PERTAMA</b>
+" +
+              `• <b>Status :</b> ${currentCfg.enabled ? "AKTIF ✅" : "NONAKTIF ⏸️"}
+` +
+              `• <b>Diskon :</b> <code>${currentCfg.percent}%</code> (Maks. <code>${formatRupiah(currentCfg.maxCut)}</code>)
+
+` +
+              "Format:
+" +
+              "• <code>/setfirstbuyer on 20 5000</code> (aktif, 20%, maks Rp 5.000)
+" +
+              "• <code>/setfirstbuyer off</code> (matikan promo)",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const parts = argStr.split(/\s+/);
+        const mode = (parts[0] || "").toLowerCase();
+        if (mode === "off" || mode === "0" || mode === "false") {
+          const saved = await saveFirstBuyerConfig({ ...currentCfg, enabled: false });
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `⏸️ Harga Spesial Pembeli Pertama <b>DINONAKTIFKAN</b> (Diskon sebelumnya: ${saved.percent}% / maks ${formatRupiah(saved.maxCut)}).`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const enabled = mode === "on" || mode === "1" || mode === "true" ? true : currentCfg.enabled;
+        const pctIdx = mode === "on" || mode === "off" || mode === "1" || mode === "0" || mode === "true" || mode === "false" ? 1 : 0;
+        const pctRaw = parseInt(parts[pctIdx], 10);
+        const maxRaw = parseInt(parts[pctIdx + 1], 10);
+
+        const nextCfg = await saveFirstBuyerConfig({
+          enabled,
+          percent: Number.isFinite(pctRaw) && pctRaw > 0 ? pctRaw : currentCfg.percent,
+          maxCut: Number.isFinite(maxRaw) && maxRaw >= 500 ? maxRaw : currentCfg.maxCut,
+        });
+
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            "🔥 <b>Harga Spesial Pembeli Pertama Diperbarui!</b>
+" +
+            `• <b>Status :</b> ${nextCfg.enabled ? "AKTIF ✅" : "NONAKTIF ⏸️"}
+` +
+            `• <b>Diskon :</b> <code>${nextCfg.percent}%</code>
+` +
+            `• <b>Batas Potongan :</b> <code>${formatRupiah(nextCfg.maxCut)}</code>`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       if (rawText.startsWith("/voucher")) {
         const code = rawText.replace(/^\/voucher\s*/i, "").trim().toUpperCase();
         if (!code) {
@@ -6193,7 +6455,13 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
           reply_markup: getCompactReplyKeyboard(),
         });
-        await sendMainMenuCard(token, chatId);
+        if (isNewUser && !refMatch) {
+          await sendOnboardingGuide(token, chatId, senderId, 0);
+        } else {
+          await sendMainMenuCard(token, chatId);
+        }
+      } else if (text === "/panduan" || text === "🧭 Asisten Panduan") {
+        await sendOnboardingGuide(token, chatId, senderId, 0);
       } else if (text === "/menu" || text === "☰ Lainnya" || text === "☰ Menu Lainnya") {
         await sendMoreMenu(token, chatId);
       } else if (text === "/profil" || text === "👤 Profil") {
