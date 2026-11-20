@@ -6,8 +6,10 @@ const LINK_CH_CADANGAN = "https://t.me/+OGXaaPyrnd5kMmY1";
 const LINK_CH_FREE = "https://t.me/+jf3tLqLIG444MjBI";
 
 // ---- PENGATURAN MENU RESELLER (UBAH SESUAI KEBUTUHAN) ----
-const RESELLER_PRICE_LITE = 1200; // harga reseller Paket Lite (retail Rp 2.000)
-const RESELLER_PRICE_STANDAR = 2000; // harga reseller Paket Standar (retail Rp 3.000)
+const RETAIL_PRICE_LITE = 5000; // harga retail Paket Lite
+const RETAIL_PRICE_STANDAR = 10000; // harga retail Paket Standar
+const RESELLER_PRICE_LITE = 3500; // harga modal reseller Paket Lite (retail Rp 5.000)
+const RESELLER_PRICE_STANDAR = 7000; // harga modal reseller Paket Standar (retail Rp 10.000)
 const RESELLER_MIN_ORDER = 10; // minimal ambil set per order
 const DEFAULT_MACRO_SECRET = "lumineacc2026";
 
@@ -15,9 +17,9 @@ const DEFAULT_MACRO_SECRET = "lumineacc2026";
 // Tier otomatis naik saat omset reseller mencapai min_omset. Ubah angka sesuai kebutuhan.
 const RESELLER_TIERS = [
   { name: "🥉 Bronze", min_omset: 0, price_lite: RESELLER_PRICE_LITE, price_standar: RESELLER_PRICE_STANDAR },
-  { name: "🥈 Silver", min_omset: 100000, price_lite: 1100, price_standar: 1850 },
-  { name: "🥇 Gold", min_omset: 300000, price_lite: 1000, price_standar: 1700 },
-  { name: "💎 Platinum", min_omset: 750000, price_lite: 900, price_standar: 1500 },
+  { name: "🥈 Silver", min_omset: 250000, price_lite: 3250, price_standar: 6500 },
+  { name: "🥇 Gold", min_omset: 750000, price_lite: 3000, price_standar: 6000 },
+  { name: "💎 Platinum", min_omset: 1500000, price_lite: 2750, price_standar: 5500 },
 ];
 
 // ---- UPSELL SETELAH PEMBAYARAN DI-ACC ----
@@ -25,12 +27,19 @@ const UPSELL_ENABLED = true; // false = matikan fitur upsell
 const UPSELL_DISCOUNT_PERCENT = 10; // diskon untuk set tawaran
 const UPSELL_WINDOW_MINUTES = 10; // lama penawaran berlaku
 
+// ---- HADIAH LEADERBOARD BULANAN (saldo otomatis untuk Top 3 pembeli bulan lalu) ----
+const LB_REWARD_ENABLED = true; // false = matikan hadiah
+const LB_REWARD_SALDO = [10000, 5000, 3000]; // hadiah saldo untuk peringkat 1, 2, 3
+const LB_REWARD_MIN_OMSET = 20000; // minimal total belanja bulan itu agar berhak dapat hadiah
+const REDIS_LB_REWARD_LOCK_PREFIX = "lumine_main_lb_reward_";
+
 // ---- BOT RESELLER (WHITE-LABEL) ----
-const RESELLER_BOT_MAX_PRICE = 4000; // harga jual MAKSIMAL yang boleh dipasang reseller di bot mereka
+// Harga jual reseller di bot mereka: MINIMAL = harga retail toko utama (tidak boleh lebih murah dari kamu),
+// MAKSIMAL = retail + persen berikut (dibulatkan ke Rp 500).
+const RESELLER_BOT_MAX_MARKUP_PERCENT = 20;
 const RESELLER_BOT_ITEMS_PER_PAGE = 8; // jumlah set per halaman katalog bot reseller
 
 const REDIS_KEY = "lumine_main_katalog";
-const REDIS_BUNDLE_KEY = "lumine_main_bundle";
 const REDIS_QRIS_KEY = "lumine_main_qris";
 const REDIS_BANNER_KEY = "lumine_main_banner";
 const REDIS_TESTI_KEY = "lumine_main_testi";
@@ -62,6 +71,18 @@ const REDIS_RBOT_PAID_KEY = "lumine_main_rb_margin_paid";
 const REDIS_RBOT_SALES_PREFIX = "lumine_main_rb_sales_";
 const REDIS_RBOT_FILECACHE_KEY = "lumine_main_rb_filecache";
 const REDIS_RBOT_LOCK_PREFIX = "lumine_main_rb_lock_";
+const REDIS_WD_HELD_KEY = "lumine_main_wd_held"; // margin yang sedang "ditahan" untuk WD pending
+const REDIS_WD_SEQ_KEY = "lumine_main_wd_seq";
+const REDIS_WD_PREFIX = "lumine_main_wd_";
+const REDIS_WD_PENDING_KEY = "lumine_main_wd_pending"; // hash: id WD -> owner
+const REDIS_WD_HIST_PREFIX = "lumine_main_wd_hist_";
+const REDIS_WD_LOCK_PREFIX = "lumine_main_wd_lock_";
+const REDIS_WD_CH_KEY = "lumine_main_wd_channel";
+
+// ---- PENGATURAN WD (TARIK MARGIN) RESELLER ----
+const WD_ENABLED = true; // false = matikan fitur WD
+const WD_MIN_AMOUNT = 10000; // minimal nominal sekali WD
+const WD_FEE = 0; // biaya admin per WD (Rp). 0 = gratis. Dipotong dari nominal yang ditransfer.
 
 function escapeHtml(str) {
   return String(str || "")
@@ -372,20 +393,6 @@ async function saveKatalog(list) {
   await redisCommand(["SET", REDIS_KEY, JSON.stringify(list)]);
 }
 
-async function getBundle() {
-  const raw = await redisCommand(["GET", REDIS_BUNDLE_KEY]);
-  if (!raw) return { link: "" };
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return { link: "" };
-  }
-}
-
-async function saveBundle(bundleData) {
-  await redisCommand(["SET", REDIS_BUNDLE_KEY, JSON.stringify(bundleData)]);
-}
-
 async function getQris() {
   const raw = await redisCommand(["GET", REDIS_QRIS_KEY]);
   if (!raw) return null;
@@ -613,7 +620,7 @@ async function findPendingOrderByNominals(nominalList) {
 
 function parseNominal(hargaStr) {
   const angka = parseInt(String(hargaStr || "").replace(/\D/g, ""), 10);
-  return angka && angka >= 100 ? angka : 2000;
+  return angka && angka >= 100 ? angka : RETAIL_PRICE_LITE;
 }
 
 function formatRupiah(angka) {
@@ -781,6 +788,7 @@ async function buildLeaderboardPayload(period, viewerId) {
   const text =
     `🏆 <b>LEADERBOARD TOP BUYER — ${titleLabel}</b>\n` +
     `<i>Peringkat pembeli terbanyak & gelar loyalitas:</i>\n\n` +
+    (period === "month" ? buildLbRewardLine() : "") +
     `╭─── 👑 <b>KLASEMEN TOP 10</b> ───\n` +
     listLines +
     `╰─────────────────────\n\n` +
@@ -802,6 +810,119 @@ async function buildLeaderboardPayload(period, viewerId) {
 
   return { text, reply_markup };
 }
+// ---- HADIAH LEADERBOARD BULANAN ----
+function getPrevMonthKey() {
+  const wib = new Date(Date.now() + 7 * 3600 * 1000);
+  let y = wib.getUTCFullYear();
+  let m = wib.getUTCMonth(); // 0-11 = bulan sekarang; sebagai 1-12 itu bulan lalu
+  if (m === 0) {
+    m = 12;
+    y -= 1;
+  }
+  return `${y}-${String(m).padStart(2, "0")}`;
+}
+
+function buildLbRewardLine() {
+  if (!LB_REWARD_ENABLED) return "";
+  const medals = ["🥇", "🥈", "🥉"];
+  const parts = LB_REWARD_SALDO.map((v, i) => `${medals[i]} ${formatRupiah(v)}`);
+  return `🎁 <b>Hadiah Top 3 bulan ini (saldo):</b> ${parts.join(" • ")}\n` +
+    `<i>Min. belanja ${formatRupiah(LB_REWARD_MIN_OMSET)} • dibagikan otomatis awal bulan depan</i>\n\n`;
+}
+
+// Bagikan hadiah untuk bulan tertentu. Aman dipanggil berkali-kali: hanya jalan sekali per bulan (lock).
+async function awardMonthlyLeaderboard(token, monthKey) {
+  if (!LB_REWARD_ENABLED) return { ok: false, reason: "disabled" };
+  const lockKey = `${REDIS_LB_REWARD_LOCK_PREFIX}${monthKey}`;
+  const lock = await redisCommand(["SET", lockKey, "1", "NX", "EX", "5184000"]);
+  if (!lock) return { ok: false, reason: "already" };
+
+  const raw = await redisCommand([
+    "ZREVRANGE",
+    `${REDIS_LB_PREFIX}month_rp_${monthKey}`,
+    "0",
+    String(LB_REWARD_SALDO.length - 1),
+    "WITHSCORES",
+  ]);
+  const winners = [];
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      winners.push({ userId: raw[i], total: parseInt(raw[i + 1], 10) || 0 });
+    }
+  }
+  const names = winners.length
+    ? (await redisCommand(["HMGET", REDIS_LB_NAMES_KEY, ...winners.map((w) => w.userId)])) || []
+    : [];
+
+  const medals = ["🥇", "🥈", "🥉"];
+  const awarded = [];
+  for (let i = 0; i < winners.length; i++) {
+    const w = winners[i];
+    if (w.total < LB_REWARD_MIN_OMSET) continue;
+    const hadiah = LB_REWARD_SALDO[i];
+    const saldoBaru = await addUserSaldo(w.userId, hadiah);
+    awarded.push({ rank: i + 1, userId: w.userId, nama: names[i] || "Pembeli", total: w.total, hadiah });
+
+    await tgRequest(token, "sendMessage", {
+      chat_id: w.userId,
+      text:
+        `🏆 <b>SELAMAT! KAMU PERINGKAT #${i + 1} LEADERBOARD ${monthKey}</b> ${medals[i]}\n\n` +
+        `🎁 <b>Hadiah:</b> +<code>${formatRupiah(hadiah)}</code> saldo\n` +
+        `💳 <b>Saldo Kamu Sekarang:</b> <code>${formatRupiah(saldoBaru)}</code>\n\n` +
+        "<i>Makasih udah jadi pembeli setia! Gas lagi bulan ini biar naik peringkat 💜</i>",
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[{ text: "🛍️ Belanja Pakai Saldo", callback_data: "menu_katalog" }]],
+      },
+    }).catch(() => {});
+  }
+
+  if (awarded.length > 0) {
+    const lines = awarded
+      .map((a) => `${medals[a.rank - 1]} <b>${escapeHtml(a.nama)}</b> — ${formatRupiah(a.total)} ➜ +${formatRupiah(a.hadiah)}`)
+      .join("\n");
+
+    const testi = await getTestiConfig();
+    if (testi && testi.channel_id) {
+      const payload = {
+        chat_id: testi.channel_id,
+        text:
+          `🏆 <b>PEMENANG LEADERBOARD ${monthKey}</b>\n` +
+          "━━━━━━━━━━━━━━━━━━━━\n" +
+          lines +
+          "\n━━━━━━━━━━━━━━━━━━━━\n" +
+          "🎁 <i>Hadiah saldo sudah masuk otomatis. Mau ikutan bulan ini? Belanja terus ya!</i>",
+        parse_mode: "HTML",
+      };
+      if (testi.bot_username) {
+        payload.reply_markup = {
+          inline_keyboard: [[{ text: "🛍️ Belanja Sekarang", url: `https://t.me/${testi.bot_username}` }]],
+        };
+      }
+      await tgRequest(token, "sendMessage", payload).catch(() => {});
+    }
+
+    const qris = await getQris();
+    if (qris && qris.admin_chat_id) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: qris.admin_chat_id,
+        text: `🎁 <b>HADIAH LEADERBOARD ${monthKey} DIBAGIKAN</b>\n\n${lines}`,
+        parse_mode: "HTML",
+      }).catch(() => {});
+    }
+  }
+  return { ok: true, awarded };
+}
+
+// Dipanggil tiap ada pesan masuk: cek murah (1 GET), baru jalan kalau bulan lalu belum dibagikan.
+async function maybeAwardLastMonth(token) {
+  if (!LB_REWARD_ENABLED) return;
+  const monthKey = getPrevMonthKey();
+  const done = await redisCommand(["GET", `${REDIS_LB_REWARD_LOCK_PREFIX}${monthKey}`]);
+  if (done) return;
+  await awardMonthlyLeaderboard(token, monthKey);
+}
+
 // ---- UPSELL: PENAWARAN SET BERIKUTNYA SETELAH ACC ----
 function formatWibClock(ms) {
   const d = new Date(ms + 7 * 3600 * 1000);
@@ -1076,7 +1197,7 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
         `✅ <b>DEPOSIT SALDO BERHASIL! (Order #${order.id})</b>\n\n` +
         `💰 <b>Nominal Masuk:</b> +<code>${formatRupiah(depositAmount)}</code>\n` +
         `💳 <b>Saldo Kamu Sekarang:</b> <code>${formatRupiah(newSaldo)}</code>\n\n` +
-        `<i>Saldo siap dipakai untuk checkout instan di Katalog, Bundling 5k, atau Mystery Box!</i>`,
+        `<i>Saldo siap dipakai untuk checkout instan di Katalog atau Mystery Box!</i>`,
       parse_mode: "HTML",
       reply_markup: {
         inline_keyboard: [
@@ -1122,7 +1243,6 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
   let buyerText = "";
 
   if (order.is_mystery) {
-    const bundle = await getBundle();
     const pool = katalogList.map((k) => ({
       id: String(k.id),
       nama: k.nama,
@@ -1130,14 +1250,6 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
         Array.isArray(k.links) && k.links.length > 0 ? k.links : k.link ? [k.link] : [],
       files: Array.isArray(k.files) ? k.files : [],
     }));
-    if (bundle.link && bundle.link.trim() !== "") {
-      pool.push({
-        id: "",
-        nama: "🌟 JACKPOT: Promo Bundling 2 Photopack",
-        links: [bundle.link],
-        files: [],
-      });
-    }
     const won =
       pool.length > 0
         ? pool[Math.floor(Math.random() * pool.length)]
@@ -1272,7 +1384,7 @@ function getCompactReplyKeyboard() {
   return {
     keyboard: [
       [{ text: "🛍️ Katalog" }, { text: "🔥 Bestseller" }],
-      [{ text: "🎲 Mystery Box" }, { text: "🎁 Promo 5k" }],
+      [{ text: "🎲 Mystery Box" }],
       [{ text: "💰 Saldo & Depo" }, { text: "🎒 Koleksi Saya" }],
       [{ text: "🏆 Leaderboard" }, { text: "💎 Info & Channel" }],
       [{ text: "🤝 Reseller" }],
@@ -1392,9 +1504,8 @@ async function sendMainMenuCard(token, chatId) {
     "✨ <b>LUMINE PHOTOPACK</b> ✨\n" +
     "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n\n" +
     "╭─── 💰 <b>DAFTAR HARGA</b> ───\n" +
-    "│ • <b>Paket Lite</b> (5–7 Foto) : <code>Rp 2.000</code>\n" +
-    "│ • <b>Paket Standar</b> (8–10 Foto) : <code>Rp 3.000</code>\n" +
-    "│ • 🎁 <b>Bundling 2 Set</b> : <code>Rp 5.000</code>\n" +
+    `│ • <b>Paket Lite</b> : <code>${formatRupiah(RETAIL_PRICE_LITE)}</code>\n` +
+    `│ • <b>Paket Standar</b> : <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
     `│ • 🎲 <b>Mystery Box Gacha</b> : <code>${formatRupiah(mysteryCfg.price || 3000)}</code>\n` +
     "╰────────────────────\n\n" +
     "💳 Bisa <b>Deposit Saldo (Auto-ACC)</b> untuk checkout 1x klik tanpa kode unik!\n" +
@@ -1407,10 +1518,7 @@ async function sendMainMenuCard(token, chatId) {
         { text: "🛍️ Katalog Photopack", callback_data: "menu_katalog" },
         { text: "🔥 Bestseller", callback_data: "menu_bestseller" },
       ],
-      [
-        { text: "🎲 Mystery Box", callback_data: "menu_mystery" },
-        { text: "🎁 Promo Bundling 5k", callback_data: "menu_promo" },
-      ],
+      [{ text: "🎲 Mystery Box", callback_data: "menu_mystery" }],
       [
         { text: "💰 Saldo & Deposit", callback_data: "menu_saldo" },
         { text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" },
@@ -1599,7 +1707,6 @@ async function sendBestsellerMenu(token, chatId) {
 async function sendMysteryMenu(token, chatId) {
   const cfg = await getMysteryConfig();
   const katalogList = await getKatalog();
-  const bundle = await getBundle();
 
   if (!cfg.enabled || katalogList.length === 0) {
     await tgRequest(token, "sendMessage", {
@@ -1613,10 +1720,7 @@ async function sendMysteryMenu(token, chatId) {
     return;
   }
 
-  let prizePreview = `• Salah satu dari <b>${katalogList.length} Koleksi Photopack</b> (nilai s/d Rp 3.000)\n`;
-  if (bundle.link && bundle.link.trim() !== "") {
-    prizePreview += "• 🌟 <b>GRAND JACKPOT:</b> Promo Bundling 2 Photopack (nilai Rp 5.000)!\n";
-  }
+  const prizePreview = `• Salah satu dari <b>${katalogList.length} Koleksi Photopack</b>\n`;
 
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
@@ -1697,43 +1801,6 @@ async function sendMysteryMenu(token, chatId) {
   });
 }
 
-async function sendPromoBundling(token, chatId, replyToMessageId = null) {
-  const bundle = await getBundle();
-  const promoText =
-    "🎁 <b>PROMO BUNDLING HEMAT — 2 PHOTOPACK</b>\n\n" +
-    "╭─── 💸 <b>RINCIAN PROMO</b> ───\n" +
-    "│ • Harga Normal : <s>Rp 6.000</s>\n" +
-    "│ • Harga Promo  : <b>Rp 5.000</b> <i>(Hemat Rp 1.000!)</i>\n" +
-    "╰────────────────────\n\n" +
-    "📌 <b>Cara Klaim Promo:</b>\n" +
-    "1. Cek judul 2 set yang kamu mau di <b>Katalog Photopack</b>.\n" +
-    "2. Klik tombol <b>Beli Promo</b> di bawah untuk bayar via Saldo atau QRIS.\n" +
-    "3. Setelah pembayaran terverifikasi, link akses langsung dikirim otomatis!";
-
-  const buttons = [];
-  if (bundle.link && bundle.link.trim() !== "") {
-    buttons.push([
-      {
-        text: "⚡ Beli Promo 2 Photopack (Rp 5.000)",
-        callback_data: "buy_bundle",
-      },
-    ]);
-  }
-  buttons.push([
-    { text: `💬 Tanya Admin (@${ADMIN_USERNAME})`, url: `https://t.me/${ADMIN_USERNAME}` },
-  ]);
-  buttons.push([{ text: "🔙 Menu Utama", callback_data: "menu_home" }]);
-
-  const payload = {
-    chat_id: chatId,
-    text: promoText,
-    parse_mode: "HTML",
-    reply_markup: { inline_keyboard: buttons },
-  };
-  if (replyToMessageId) payload.reply_to_message_id = replyToMessageId;
-  await tgRequest(token, "sendMessage", payload);
-}
-
 async function sendResellerMenu(token, chatId, user) {
   const userId = (user && user.id) || "-";
   const uname = user && user.username ? `@${user.username}` : "(tanpa username)";
@@ -1755,7 +1822,7 @@ async function sendResellerMenu(token, chatId, user) {
         "<i>Atur harga jual di bot itu: /hargaku • /setharga • /margin</i>\n\n"
       : "🤖 <b>Punya bot toko sendiri!</b>\n" +
         "Buat bot di @BotFather, lalu kirim <code>/daftarbot TOKEN_BOT</code> ke sini. " +
-        `Harga jual kamu yang atur (maks ${formatRupiah(RESELLER_BOT_MAX_PRICE)}), untung dicatat otomatis.\n\n`;
+        `Harga jual kamu yang atur (min = harga toko utama, maks +${RESELLER_BOT_MAX_MARKUP_PERCENT}%), untung dicatat otomatis.\n\n`;
   }
   const statusLine = statusReseller
     ? "✅ <b>Status Kamu: Reseller Aktif</b>\n\n"
@@ -1764,6 +1831,9 @@ async function sendResellerMenu(token, chatId, user) {
   const keyboardRows = [];
   if (statusReseller) {
     keyboardRows.push([{ text: "📊 Cek Omset Saya", callback_data: "reseller_omset_self" }]);
+    if (WD_ENABLED) {
+      keyboardRows.push([{ text: "💳 WD Margin", callback_data: "reseller_wd" }]);
+    }
   } else {
     keyboardRows.push([{ text: "📝 Daftar Reseller", url: `https://t.me/${ADMIN_USERNAME}?text=${prefill}` }]);
   }
@@ -1864,26 +1934,6 @@ async function sendChannelLainnya(token, chatId) {
       targetLinks: [],
       targetFiles: [],
       isMystery: true,
-    };
-  }
-
-  if (targetKey === "bundle") {
-    const bundle = await getBundle();
-    if (!bundle.link) {
-      return {
-        ok: false,
-        error: `⚠️ Link promo bundling belum diatur. Silakan hubungi @${ADMIN_USERNAME}.`,
-      };
-    }
-    return {
-      ok: true,
-      itemId: "",
-      itemNama: "Promo Bundling 2 Photopack",
-      baseNominal: 5000,
-      targetLink: bundle.link,
-      targetLinks: [bundle.link],
-      targetFiles: [],
-      isMystery: false,
     };
   }
 
@@ -2034,13 +2084,17 @@ async function removeResellerBot(ownerId) {
 }
 
 async function getResellerMargin(ownerId) {
-  const [e, p] = await Promise.all([
+  const [e, p, h] = await Promise.all([
     redisCommand(["HGET", REDIS_RBOT_MARGIN_KEY, String(ownerId)]),
     redisCommand(["HGET", REDIS_RBOT_PAID_KEY, String(ownerId)]),
+    redisCommand(["HGET", REDIS_WD_HELD_KEY, String(ownerId)]),
   ]);
   const earned = parseInt(e, 10) || 0;
   const paid = parseInt(p, 10) || 0;
-  return { earned, paid, owed: Math.max(0, earned - paid) };
+  const held = Math.max(0, parseInt(h, 10) || 0);
+  const owed = Math.max(0, earned - paid); // total margin yang belum dibayar admin
+  // available = saldo margin yang boleh di-WD (belum terpakai WD pending)
+  return { earned, paid, owed, held, available: Math.max(0, owed - held) };
 }
 
 async function getResellerSales(ownerId) {
@@ -2067,7 +2121,12 @@ async function buildMarginText(ownerId) {
     "━━━━━━━━━━━━━━━━━━━━\n" +
     `📈 <b>Total Untung:</b> <code>${formatRupiah(m.earned)}</code>\n` +
     `✅ <b>Sudah Dibayar Admin:</b> <code>${formatRupiah(m.paid)}</code>\n` +
-    `⏳ <b>Belum Dibayar:</b> <code>${formatRupiah(m.owed)}</code>\n`;
+    `⏳ <b>Belum Dibayar:</b> <code>${formatRupiah(m.owed)}</code>\n` +
+    (m.held > 0 ? `🔒 <b>Sedang Diproses WD:</b> <code>${formatRupiah(m.held)}</code>\n` : "") +
+    `💳 <b>Bisa Ditarik (WD):</b> <code>${formatRupiah(m.available)}</code>\n` +
+    (WD_ENABLED
+      ? `<i>Tarik margin lewat bot utama: /wd NOMINAL (min ${formatRupiah(WD_MIN_AMOUNT)})</i>\n`
+      : "");
   if (sales.length > 0) {
     text += "\n🧾 <b>Penjualan Terakhir:</b>\n";
     for (const s of sales.slice(0, 8)) {
@@ -2081,12 +2140,224 @@ async function buildMarginText(ownerId) {
   return text;
 }
 
+// ---- WD (TARIK MARGIN) RESELLER ----
+// Alur: reseller /wd NOMINAL TUJUAN -> margin ditahan (held) -> admin transfer manual lalu klik ACC
+//       -> held dikurangi & paid ditambah. Kalau ditolak -> held dikembalikan (margin utuh).
+async function getWd(wdId) {
+  const raw = await redisCommand(["GET", `${REDIS_WD_PREFIX}${wdId}`]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function saveWd(wd) {
+  await redisCommand(["SET", `${REDIS_WD_PREFIX}${wd.id}`, JSON.stringify(wd)]);
+  if (wd.status === "pending") {
+    await redisCommand(["HSET", REDIS_WD_PENDING_KEY, String(wd.id), String(wd.owner_id)]);
+  } else {
+    await redisCommand(["HDEL", REDIS_WD_PENDING_KEY, String(wd.id)]);
+  }
+}
+
+// Ajukan WD. Atomik: tahan dulu (HINCRBY), cek, rollback kalau melebihi saldo.
+async function createWdRequest(user, amount, tujuan) {
+  const ownerId = String(user.id);
+  const nominal = Math.round(Number(amount) || 0);
+
+  if (!WD_ENABLED) return { ok: false, error: "⚠️ Fitur WD sedang dinonaktifkan admin." };
+  if (nominal < WD_MIN_AMOUNT) {
+    return { ok: false, error: `⚠️ Minimal WD <b>${formatRupiah(WD_MIN_AMOUNT)}</b>.` };
+  }
+  if (!tujuan || tujuan.length < 5) {
+    return {
+      ok: false,
+      error:
+        "⚠️ Isi tujuan transfer yang jelas.\n<i>Contoh: <code>/wd 25000 DANA 08123456789 a.n Budi</code></i>",
+    };
+  }
+
+  const pendingCount = (await redisCommand(["HGETALL", REDIS_WD_PENDING_KEY])) || [];
+  for (let i = 0; i < pendingCount.length; i += 2) {
+    if (String(pendingCount[i + 1]) === ownerId) {
+      return {
+        ok: false,
+        error: `⚠️ Kamu masih punya WD #${escapeHtml(String(pendingCount[i]))} yang diproses admin. Tunggu selesai dulu ya.`,
+      };
+    }
+  }
+
+  const newHeld = parseInt(await redisCommand(["HINCRBY", REDIS_WD_HELD_KEY, ownerId, nominal]), 10) || 0;
+  const m = await getResellerMargin(ownerId); // held sudah termasuk nominal ini
+  if (newHeld > m.owed) {
+    await redisCommand(["HINCRBY", REDIS_WD_HELD_KEY, ownerId, -nominal]);
+    const avail = Math.max(0, m.owed - (newHeld - nominal));
+    return {
+      ok: false,
+      error: `⚠️ Margin tidak cukup. Yang bisa ditarik sekarang: <b>${formatRupiah(avail)}</b>.`,
+    };
+  }
+
+  const wdId = await redisCommand(["INCR", REDIS_WD_SEQ_KEY]);
+  const fullName = [user.first_name, user.last_name].filter(Boolean).join(" ") || "Reseller";
+  const wd = {
+    id: wdId,
+    owner_id: ownerId,
+    owner_name: fullName,
+    owner_username: user.username ? `@${user.username}` : "Tanpa Username",
+    amount: nominal,
+    fee: WD_FEE,
+    net: Math.max(0, nominal - WD_FEE),
+    tujuan: String(tujuan).slice(0, 200),
+    status: "pending",
+    created: getWibTimestamp(),
+  };
+  await saveWd(wd);
+  await redisCommand(["LPUSH", `${REDIS_WD_HIST_PREFIX}${ownerId}`, String(wdId)]);
+  await redisCommand(["LTRIM", `${REDIS_WD_HIST_PREFIX}${ownerId}`, "0", "19"]);
+  return { ok: true, wd };
+}
+
+// Channel tujuan notif WD: pakai channel khusus WD (/setwdch) kalau ada, kalau tidak pakai Channel Testimoni.
+async function getWdChannelId() {
+  const raw = await redisCommand(["GET", REDIS_WD_CH_KEY]);
+  if (raw) {
+    try {
+      const cfg = JSON.parse(raw);
+      if (cfg && cfg.channel_id) return cfg.channel_id;
+    } catch {
+      // abaikan data rusak
+    }
+  }
+  const testi = await getTestiConfig();
+  return (testi && testi.channel_id) || null;
+}
+
+async function sendWdToChannel(token, wd) {
+  const channelId = await getWdChannelId();
+  if (!channelId) return;
+
+  const testi = await getTestiConfig();
+  const payload = {
+    chat_id: channelId,
+    text:
+      `💸 <b>BUKTI WD RESELLER #${wd.id}</b>\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `👤 <b>Reseller :</b> ${escapeHtml(wd.owner_name)} (${escapeHtml(maskUsername(wd.owner_username))})\n` +
+      `💰 <b>Nominal  :</b> <code>${formatRupiah(wd.net)}</code>\n` +
+      `🕒 <b>Waktu    :</b> ${wd.done_at || getWibTimestamp()}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `✅ <i>WD sudah dibayar lunas oleh admin!</i>`,
+    parse_mode: "HTML",
+  };
+  if (testi && testi.bot_username) {
+    payload.reply_markup = {
+      inline_keyboard: [[{ text: "🤝 Gabung Jadi Reseller", url: `https://t.me/${testi.bot_username}` }]],
+    };
+  }
+  await tgRequest(token, "sendMessage", payload);
+}
+
+// Admin ACC: tandai lunas (admin sudah transfer manual). Margin ditahan jadi "dibayar".
+async function processWdAcc(token, wd) {
+  const lock = await redisCommand(["SET", `${REDIS_WD_LOCK_PREFIX}${wd.id}`, "1", "NX", "EX", "86400"]);
+  if (!lock) return { ok: false, duplicate: true };
+
+  wd.status = "done";
+  wd.done_at = getWibTimestamp();
+  await saveWd(wd);
+  await Promise.all([
+    redisCommand(["HINCRBY", REDIS_RBOT_PAID_KEY, String(wd.owner_id), wd.amount]),
+    redisCommand(["HINCRBY", REDIS_WD_HELD_KEY, String(wd.owner_id), -wd.amount]),
+  ]);
+
+  const m = await getResellerMargin(wd.owner_id);
+  await tgRequest(token, "sendMessage", {
+    chat_id: wd.owner_id,
+    text:
+      `✅ <b>WD #${wd.id} BERHASIL!</b>\n\n` +
+      `💸 <b>Ditarik:</b> <code>${formatRupiah(wd.amount)}</code>\n` +
+      (wd.fee > 0 ? `🧾 <b>Biaya Admin:</b> ${formatRupiah(wd.fee)}\n` : "") +
+      `🏦 <b>Ditransfer:</b> <code>${formatRupiah(wd.net)}</code>\n` +
+      `📍 <b>Tujuan:</b> ${escapeHtml(wd.tujuan)}\n\n` +
+      `💳 Sisa margin bisa ditarik: <code>${formatRupiah(m.available)}</code>`,
+    parse_mode: "HTML",
+  });
+
+  // Posting bukti WD ke channel (tidak boleh mengganggu proses ACC)
+  try {
+    await sendWdToChannel(token, wd);
+  } catch (e) {
+    console.error("sendWdToChannel gagal:", e);
+  }
+  return { ok: true };
+}
+
+// Admin tolak: margin yang ditahan dikembalikan utuh.
+async function processWdReject(token, wd, alasan) {
+  const lock = await redisCommand(["SET", `${REDIS_WD_LOCK_PREFIX}${wd.id}`, "1", "NX", "EX", "86400"]);
+  if (!lock) return { ok: false, duplicate: true };
+
+  wd.status = "rejected";
+  wd.done_at = getWibTimestamp();
+  wd.alasan = alasan || "";
+  await saveWd(wd);
+  await redisCommand(["HINCRBY", REDIS_WD_HELD_KEY, String(wd.owner_id), -wd.amount]);
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: wd.owner_id,
+    text:
+      `❌ <b>WD #${wd.id} DITOLAK</b>\n\n` +
+      `💸 Nominal: <code>${formatRupiah(wd.amount)}</code>\n` +
+      (wd.alasan ? `📝 Alasan: ${escapeHtml(wd.alasan)}\n` : "") +
+      `\nMargin kamu <b>sudah dikembalikan</b> dan bisa ditarik lagi. Ada pertanyaan? Hubungi @${ADMIN_USERNAME}.`,
+    parse_mode: "HTML",
+  });
+  return { ok: true };
+}
+
+async function buildWdHistoryText(ownerId) {
+  const ids = (await redisCommand(["LRANGE", `${REDIS_WD_HIST_PREFIX}${ownerId}`, "0", "7"])) || [];
+  const m = await getResellerMargin(ownerId);
+  let text =
+    "💳 <b>WD MARGIN RESELLER</b>\n" +
+    "━━━━━━━━━━━━━━━━━━━━\n" +
+    `💰 <b>Bisa Ditarik:</b> <code>${formatRupiah(m.available)}</code>\n` +
+    (m.held > 0 ? `🔒 <b>Sedang Diproses:</b> <code>${formatRupiah(m.held)}</code>\n` : "") +
+    `✅ <b>Total Sudah Ditarik:</b> <code>${formatRupiah(m.paid)}</code>\n\n` +
+    "<b>Cara WD:</b>\n" +
+    "<code>/wd NOMINAL TUJUAN</code>\n" +
+    "<i>Contoh: <code>/wd 25000 DANA 08123456789 a.n Budi</code></i>\n" +
+    `Minimal ${formatRupiah(WD_MIN_AMOUNT)}` +
+    (WD_FEE > 0 ? ` • Biaya admin ${formatRupiah(WD_FEE)}` : " • Tanpa biaya admin") +
+    "\n";
+  if (ids.length > 0) {
+    text += "\n🧾 <b>Riwayat Terakhir:</b>\n";
+    const icon = { pending: "⏳", done: "✅", rejected: "❌" };
+    for (const id of ids) {
+      const w = await getWd(id);
+      if (!w) continue;
+      text += `${icon[w.status] || "•"} #${w.id} • ${formatRupiah(w.amount)} • ${escapeHtml(w.created || "")}\n`;
+    }
+  }
+  return text;
+}
+
 // Harga modal reseller per set, mengikuti tier & harga retail set tersebut.
 function getResellerModalPrice(retailPrice, tier) {
   const retail = Number(retailPrice) || 0;
-  if (retail <= 2000) return Math.min(retail, tier.price_lite);
-  if (retail <= 3000) return tier.price_standar;
-  return Math.round((retail * tier.price_standar) / 3000 / 50) * 50;
+  if (retail <= RETAIL_PRICE_LITE) return Math.min(retail, tier.price_lite);
+  if (retail <= RETAIL_PRICE_STANDAR) return tier.price_standar;
+  return Math.round((retail * tier.price_standar) / RETAIL_PRICE_STANDAR / 50) * 50;
+}
+
+// Batas harga jual reseller untuk satu set: minimal = retail toko, maksimal = retail + markup%.
+function getResellerSellBounds(retail, modal) {
+  const min = Math.max(Number(retail) || 0, Number(modal) || 0);
+  const cap = Math.round((min * (1 + RESELLER_BOT_MAX_MARKUP_PERCENT / 100)) / 500) * 500;
+  return { min, max: Math.max(min, cap) };
 }
 
 // Daftar set yang dijual di bot reseller + harga modal / jual / margin.
@@ -2105,21 +2376,26 @@ async function getResellerBotItems(ownerId, rb) {
 
     const retail = parseNominal(k.harga);
     const modal = getResellerModalPrice(retail, tier);
-    if (modal >= RESELLER_BOT_MAX_PRICE) continue; // tidak ada ruang margin
+    const bounds = getResellerSellBounds(retail, modal);
+    if (modal >= bounds.max) continue; // tidak ada ruang margin
 
     const custom = Number(prices[String(k.id)]);
     const wanted = custom > 0 ? custom : retail;
-    const sell = Math.min(RESELLER_BOT_MAX_PRICE, Math.max(modal, wanted));
+    const sell = Math.min(bounds.max, Math.max(bounds.min, wanted));
 
     items.push({
       id: String(k.id),
       nama: k.nama,
       isi: k.isi || "",
       photo_id: k.photo_id || "",
+      kategori: k.kategori === "full" ? "full" : "mini",
+      sold: Number(k.sold) || 0,
       links,
       files,
       retail,
       modal,
+      min_sell: bounds.min,
+      max_sell: bounds.max,
       sell,
       margin: sell - modal,
     });
@@ -2315,6 +2591,28 @@ async function processResellerBotOrder(mainToken, order) {
     console.error("notif reseller gagal:", e);
   }
 
+  // Notifikasi margin ke ADMIN (berlaku untuk Auto-ACC makro maupun ACC manual)
+  try {
+    const qrisAdmin = await getQris();
+    if (qrisAdmin && qrisAdmin.admin_chat_id) {
+      const mAdmin = await getResellerMargin(ownerId);
+      await tgRequest(mainToken, "sendMessage", {
+        chat_id: qrisAdmin.admin_chat_id,
+        text:
+          `💸 <b>MARGIN RESELLER MASUK (#${order.id})</b>\n\n` +
+          `🏪 <b>Toko:</b> ${escapeHtml(order.rbot_nama || "-")} (@${escapeHtml(order.rbot_username || "-")})\n` +
+          `👤 <b>Reseller:</b> ${escapeHtml((rb && rb.owner_name) || "Reseller")} (<code>${escapeHtml(String(ownerId))}</code>)\n` +
+          `📦 <b>Item:</b> ${escapeHtml(order.item_nama)}\n` +
+          `💰 <b>Jual:</b> ${formatRupiah(order.sell_price)} − modal ${formatRupiah(modal)} = <b>+${formatRupiah(margin)}</b>\n` +
+          `⏳ <b>Total margin reseller belum dibayar:</b> <code>${formatRupiah(mAdmin.owed)}</code>` +
+          (mAdmin.held > 0 ? ` <i>(🔒 ${formatRupiah(mAdmin.held)} sedang WD)</i>` : ""),
+        parse_mode: "HTML",
+      });
+    }
+  } catch (e) {
+    console.error("notif margin ke admin gagal:", e);
+  }
+
   return { deliveredName: order.item_nama, deliveredLink: links[0] || "" };
 }
 
@@ -2358,46 +2656,230 @@ async function rbEditCaptionOrText(ctx, chatId, messageId, text) {
   });
 }
 
-async function sendRbCatalog(ctx, chatId, page, messageId) {
+function getRbReplyKeyboard() {
+  return {
+    keyboard: [
+      [{ text: "🛍️ Katalog" }, { text: "🔥 Bestseller" }],
+      [{ text: "📋 Cara Order" }, { text: "🏠 Menu Utama" }],
+    ],
+    resize_keyboard: true,
+  };
+}
+
+// Kartu menu utama bot reseller (mirip bot utama): banner + info toko + tombol menu.
+async function sendRbMainMenu(ctx, chatId) {
+  const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+  const banner = await getBanner();
+  const minPrice = items.length > 0 ? Math.min(...items.map((x) => x.sell)) : 0;
+  const miniCount = items.filter((x) => x.kategori !== "full").length;
+  const fullCount = items.filter((x) => x.kategori === "full").length;
+
+  const cardText =
+    `✨ <b>${escapeHtml(rbShopName(ctx.rb).toUpperCase())}</b> ✨\n` +
+    "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n\n" +
+    "╭─── 💰 <b>INFO TOKO</b> ───\n" +
+    `│ • <b>Total Set</b> : ${items.length} koleksi\n` +
+    (items.length > 0 ? `│ • <b>Harga Mulai</b> : <code>${formatRupiah(minPrice)}</code>\n` : "") +
+    `│ • 🧩 <b>Mini Set</b> : ${miniCount} • 📦 <b>Full Set</b> : ${fullCount}\n` +
+    "│ • ⚡ <b>Pengiriman</b> : Otomatis setelah bayar\n" +
+    "│ • 💳 <b>Pembayaran</b> : QRIS\n" +
+    "╰────────────────────\n\n" +
+    "Silakan pilih menu di bawah ini 👇";
+
+  const rows = [
+    [
+      { text: "🛍️ Katalog Photopack", callback_data: "rkat" },
+      { text: "🔥 Bestseller", callback_data: "rbest" },
+    ],
+    [{ text: "📋 Cara Order", callback_data: "rcara" }],
+  ];
+  if (ctx.rb.owner_username) {
+    rows.push([{ text: `💬 Hubungi Penjual (@${ctx.rb.owner_username})`, url: `https://t.me/${ctx.rb.owner_username}` }]);
+  }
+  const replyMarkup = { inline_keyboard: rows };
+
+  let sent = false;
+  if (banner && banner.file_id) {
+    sent = await sendFileViaResellerBot(ctx.mainToken, ctx.rb, "sendPhoto", chatId, banner.file_id, {
+      caption: cardText,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  }
+  if (!sent) {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: cardText,
+      parse_mode: "HTML",
+      reply_markup: replyMarkup,
+    });
+  }
+}
+
+// Pilih kategori (Mini Set / Full Set)
+async function sendRbCatalog(ctx, chatId, messageId) {
   const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
   if (items.length === 0) {
-    await rbEditOrSend(
-      ctx,
-      chatId,
-      messageId,
-      "📂 Katalog sedang diperbarui. Coba lagi nanti ya 🙏",
-      undefined
-    );
+    await rbEditOrSend(ctx, chatId, messageId, "📂 Katalog sedang diperbarui. Coba lagi nanti ya 🙏", {
+      inline_keyboard: [[{ text: "🔙 Menu Utama", callback_data: "rhome" }]],
+    });
     return;
   }
-
-  const totalPages = Math.max(1, Math.ceil(items.length / RESELLER_BOT_ITEMS_PER_PAGE));
-  const p = Math.min(Math.max(0, parseInt(page, 10) || 0), totalPages - 1);
-  const slice = items.slice(p * RESELLER_BOT_ITEMS_PER_PAGE, (p + 1) * RESELLER_BOT_ITEMS_PER_PAGE);
-
-  const rows = slice.map((x) => [
-    {
-      text: `${x.nama} — ${formatRupiah(x.sell)}`.slice(0, 60),
-      callback_data: `ritem_${x.id}`,
-    },
-  ]);
-  if (totalPages > 1) {
-    const nav = [];
-    if (p > 0) nav.push({ text: "⬅️ Sebelumnya", callback_data: `rpage_${p - 1}` });
-    nav.push({ text: `${p + 1}/${totalPages}`, callback_data: `rpage_${p}` });
-    if (p < totalPages - 1) nav.push({ text: "Berikutnya ➡️", callback_data: `rpage_${p + 1}` });
-    rows.push(nav);
-  }
+  const miniCount = items.filter((x) => x.kategori !== "full").length;
+  const fullCount = items.filter((x) => x.kategori === "full").length;
 
   await rbEditOrSend(
     ctx,
     chatId,
     messageId,
-    `🛍️ <b>${escapeHtml(rbShopName(ctx.rb))}</b>\n` +
-      "<i>Photopack HD • Tanpa Watermark</i>\n\n" +
-      `Pilih set yang kamu mau 👇${totalPages > 1 ? ` (hal ${p + 1}/${totalPages})` : ""}`,
+    "╭─── 🛍️ <b>KATALOG PHOTOPACK</b> ───\n" +
+      "│ Mau yang Mini Set atau Full Set?\n" +
+      "│ Pilih kategori di bawah ini dulu ya 👇\n" +
+      "╰─────────────────────",
+    {
+      inline_keyboard: [
+        [{ text: `🧩 Mini Set (${miniCount})`, callback_data: "rcat_mini_0" }],
+        [{ text: `📦 Full Set (${fullCount})`, callback_data: "rcat_full_0" }],
+        [{ text: "🔥 Lihat Top Bestseller", callback_data: "rbest" }],
+        [{ text: "🔙 Menu Utama", callback_data: "rhome" }],
+      ],
+    }
+  );
+}
+
+// Daftar set per kategori (dengan halaman)
+async function sendRbCategoryList(ctx, chatId, kategori, page, messageId) {
+  const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+  const kat = kategori === "full" ? "full" : "mini";
+  const filtered = items.filter((x) => (kat === "full" ? x.kategori === "full" : x.kategori !== "full"));
+
+  if (filtered.length === 0) {
+    await rbEditOrSend(ctx, chatId, messageId, "📂 Belum ada produk di kategori ini. Coba kategori lain ya 🙏", {
+      inline_keyboard: [[{ text: "🔙 Kembali ke Kategori", callback_data: "rkat" }]],
+    });
+    return;
+  }
+
+  const rankMap = getRankedKatalog(items);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / RESELLER_BOT_ITEMS_PER_PAGE));
+  const p = Math.min(Math.max(0, parseInt(page, 10) || 0), totalPages - 1);
+  const slice = filtered.slice(p * RESELLER_BOT_ITEMS_PER_PAGE, (p + 1) * RESELLER_BOT_ITEMS_PER_PAGE);
+
+  const rows = slice.map((x) => {
+    const rank = rankMap[x.id];
+    let prefix = "📸";
+    let suffix = "";
+    if (rank === 1) {
+      prefix = "🔥";
+      suffix = " • BESTSELLER";
+    } else if (rank === 2 || rank === 3) {
+      prefix = "⭐";
+      suffix = " • POPULER";
+    }
+    return [{ text: `${prefix} ${x.nama} — ${formatRupiah(x.sell)}${suffix}`.slice(0, 62), callback_data: `ritem_${x.id}` }];
+  });
+
+  if (totalPages > 1) {
+    const nav = [];
+    if (p > 0) nav.push({ text: "⬅️ Sebelumnya", callback_data: `rcat_${kat}_${p - 1}` });
+    nav.push({ text: `${p + 1}/${totalPages}`, callback_data: `rcat_${kat}_${p}` });
+    if (p < totalPages - 1) nav.push({ text: "Berikutnya ➡️", callback_data: `rcat_${kat}_${p + 1}` });
+    rows.push(nav);
+  }
+  rows.push([
+    { text: "🔙 Kembali ke Kategori", callback_data: "rkat" },
+    { text: "🏠 Menu Utama", callback_data: "rhome" },
+  ]);
+
+  const label = kat === "full" ? "📦 FULL SET" : "🧩 MINI SET";
+  await rbEditOrSend(
+    ctx,
+    chatId,
+    messageId,
+    `╭─── 🛍️ <b>KATALOG ${label}</b> ───\n` +
+      "│ Pilih judul di bawah untuk melihat\n" +
+      "│ <b>foto preview</b> & bayar via QRIS:\n" +
+      "╰─────────────────────\n" +
+      `<i>🔥 = Terlaris #1 • ⭐ = Paling Populer${totalPages > 1 ? ` • Hal ${p + 1}/${totalPages}` : ""}</i>`,
     { inline_keyboard: rows }
   );
+}
+
+async function sendRbBestseller(ctx, chatId) {
+  const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
+  const top = items
+    .filter((x) => (Number(x.sold) || 0) > 0)
+    .sort((a, b) => (Number(b.sold) || 0) - (Number(a.sold) || 0))
+    .slice(0, 5);
+
+  if (top.length === 0) {
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "🔥 <b>SET PALING POPULER & BESTSELLER</b>\n\n" +
+        "<i>Belum ada riwayat penjualan tercatat. Yuk jadi pembeli pertama!</i>",
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🛍️ Buka Katalog Photopack", callback_data: "rkat" }],
+          [{ text: "🔙 Menu Utama", callback_data: "rhome" }],
+        ],
+      },
+    });
+    return;
+  }
+
+  let lines = "";
+  const buttons = [];
+  top.forEach((x, idx) => {
+    const badge = idx === 0 ? "🔥 <b>#1 BESTSELLER</b>" : `⭐ <b>#${idx + 1} POPULER</b>`;
+    lines +=
+      `│ ${badge}\n` +
+      `│ 📸 <b>${escapeHtml(x.nama)}</b> (${formatRupiah(x.sell)})\n` +
+      `│     └ Terjual <b>${Number(x.sold) || 0}x</b>${x.isi ? ` • ${escapeHtml(x.isi)}` : ""}\n`;
+    buttons.push([
+      { text: `${idx === 0 ? "🔥" : "⭐"} Beli #${idx + 1}: ${x.nama} (${formatRupiah(x.sell)})`.slice(0, 62), callback_data: `ritem_${x.id}` },
+    ]);
+  });
+  buttons.push([
+    { text: "🛍️ Semua Katalog", callback_data: "rkat" },
+    { text: "🔙 Menu Utama", callback_data: "rhome" },
+  ]);
+
+  await tgRequest(ctx.token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "🔥 <b>TOP SET PALING POPULER & BESTSELLER</b> 🔥\n" +
+      "<i>Koleksi dengan pembelian tertinggi pilihan member:</i>\n\n" +
+      "╭─── 🏆 <b>REKOMENDASI TERLARIS</b> ───\n" +
+      lines +
+      "╰────────────────────────\n\n" +
+      "Ketuk tombol di bawah untuk intip foto preview & checkout 👇",
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+async function sendRbCaraOrder(ctx, chatId) {
+  await tgRequest(ctx.token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "📋 <b>PANDUAN & ATURAN PEMBELIAN</b>\n\n" +
+      "1️⃣ <b>Pilih Paket</b>\n" +
+      "Buka <b>Katalog Photopack</b> atau <b>🔥 Bestseller</b>, lalu klik set yang kamu mau.\n\n" +
+      "2️⃣ <b>Bayar Pakai QRIS</b>\n" +
+      "Scan QRIS dan transfer <b>TEPAT sampai digit terakhir</b> sesuai total di invoice.\n\n" +
+      "3️⃣ <b>Terima File Otomatis</b>\n" +
+      "Setelah pembayaran terverifikasi, link file langsung dikirim otomatis ke chat ini.\n\n" +
+      "<i>Kalau ada kendala, hubungi penjual atau admin.</i>",
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🛍️ Buka Katalog", callback_data: "rkat" }],
+        [{ text: "🔙 Menu Utama", callback_data: "rhome" }],
+      ],
+    },
+  });
 }
 
 async function sendRbItemDetail(ctx, chatId, itemId) {
@@ -2411,15 +2893,25 @@ async function sendRbItemDetail(ctx, chatId, itemId) {
     return;
   }
 
+  const rank = getRankedKatalog(items)[x.id];
+  const sold = Number(x.sold) || 0;
+  let popularityLine = "";
+  if (rank === 1) popularityLine = `│ • <b>Status :</b> 🔥 <b>#1 BESTSELLER</b> (${sold}x terjual)\n`;
+  else if (rank === 2 || rank === 3) popularityLine = `│ • <b>Status :</b> ⭐ <b>#${rank} POPULER</b> (${sold}x terjual)\n`;
+  else if (sold > 0) popularityLine = `│ • <b>Terjual :</b> ${sold}x pembelian\n`;
+
   const caption =
     `✨ <b>${escapeHtml(x.nama)}</b>\n\n` +
-    (x.isi ? `📦 <b>Isi :</b> ${escapeHtml(x.isi)}\n` : "") +
-    `💰 <b>Harga :</b> <code>${formatRupiah(x.sell)}</code>\n\n` +
-    "💳 Bayar via QRIS. File dikirim otomatis setelah pembayaran terverifikasi.";
+    "╭─── 📦 <b>DETAIL PAKET</b> ───\n" +
+    popularityLine +
+    (x.isi ? `│ • <b>Isi :</b> ${escapeHtml(x.isi)}\n` : "") +
+    `│ • <b>Harga :</b> <code>${formatRupiah(x.sell)}</code>\n` +
+    "╰────────────────────\n\n" +
+    "💳 Klik tombol di bawah untuk checkout via <b>QRIS</b>. File dikirim otomatis setelah pembayaran terverifikasi!";
   const replyMarkup = {
     inline_keyboard: [
-      [{ text: `🛒 Beli Sekarang (${formatRupiah(x.sell)})`, callback_data: `rbuy_${x.id}` }],
-      [{ text: "🔙 Kembali ke Katalog", callback_data: "rpage_0" }],
+      [{ text: `💳 Beli Set Ini (${formatRupiah(x.sell)})`, callback_data: `rbuy_${x.id}` }],
+      [{ text: "🔙 Kembali ke Katalog", callback_data: `rcat_${x.kategori === "full" ? "full" : "mini"}_0` }],
     ],
   };
 
@@ -2512,8 +3004,17 @@ async function handleRbCallback(ctx, call) {
   await tgRequest(ctx.token, "answerCallbackQuery", { callback_query_id: call.id });
   if (!chatId) return;
 
-  if (data.startsWith("rpage_")) {
-    await sendRbCatalog(ctx, chatId, data.replace("rpage_", ""), messageId);
+  if (data === "rhome") {
+    await sendRbMainMenu(ctx, chatId);
+  } else if (data === "rkat" || data.startsWith("rpage_")) {
+    await sendRbCatalog(ctx, chatId, messageId);
+  } else if (data.startsWith("rcat_")) {
+    const [, kat, pg] = data.split("_");
+    await sendRbCategoryList(ctx, chatId, kat, pg, messageId);
+  } else if (data === "rbest") {
+    await sendRbBestseller(ctx, chatId);
+  } else if (data === "rcara") {
+    await sendRbCaraOrder(ctx, chatId);
   } else if (data.startsWith("ritem_")) {
     await sendRbItemDetail(ctx, chatId, data.replace("ritem_", ""));
   } else if (data.startsWith("rbuy_")) {
@@ -2596,13 +3097,14 @@ async function handleRbMessage(ctx, msg) {
     let text =
       "💲 <b>HARGA JUAL TOKO KAMU</b>\n" +
       `🏅 Tier: ${tier.name}\n` +
-      `Batas: minimal harga modal • maksimal <b>${formatRupiah(RESELLER_BOT_MAX_PRICE)}</b>\n` +
+      `Batas: minimal = harga toko utama • maksimal +${RESELLER_BOT_MAX_MARKUP_PERCENT}%\n` +
       "━━━━━━━━━━━━━━━━━━━━\n";
     if (items.length === 0) text += "<i>Belum ada set yang bisa dijual.</i>\n";
     items.forEach((x, i) => {
       text +=
         `${i + 1}. <b>${escapeHtml(x.nama)}</b>\n` +
-        `   Modal ${formatRupiah(x.modal)} • Jual <code>${formatRupiah(x.sell)}</code> • Untung ${formatRupiah(x.margin)}\n`;
+        `   Modal ${formatRupiah(x.modal)} • Jual <code>${formatRupiah(x.sell)}</code> • Untung ${formatRupiah(x.margin)}\n` +
+        `   <i>Boleh diatur ${formatRupiah(x.min_sell)} – ${formatRupiah(x.max_sell)}</i>\n`;
     });
     text +=
       "\nUbah harga:\n<code>/setharga NO HARGA</code>\n<code>/setharga semua HARGA</code>";
@@ -2631,7 +3133,7 @@ async function handleRbMessage(ctx, msg) {
     if (target === "semua") {
       let adjusted = 0;
       for (const x of items) {
-        const clamped = Math.min(RESELLER_BOT_MAX_PRICE, Math.max(x.modal, price));
+        const clamped = Math.min(x.max_sell, Math.max(x.min_sell, price));
         if (clamped !== price) adjusted++;
         rb.prices[x.id] = clamped;
       }
@@ -2655,18 +3157,18 @@ async function handleRbMessage(ctx, msg) {
       return;
     }
     const x = items[idx];
-    if (price < x.modal) {
+    if (price < x.min_sell) {
       await tgRequest(ctx.token, "sendMessage", {
         chat_id: chatId,
-        text: `⚠️ Harga terlalu rendah. Minimal <b>${formatRupiah(x.modal)}</b> (modal tier kamu).`,
+        text: `⚠️ Harga terlalu rendah. Minimal <b>${formatRupiah(x.min_sell)}</b> (sama dengan harga toko utama).`,
         parse_mode: "HTML",
       });
       return;
     }
-    if (price > RESELLER_BOT_MAX_PRICE) {
+    if (price > x.max_sell) {
       await tgRequest(ctx.token, "sendMessage", {
         chat_id: chatId,
-        text: `⚠️ Harga terlalu tinggi. Maksimal <b>${formatRupiah(RESELLER_BOT_MAX_PRICE)}</b>.`,
+        text: `⚠️ Harga terlalu tinggi. Maksimal <b>${formatRupiah(x.max_sell)}</b> untuk set ini.`,
         parse_mode: "HTML",
       });
       return;
@@ -2727,7 +3229,30 @@ async function handleRbMessage(ctx, msg) {
     });
   }
 
-  await sendRbCatalog(ctx, chatId, 0, null);
+  const t = String(msg.text || "").trim();
+  if (t === "🛍️ Katalog" || /katalog|list|daftar|harga/i.test(t)) {
+    await sendRbCatalog(ctx, chatId, null);
+    return;
+  }
+  if (t === "🔥 Bestseller" || /bestseller|populer|terlaris|laris/i.test(t)) {
+    await sendRbBestseller(ctx, chatId);
+    return;
+  }
+  if (t === "📋 Cara Order" || /cara|order|beli/i.test(t)) {
+    await sendRbCaraOrder(ctx, chatId);
+    return;
+  }
+
+  if (cmd === "/start") {
+    const buyerName = escapeHtml((msg.from && msg.from.first_name) || "Kak");
+    await tgRequest(ctx.token, "sendMessage", {
+      chat_id: chatId,
+      text: `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>${escapeHtml(rbShopName(ctx.rb))}</b>.`,
+      parse_mode: "HTML",
+      reply_markup: getRbReplyKeyboard(),
+    });
+  }
+  await sendRbMainMenu(ctx, chatId);
 }
 
 async function handleResellerBotRequest(req, res, mainToken, ownerId) {
@@ -2825,6 +3350,7 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
       prices: {},
       active: true,
       owner_name: [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Reseller",
+      owner_username: msg.from.username || "",
       created: getWibTimestamp(),
     });
 
@@ -2837,7 +3363,7 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
         "• <code>/setharga NO HARGA</code> — atur harga jual\n" +
         "• <code>/setnama NAMA TOKO</code>\n" +
         "• <code>/margin</code> — untung kamu\n\n" +
-        `ℹ️ Harga jual minimal = modal tier kamu, maksimal ${formatRupiah(RESELLER_BOT_MAX_PRICE)}.`
+        `ℹ️ Harga jual minimal = harga toko utama, maksimal +${RESELLER_BOT_MAX_MARKUP_PERCENT}%. Cek batas tiap set di /hargaku.`
     );
     return true;
   }
@@ -2865,6 +3391,82 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
     return true;
   }
 
+  // ----- WD margin (reseller) -----
+  if (cmd === "/riwayatwd" || (cmd === "/wd" && !arg)) {
+    if (!msg.chat || msg.chat.type !== "private") return true;
+    if (!(await isReseller(uid))) {
+      await reply("❌ Fitur WD khusus reseller.");
+      return true;
+    }
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: await buildWdHistoryText(uid),
+      parse_mode: "HTML",
+    });
+    return true;
+  }
+
+  if (cmd === "/wd") {
+    if (!msg.chat || msg.chat.type !== "private") return true;
+    if (!(await isReseller(uid))) {
+      await reply("❌ Fitur WD khusus reseller.");
+      return true;
+    }
+    const m = arg.match(/^(\S+)\s+([\s\S]+)$/);
+    const nominal = m ? parseInt(m[1].replace(/\D/g, ""), 10) : parseInt(arg.replace(/\D/g, ""), 10);
+    const tujuan = m ? m[2].trim() : "";
+    if (!nominal) {
+      await reply(
+        "⚠️ Format: <code>/wd NOMINAL TUJUAN</code>\n<i>Contoh: <code>/wd 25000 DANA 08123456789 a.n Budi</code></i>"
+      );
+      return true;
+    }
+
+    const result = await createWdRequest(msg.from, nominal, tujuan);
+    if (!result.ok) {
+      await reply(result.error);
+      return true;
+    }
+
+    const wd = result.wd;
+    await reply(
+      `⏳ <b>PENGAJUAN WD #${wd.id} TERKIRIM</b>\n\n` +
+        `💸 Nominal: <code>${formatRupiah(wd.amount)}</code>\n` +
+        (wd.fee > 0 ? `🧾 Biaya Admin: ${formatRupiah(wd.fee)}\n` : "") +
+        `🏦 Diterima: <code>${formatRupiah(wd.net)}</code>\n` +
+        `📍 Tujuan: ${escapeHtml(wd.tujuan)}\n\n` +
+        "Admin akan memproses & mentransfer manual. Kamu dapat notifikasi saat selesai."
+    );
+
+    const qris = await getQris();
+    const adminChat = qris && qris.admin_chat_id;
+    if (adminChat) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: adminChat,
+        text:
+          `💸 <b>PENGAJUAN WD RESELLER #${wd.id}</b>\n\n` +
+          `👤 ${escapeHtml(wd.owner_name)} (${escapeHtml(wd.owner_username)}) • <code>${escapeHtml(wd.owner_id)}</code>\n` +
+          `💰 Nominal: <code>${formatRupiah(wd.amount)}</code>\n` +
+          (wd.fee > 0 ? `🧾 Biaya Admin: ${formatRupiah(wd.fee)}\n` : "") +
+          `🏦 <b>Transfer: <code>${formatRupiah(wd.net)}</code></b>\n` +
+          `📍 Tujuan: <code>${escapeHtml(wd.tujuan)}</code>\n\n` +
+          "<i>Transfer manual dulu, lalu klik ACC. Tolak = margin dikembalikan ke reseller.</i>",
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: `✅ ACC WD #${wd.id} (Sudah Transfer)`, callback_data: `wdacc_${wd.id}` },
+              { text: `❌ Tolak #${wd.id}`, callback_data: `wdrej_${wd.id}` },
+            ],
+          ],
+        },
+      });
+    } else {
+      await reply(`ℹ️ Admin belum mengaktifkan notifikasi. Hubungi @${ADMIN_USERNAME} sebut WD #${wd.id}.`);
+    }
+    return true;
+  }
+
   if (cmd === "/hapusbot") {
     const targetId = isAdmin && /^\d+$/.test(arg) ? arg : String(uid);
     const ok = await removeResellerBot(targetId);
@@ -2873,9 +3475,85 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
   }
 
   // ----- admin -----
-  const adminCmds = ["/listbot", "/matikanbot", "/aktifkanbot", "/listmargin", "/bayarmargin"];
+  const adminCmds = ["/listbot", "/matikanbot", "/aktifkanbot", "/listmargin", "/bayarmargin", "/listwd", "/setwdch"];
   if (!adminCmds.includes(cmd)) return false;
   if (!isAdmin) return true;
+
+  if (cmd === "/setwdch") {
+    const current = await redisCommand(["GET", REDIS_WD_CH_KEY]);
+    if (!arg) {
+      let status = "Pakai <b>Channel Testimoni</b> (default)";
+      if (current) {
+        try {
+          status = `✅ <b>${escapeHtml(JSON.parse(current).channel_title || "Channel WD")}</b>`;
+        } catch {
+          // abaikan
+        }
+      }
+      await reply(
+        "💸 <b>CHANNEL BUKTI WD</b>\n\n" +
+          `Status: ${status}\n\n` +
+          "1. Jadikan bot ini <b>Admin</b> di channelnya.\n" +
+          "2. Ketik <code>/setwdch @username_channel</code>\n" +
+          "<i><code>/setwdch off</code> = balik ke Channel Testimoni.</i>"
+      );
+      return true;
+    }
+    if (arg.toLowerCase() === "off") {
+      await redisCommand(["DEL", REDIS_WD_CH_KEY]);
+      await reply("✅ Channel WD khusus dihapus. Notif WD kembali ke Channel Testimoni.");
+      return true;
+    }
+    const test = await tgRequest(token, "sendMessage", {
+      chat_id: arg,
+      text: "✅ <b>Channel Bukti WD Berhasil Terhubung!</b>",
+      parse_mode: "HTML",
+    });
+    if (test && test.ok) {
+      await redisCommand([
+        "SET",
+        REDIS_WD_CH_KEY,
+        JSON.stringify({
+          channel_id: test.result.chat.id,
+          channel_title: test.result.chat.title || arg,
+        }),
+      ]);
+      await reply(`✅ Notif WD akan diposting ke <b>${escapeHtml(test.result.chat.title || arg)}</b>.`);
+    } else {
+      await reply("⚠️ Gagal kirim ke channel itu. Pastikan bot sudah jadi Admin di channel lalu ulangi.");
+    }
+    return true;
+  }
+
+  if (cmd === "/listwd") {
+    const pend = (await redisCommand(["HGETALL", REDIS_WD_PENDING_KEY])) || [];
+    if (pend.length === 0) {
+      await reply("✅ Tidak ada WD pending.");
+      return true;
+    }
+    for (let i = 0; i < pend.length; i += 2) {
+      const w = await getWd(pend[i]);
+      if (!w || w.status !== "pending") continue;
+      await tgRequest(token, "sendMessage", {
+        chat_id: chatId,
+        text:
+          `💸 <b>WD PENDING #${w.id}</b>\n` +
+          `👤 ${escapeHtml(w.owner_name)} • <code>${escapeHtml(w.owner_id)}</code>\n` +
+          `🏦 Transfer: <code>${formatRupiah(w.net)}</code> (nominal ${formatRupiah(w.amount)})\n` +
+          `📍 <code>${escapeHtml(w.tujuan)}</code>`,
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: `✅ ACC #${w.id}`, callback_data: `wdacc_${w.id}` },
+              { text: `❌ Tolak #${w.id}`, callback_data: `wdrej_${w.id}` },
+            ],
+          ],
+        },
+      });
+    }
+    return true;
+  }
 
   if (cmd === "/listbot") {
     const all = await getAllResellerBots();
@@ -2941,8 +3619,11 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
       return true;
     }
     const m = await getResellerMargin(targetId);
-    if (nominal > m.owed) {
-      await reply(`⚠️ Nominal melebihi margin yang belum dibayar (${formatRupiah(m.owed)}).`);
+    if (nominal > m.available) {
+      await reply(
+        `⚠️ Nominal melebihi margin yang bisa dibayar (${formatRupiah(m.available)}).` +
+          (m.held > 0 ? `\n🔒 ${formatRupiah(m.held)} sedang diproses lewat WD pending (cek /listwd).` : "")
+      );
       return true;
     }
     await redisCommand(["HINCRBY", REDIS_RBOT_PAID_KEY, targetId, nominal]);
@@ -3194,7 +3875,8 @@ module.exports = async function handler(req, res) {
       } else if (data === "menu_koleksi") {
         await sendKoleksiMenu(token, chatId, callerId);
       } else if (data === "menu_promo") {
-        await sendPromoBundling(token, chatId);
+        // tombol lama (promo bundling sudah dihapus) -> arahkan ke katalog
+        await sendKatalogMenu(token, chatId);
       } else if (data === "menu_cara") {
         await sendCaraOrder(token, chatId);
       } else if (data === "menu_channel") {
@@ -3602,6 +4284,48 @@ module.exports = async function handler(req, res) {
             `💰 Nominal: ${formatRupiah(order.total_nominal)}`,
           parse_mode: "HTML",
         });
+      } else if (data === "reseller_wd") {
+        if (!(await isReseller(callerId))) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "❌ Fitur WD khusus reseller.",
+          });
+        } else {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: await buildWdHistoryText(callerId),
+            parse_mode: "HTML",
+          });
+        }
+      } else if (data.startsWith("wdacc_") || data.startsWith("wdrej_")) {
+        if (!isCallerAdmin) return res.status(200).json({ ok: true });
+        const isAcc = data.startsWith("wdacc_");
+        const wdId = data.replace(isAcc ? "wdacc_" : "wdrej_", "");
+        const wd = await getWd(wdId);
+
+        if (!wd || wd.status !== "pending") {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `⚠️ WD #${escapeHtml(wdId)} tidak ditemukan atau sudah diproses.`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const r = isAcc ? await processWdAcc(token, wd) : await processWdReject(token, wd, "");
+        if (r.duplicate) return res.status(200).json({ ok: true });
+
+        await tgRequest(token, "editMessageText", {
+          chat_id: chatId,
+          message_id: messageId,
+          text:
+            (isAcc ? `✅ <b>WD #${wd.id} SUDAH DI-ACC</b>\n` : `❌ <b>WD #${wd.id} DITOLAK</b>\n`) +
+            `👤 ${escapeHtml(wd.owner_name)} • <code>${escapeHtml(wd.owner_id)}</code>\n` +
+            `💰 Nominal: <b>${formatRupiah(wd.amount)}</b> • Transfer: <b>${formatRupiah(wd.net)}</b>\n` +
+            `📍 ${escapeHtml(wd.tujuan)}\n` +
+            (isAcc ? "💸 <i>Margin dicatat sebagai sudah dibayar.</i>" : "↩️ <i>Margin dikembalikan ke reseller.</i>"),
+          parse_mode: "HTML",
+        });
       } else if (data === "reseller_omset_self") {
         const statusReseller = await isReseller(callerId);
         if (!statusReseller) {
@@ -3680,6 +4404,13 @@ module.exports = async function handler(req, res) {
 
       if (msg.chat && msg.chat.type === "private") {
         await redisCommand(["SADD", REDIS_USERS_KEY, String(chatId)]);
+      }
+
+      // Hadiah leaderboard bulan lalu (jalan sekali per bulan, otomatis)
+      try {
+        await maybeAwardLastMonth(token);
+      } catch (awardErr) {
+        console.error("Award Leaderboard Error:", awardErr);
       }
 
       const rawText = (msg.text || msg.caption || "").trim();
@@ -4402,6 +5133,41 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 5B. ADMIN: /hadiahlb — lihat pengaturan hadiah / bagikan hadiah bulan lalu sekarang
+      if (rawText.startsWith("/hadiahlb")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/hadiahlb\s*/i, "").trim().toLowerCase();
+        const monthKey = getPrevMonthKey();
+
+        if (arg === "kirim") {
+          const r = await awardMonthlyLeaderboard(token, monthKey);
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: r.ok
+              ? `✅ Hadiah leaderboard ${monthKey} diproses. Pemenang: <b>${r.awarded.length}</b> orang.`
+              : r.reason === "already"
+              ? `⚠️ Hadiah ${monthKey} sudah pernah dibagikan.`
+              : "⚠️ Fitur hadiah leaderboard dimatikan.",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const done = await redisCommand(["GET", `${REDIS_LB_REWARD_LOCK_PREFIX}${monthKey}`]);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            "🎁 <b>HADIAH LEADERBOARD BULANAN</b>\n\n" +
+            `• Status: ${LB_REWARD_ENABLED ? "✅ Aktif" : "❌ Nonaktif"}\n` +
+            `• Bulan yang dihitung: <b>${monthKey}</b> (${done ? "sudah dibagikan" : "belum dibagikan"})\n\n` +
+            buildLbRewardLine() +
+            "Dibagikan otomatis begitu ada pesan masuk di awal bulan. Mau sekarang? <code>/hadiahlb kirim</code>\n" +
+            "<i>Ubah nominal di LB_REWARD_SALDO pada kode.</i>",
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 6. ADMIN: /resetlb
       if (rawText.startsWith("/resetlb")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -4776,40 +5542,7 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      // 12. ADMIN: /setbundle
-      if (rawText.startsWith("/setbundle")) {
-        if (!isAdmin) return res.status(200).json({ ok: true });
-        const arg = rawText.replace(/^\/setbundle\s*/i, "").trim();
-        const currentBundle = await getBundle();
-
-        if (!arg) {
-          await tgRequest(token, "sendMessage", {
-            chat_id: chatId,
-            text:
-              "🎁 <b>LINK FILE PROMO BUNDLING 5K</b>\n" +
-              `Saat ini: ${currentBundle.link ? escapeHtml(currentBundle.link) : "<i>Belum dipasang</i>"}\n` +
-              "Pasang: <code>/setbundle https://link-file.com</code>",
-            parse_mode: "HTML",
-          });
-          return res.status(200).json({ ok: true });
-        }
-
-        if (arg.toLowerCase() === "hapuslink") {
-          await saveBundle({ link: "" });
-          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Link bundling dihapus." });
-          return res.status(200).json({ ok: true });
-        }
-
-        const cleanLink = normalizeUrl(arg);
-        await saveBundle({ link: cleanLink });
-        await tgRequest(token, "sendMessage", {
-          chat_id: chatId,
-          text: `✅ <b>Link Bundling 5k disimpan!</b>\n🔗 ${escapeHtml(cleanLink)}`,
-          parse_mode: "HTML",
-        });
-        return res.status(200).json({ ok: true });
-            }
-                  // 13. FOTO TANPA CAPTION PERINTAH
+      // 13. FOTO TANPA CAPTION PERINTAH
       if (msg.photo) {
         if (isAdmin) {
           await tgRequest(token, "sendMessage", {
@@ -4847,13 +5580,15 @@ module.exports = async function handler(req, res) {
               "• <code>/addsaldo ID NOMINAL</code> | <code>/ceksaldo ID</code> — Kelola Saldo\n" +
               "• <code>/setbanner</code> | <code>/setqris</code> | <code>/settesti</code> | <code>/broadcast</code>\n" +
               "• <code>/buatvoucher KODE | DISKON | KUOTA</code>\n" +
-              "• <code>/setmystery HARGA</code> | <code>/setsold</code> | <code>/resetlb</code>\n" +
-              "• <code>/tambah</code> | <code>/edit</code> | <code>/hapus</code> | <code>/setbundle</code>\n" +
+              "• <code>/setmystery HARGA</code> | <code>/setsold</code> | <code>/resetlb</code> | <code>/hadiahlb</code>\n" +
+              "• <code>/tambah</code> | <code>/edit</code> | <code>/hapus</code>\n" +
               "• <code>/tambahfile NO</code> | <code>/hapusfile NO NO</code> | <code>/listfile NO</code> — lampirkan banyak file/link\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
               "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
-              "• <code>/listmargin</code> | <code>/bayarmargin ID NOMINAL</code> — margin bot reseller";
+              "• <code>/listmargin</code> | <code>/bayarmargin ID NOMINAL</code> — margin bot reseller\n" +
+              "• <code>/listwd</code> — WD reseller pending (ACC/Tolak lewat tombol)\n" +
+              "• <code>/setwdch</code> — channel bukti WD (default: Channel Testimoni)";
           }
 
           await tgRequest(token, "sendMessage", {
@@ -4873,7 +5608,8 @@ module.exports = async function handler(req, res) {
         } else if (text === "🎲 Mystery Box") {
           await sendMysteryMenu(token, chatId);
         } else if (text === "🎁 Promo 5k" || text === "🎁 Promo Bundling 5k") {
-          await sendPromoBundling(token, chatId);
+          // tombol lama (promo bundling sudah dihapus) -> arahkan ke katalog
+          await sendKatalogMenu(token, chatId);
         } else if (text === "🏆 Leaderboard" || text === "/leaderboard") {
           const lb = await buildLeaderboardPayload("month", senderId);
           await tgRequest(token, "sendMessage", {
@@ -4906,11 +5642,6 @@ module.exports = async function handler(req, res) {
             return res.status(200).json({ ok: true });
           }
 
-          if (["bundling", "bundle", "promo", "diskon", "2 set"].some((k) => lowerText.includes(k))) {
-            await sendPromoBundling(token, chatId, msg.message_id);
-            return res.status(200).json({ ok: true });
-          }
-
           if (["mystery", "gacha", "spin", "box"].some((k) => lowerText.includes(k))) {
             await sendMysteryMenu(token, chatId);
             return res.status(200).json({ ok: true });
@@ -4933,12 +5664,12 @@ module.exports = async function handler(req, res) {
             `Butuh bantuan? Hubungi @${ADMIN_USERNAME} 🙏`;
 
           if (["harga", "berapa", "brp", "list", "daftar"].some((k) => lowerText.includes(k))) {
+            const mysteryCfgInfo = await getMysteryConfig();
             replyText =
               "💰 <b>Info Harga Lumine Photopack:</b>\n" +
-              "• Paket Lite (5–7 Foto HD) : <b>Rp 2.000</b>\n" +
-              "• Paket Standar (8–10 Foto HD) : <b>Rp 3.000</b>\n" +
-              "• 🎁 <b>Promo Bundling 2 Photopack : Rp 5.000</b>\n" +
-              "• 🎲 <b>Mystery Box Gacha : Rp 3.000</b>";
+              `• Paket Lite : <b>${formatRupiah(RETAIL_PRICE_LITE)}</b>\n` +
+              `• Paket Standar : <b>${formatRupiah(RETAIL_PRICE_STANDAR)}</b>\n` +
+              `• 🎲 <b>Mystery Box Gacha : ${formatRupiah(mysteryCfgInfo.price || 3000)}</b>`;
           }
 
           await tgRequest(token, "sendMessage", {
