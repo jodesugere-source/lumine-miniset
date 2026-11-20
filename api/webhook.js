@@ -84,6 +84,20 @@ const WD_ENABLED = true; // false = matikan fitur WD
 const WD_MIN_AMOUNT = 10000; // minimal nominal sekali WD
 const WD_FEE = 0; // biaya admin per WD (Rp). 0 = gratis. Dipotong dari nominal yang ditransfer.
 
+// ---- PENGATURAN UNDANG TEMAN (REFERRAL) ----
+const REFERRAL_ENABLED = true; // false = matikan fitur undang teman
+const REFERRAL_REWARD_SALDO = 1500; // saldo untuk yang mengundang, per teman yang berhasil belanja
+const REFERRAL_MONTHLY_CAP = 10; // maksimal teman yang dihitung per bulan per orang
+const REFERRAL_MIN_PAID = 5000; // minimal nominal pembayaran asli (QRIS) teman agar bonus cair
+const REFERRAL_FROM_ADMIN_SALDO = true; // true = bonus dipotong otomatis dari saldo admin (kas hadiah); false = bonus langsung ditambah tanpa potong
+const REFERRAL_FUND_LOW_WARN = REFERRAL_REWARD_SALDO * 10; // admin diberi peringatan saat saldo kas turun di bawah ini
+const REDIS_REF_FUND_KEY = "lumine_main_ref_fund"; // id akun admin yang jadi sumber saldo bonus
+const RESELLER_MARGIN_FROM_ADMIN_SALDO = true; // true = margin tiap penjualan bot reseller dipotong otomatis dari saldo admin (kas)
+const REDIS_REF_BY_KEY = "lumine_main_ref_by"; // hash: id teman -> id pengundang
+const REDIS_REF_REWARDED_KEY = "lumine_main_ref_rewarded"; // hash: id teman yang bonusnya sudah diproses
+const REDIS_REF_TOTAL_KEY = "lumine_main_ref_total"; // hash: id pengundang -> total teman berhasil
+const REDIS_REF_MONTH_PREFIX = "lumine_main_ref_month_"; // hash per bulan: id pengundang -> jumlah
+
 function escapeHtml(str) {
   return String(str || "")
     .replace(/&/g, "&amp;")
@@ -484,6 +498,241 @@ async function getMysteryConfig() {
 
 async function saveMysteryConfig(cfg) {
   await redisCommand(["SET", REDIS_MYSTERY_KEY, JSON.stringify(cfg)]);
+}
+
+// ---- PELUANG GACHA BERTINGKAT (paket murah lebih sering keluar) ----
+// Rasio 3 = paket tier termurah keluar 3x lebih sering dari tier di atasnya.
+// Contoh 2 harga (5rb & 10rb): 75% / 25%. Naikkan angka = makin jarang paket mahal.
+const MYSTERY_TIER_RATIO = 3;
+
+function getMysteryTiers(items) {
+  const byPrice = new Map();
+  for (const it of items) {
+    const price = parseNominal(it.harga);
+    if (!byPrice.has(price)) byPrice.set(price, []);
+    byPrice.get(price).push(it);
+  }
+  const prices = [...byPrice.keys()].sort((a, b) => a - b);
+  const weights = prices.map((_, i) => Math.pow(MYSTERY_TIER_RATIO, prices.length - 1 - i));
+  const total = weights.reduce((a, b) => a + b, 0) || 1;
+  return prices.map((price, i) => ({
+    price,
+    items: byPrice.get(price),
+    weight: weights[i],
+    chance: Math.round((weights[i] / total) * 100),
+  }));
+}
+
+function pickMysteryPrize(items) {
+  const tiers = getMysteryTiers(items);
+  if (tiers.length === 0) return null;
+  const total = tiers.reduce((a, t) => a + t.weight, 0);
+  let r = Math.random() * total;
+  let chosen = tiers[tiers.length - 1];
+  for (const t of tiers) {
+    if (r < t.weight) {
+      chosen = t;
+      break;
+    }
+    r -= t.weight;
+  }
+  return chosen.items[Math.floor(Math.random() * chosen.items.length)];
+}
+
+// ---- UNDANG TEMAN (REFERRAL) ----
+async function recordReferral(inviteeId, referrerRaw, isNewUser) {
+  if (!REFERRAL_ENABLED || !isNewUser) return false;
+  const referrerId = String(referrerRaw || "");
+  if (!inviteeId || !referrerId || referrerId === String(inviteeId)) return false;
+  const known = await redisCommand(["SISMEMBER", REDIS_USERS_KEY, referrerId]);
+  if (Number(known) !== 1) return false;
+  const set = await redisCommand(["HSETNX", REDIS_REF_BY_KEY, String(inviteeId), referrerId]);
+  return Number(set) === 1;
+}
+
+async function getReferralFundId() {
+  const stored = await redisCommand(["GET", REDIS_REF_FUND_KEY]);
+  if (stored) return String(stored);
+  const qris = await getQris();
+  return qris && qris.admin_chat_id ? String(qris.admin_chat_id) : null;
+}
+
+// Margin penjualan bot reseller dipotong dari saldo kas admin. Tidak pernah memblokir margin
+// (pembeli sudah bayar), jadi saldo kas boleh minus sebagai tanda admin perlu isi ulang.
+async function chargeFundForMargin(token, margin, ownerName) {
+  if (!RESELLER_MARGIN_FROM_ADMIN_SALDO || !(margin > 0)) return;
+  const fundId = await getReferralFundId();
+  if (!fundId) return;
+
+  const after = parseInt(await redisCommand(["HINCRBY", REDIS_SALDO_KEY, String(fundId), -Math.round(margin)]), 10);
+  if (isNaN(after)) return;
+  const before = after + Math.round(margin);
+
+  if (before >= 0 && after < 0) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: fundId,
+      text:
+        `🚨 <b>Saldo kas MINUS ${formatRupiah(Math.abs(after))}!</b>\n` +
+        `Margin penjualan reseller <b>${escapeHtml(ownerName || "Reseller")}</b> (${formatRupiah(margin)}) sudah dipotong.\n` +
+        `Bonus Undang Teman ditahan sampai kas diisi ulang.\n` +
+        `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>`,
+      parse_mode: "HTML",
+    });
+  } else if (before >= REFERRAL_FUND_LOW_WARN && after < REFERRAL_FUND_LOW_WARN) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: fundId,
+      text:
+        `🔔 <b>Saldo kas tinggal ${formatRupiah(after)}.</b>\n` +
+        `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>`,
+      parse_mode: "HTML",
+    });
+  }
+}
+
+async function maybeRewardReferral(token, order) {
+  if (!REFERRAL_ENABLED || !order || order.rbot_owner) return;
+  // Hanya pembayaran uang asli (QRIS): deposit, atau pembelian yang bukan pakai saldo
+  const realMoney = Boolean(order.is_deposit) || !order.paid_with_saldo;
+  if (!realMoney) return;
+  const paid = Number(order.final_base_nominal || order.base_nominal) || 0;
+  if (paid < REFERRAL_MIN_PAID) return;
+
+  const inviteeId = String(order.buyer_id);
+  const referrerId = await redisCommand(["HGET", REDIS_REF_BY_KEY, inviteeId]);
+  if (!referrerId) return;
+
+  // Klaim satu kali per teman (aman walau ACC terpanggil dua kali)
+  const claimed = await redisCommand(["HSETNX", REDIS_REF_REWARDED_KEY, inviteeId, "1"]);
+  if (Number(claimed) !== 1) return;
+
+  const { monthKey } = getWibPeriods();
+  const cntKey = `${REDIS_REF_MONTH_PREFIX}${monthKey}`;
+  const used = parseInt(await redisCommand(["HINCRBY", cntKey, String(referrerId), 1]), 10) || 0;
+  await redisCommand(["EXPIRE", cntKey, String(60 * 60 * 24 * 70)]);
+
+  const friendName = escapeHtml(order.buyer_name || "Temanmu");
+  if (used > REFERRAL_MONTHLY_CAP) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: referrerId,
+      text:
+        `👥 Teman kamu <b>${friendName}</b> baru saja belanja, tapi batas bonus undang teman bulan ini ` +
+        `(${REFERRAL_MONTHLY_CAP} teman) sudah tercapai. Bonus berlaku lagi bulan depan ya!`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Batalkan klaim bila bonus gagal dibayar, supaya bisa dicoba lagi di pembayaran teman berikutnya
+  const undoClaim = async () => {
+    await redisCommand(["HDEL", REDIS_REF_REWARDED_KEY, inviteeId]);
+    await redisCommand(["HINCRBY", cntKey, String(referrerId), -1]);
+  };
+
+  // Potong otomatis dari saldo admin (kas hadiah)
+  const fundId = REFERRAL_FROM_ADMIN_SALDO ? await getReferralFundId() : null;
+  let fundBalance = null;
+  if (fundId) {
+    const d = await deductUserSaldo(fundId, REFERRAL_REWARD_SALDO);
+    if (!d.ok) {
+      await undoClaim();
+      await tgRequest(token, "sendMessage", {
+        chat_id: fundId,
+        text:
+          `⚠️ <b>Saldo kas hadiah tidak cukup!</b>\n\n` +
+          `Bonus undang teman <b>${formatRupiah(REFERRAL_REWARD_SALDO)}</b> untuk pengundang <code>${escapeHtml(referrerId)}</code> ` +
+          `(teman: ${friendName}) ditahan.\n` +
+          `💳 Saldo kas: <b>${formatRupiah(d.balance)}</b>\n\n` +
+          `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>\n` +
+          `<i>Bonus akan dicoba lagi saat teman itu bayar berikutnya.</i>`,
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    fundBalance = d.balance;
+  }
+
+  let newSaldo;
+  try {
+    newSaldo = await addUserSaldo(referrerId, REFERRAL_REWARD_SALDO);
+  } catch (addErr) {
+    // kembalikan saldo kas bila gagal menambah ke pengundang
+    if (fundId) await addUserSaldo(fundId, REFERRAL_REWARD_SALDO);
+    await undoClaim();
+    throw addErr;
+  }
+  await redisCommand(["HINCRBY", REDIS_REF_TOTAL_KEY, String(referrerId), 1]);
+  await tgRequest(token, "sendMessage", {
+    chat_id: referrerId,
+    text:
+      `🎉 <b>BONUS UNDANG TEMAN!</b>\n\n` +
+      `Teman kamu <b>${friendName}</b> baru saja belanja pertama kali.\n` +
+      `💰 Saldo masuk: <b>+${formatRupiah(REFERRAL_REWARD_SALDO)}</b>\n` +
+      `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>`,
+    parse_mode: "HTML",
+  });
+
+  // Peringatan sekali saat saldo kas melewati batas bawah
+  if (fundId && fundBalance !== null) {
+    const before = fundBalance + REFERRAL_REWARD_SALDO;
+    if (before >= REFERRAL_FUND_LOW_WARN && fundBalance < REFERRAL_FUND_LOW_WARN) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: fundId,
+        text:
+          `🔔 <b>Saldo kas hadiah tinggal ${formatRupiah(fundBalance)}.</b>\n` +
+          `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>`,
+        parse_mode: "HTML",
+      });
+    }
+  }
+}
+
+async function sendReferralMenu(token, chatId, userId) {
+  if (!REFERRAL_ENABLED) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: "🎁 Fitur Undang Teman sedang tidak aktif.",
+    });
+    return;
+  }
+  const me = await tgRequest(token, "getMe", {});
+  const botUsername = (me && me.result && me.result.username) || "";
+  const link = botUsername ? `https://t.me/${botUsername}?start=ref_${userId}` : "";
+  const total = parseInt(await redisCommand(["HGET", REDIS_REF_TOTAL_KEY, String(userId)]), 10) || 0;
+  const { monthKey } = getWibPeriods();
+  const usedRaw =
+    parseInt(await redisCommand(["HGET", `${REDIS_REF_MONTH_PREFIX}${monthKey}`, String(userId)]), 10) || 0;
+  const usedMonth = Math.min(REFERRAL_MONTHLY_CAP, usedRaw);
+
+  const rows = [];
+  if (link) {
+    rows.push([
+      {
+        text: "📤 Bagikan ke Teman",
+        url:
+          "https://t.me/share/url?url=" +
+          encodeURIComponent(link) +
+          "&text=" +
+          encodeURIComponent("Yuk beli photopack HD di Lumine Photopack Store!"),
+      },
+    ]);
+  }
+  rows.push([{ text: "🔙 Menu Utama", callback_data: "menu_home" }]);
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "🎁 <b>UNDANG TEMAN, DAPAT SALDO</b>\n\n" +
+      `Bagikan link kamu. Setiap teman baru yang belanja pertama kali, kamu dapat <b>${formatRupiah(REFERRAL_REWARD_SALDO)}</b> saldo!\n\n` +
+      (link ? `🔗 <b>Link kamu:</b>\n<code>${escapeHtml(link)}</code>\n\n` : "") +
+      `👥 Teman berhasil: <b>${total}</b>\n` +
+      `📅 Bulan ini: <b>${usedMonth}/${REFERRAL_MONTHLY_CAP}</b>\n\n` +
+      "<b>Syarat:</b>\n" +
+      "• Teman harus pengguna baru yang masuk lewat link kamu\n" +
+      `• Bonus cair setelah teman bayar minimal ${formatRupiah(REFERRAL_MIN_PAID)} (QRIS / deposit)\n` +
+      `• Maksimal ${REFERRAL_MONTHLY_CAP} teman per bulan`,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: rows },
+  });
 }
 
 async function getVouchers() {
@@ -1182,7 +1431,17 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
 
   await tgRequest(token, "sendMessage", payload);
                           }
-        async function processAccOrder(token, order) {
+async function processAccOrder(token, order) {
+  const result = await processAccOrderCore(token, order);
+  try {
+    await maybeRewardReferral(token, order);
+  } catch (refErr) {
+    console.error("Referral reward error:", refErr);
+  }
+  return result;
+}
+
+async function processAccOrderCore(token, order) {
   order.status = "acc";
   await saveOrder(order.id, order);
 
@@ -1246,13 +1505,14 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
     const pool = katalogList.map((k) => ({
       id: String(k.id),
       nama: k.nama,
+      harga: k.harga,
       links:
         Array.isArray(k.links) && k.links.length > 0 ? k.links : k.link ? [k.link] : [],
       files: Array.isArray(k.files) ? k.files : [],
     }));
     const won =
       pool.length > 0
-        ? pool[Math.floor(Math.random() * pool.length)]
+        ? pickMysteryPrize(pool)
         : { id: "", nama: "Paket Spesial Lumine", links: [`https://t.me/${ADMIN_USERNAME}`], files: [] };
 
     soldItemId = won.id;
@@ -1531,6 +1791,7 @@ async function sendMainMenuCard(token, chatId) {
         { text: "📋 Cara Order", callback_data: "menu_cara" },
         { text: "🤝 Menu Reseller", callback_data: "menu_reseller" },
       ],
+      [{ text: "🎁 Undang Teman (Bonus Saldo)", callback_data: "menu_undang" }],
       [{ text: "🔗 Channel Lainnya", callback_data: "menu_channel" }],
       [{ text: `💬 Admin (@${ADMIN_USERNAME})`, url: `https://t.me/${ADMIN_USERNAME}` }],
     ],
@@ -1720,7 +1981,9 @@ async function sendMysteryMenu(token, chatId) {
     return;
   }
 
-  const prizePreview = `• Salah satu dari <b>${katalogList.length} Koleksi Photopack</b>\n`;
+  const prizePreview = getMysteryTiers(katalogList)
+    .map((t) => `• Paket <b>${formatRupiah(t.price)}</b> — peluang <b>${t.chance}%</b>\n`)
+    .join("");
 
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
@@ -2559,6 +2822,11 @@ async function processResellerBotOrder(mainToken, order) {
   await addStoreOmset(order.total_nominal);
   if (margin > 0) {
     await redisCommand(["HINCRBY", REDIS_RBOT_MARGIN_KEY, String(ownerId), margin]);
+    try {
+      await chargeFundForMargin(mainToken, margin, rb && rb.owner_name);
+    } catch (fundErr) {
+      console.error("potong kas margin gagal:", fundErr);
+    }
   }
   await logResellerSale(ownerId, {
     id: order.id,
@@ -3773,7 +4041,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         status: "Webhook Bot Utama berhasil diatur",
         webhook_url: webhookUrl,
-        macro_autoacc_url: `https://${req.headers.host}/api/webhook?autoacc=1&secret=${macroCfg.secret}&text={not_text}`,
+        macro_autoacc_url: `https://${req.headers.host}/api/webhook?autoacc=1&secret=(disembunyikan, lihat lewat /setmacro di bot)&text={not_text}`,
         database_connected: Boolean(
           (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL) &&
             (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN)
@@ -3881,6 +4149,8 @@ module.exports = async function handler(req, res) {
         await sendCaraOrder(token, chatId);
       } else if (data === "menu_channel") {
         await sendChannelLainnya(token, chatId);
+      } else if (data === "menu_undang") {
+        await sendReferralMenu(token, chatId, callerId);
       } else if (data === "menu_reseller") {
         await sendResellerMenu(token, chatId, call.from);
       } else if (data === "menu_voucher") {
@@ -4402,8 +4672,10 @@ module.exports = async function handler(req, res) {
       const isAdmin =
         senderUsername.toLowerCase() === ADMIN_USERNAME.toLowerCase();
 
+      let isNewUser = false;
       if (msg.chat && msg.chat.type === "private") {
-        await redisCommand(["SADD", REDIS_USERS_KEY, String(chatId)]);
+        const addedRes = await redisCommand(["SADD", REDIS_USERS_KEY, String(chatId)]);
+        isNewUser = Number(addedRes) === 1;
       }
 
       // Hadiah leaderboard bulan lalu (jalan sekali per bulan, otomatis)
@@ -4508,6 +4780,27 @@ module.exports = async function handler(req, res) {
         await tgRequest(token, "sendMessage", {
           chat_id: chatId,
           text: `💳 Saldo user <code>${escapeHtml(targetUid)}</code>: <b>${formatRupiah(userBal)}</b>`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /kashadiah (akun saldo admin yang membayar bonus undang teman)
+      if (rawText.startsWith("/kashadiah")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        await redisCommand(["SET", REDIS_REF_FUND_KEY, String(senderId)]);
+        const fundBal = await getUserSaldo(senderId);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            "🏦 <b>KAS HADIAH UNDANG TEMAN</b>\n\n" +
+            `• Akun kas: <code>${escapeHtml(String(senderId))}</code> (saldo admin kamu)\n` +
+            `• Saldo kas: <b>${formatRupiah(fundBal)}</b>\n` +
+            `• Bonus Undang Teman: <b>${formatRupiah(REFERRAL_REWARD_SALDO)}</b> per teman (dipotong otomatis)\n` +
+            "• Margin tiap penjualan bot reseller juga dipotong otomatis dari saldo ini\n" +
+            "• WD reseller tetap transfer uang asli manual (tidak mengubah saldo kas)\n\n" +
+            `Isi ulang: <code>/addsaldo ${escapeHtml(String(senderId))} NOMINAL</code>\n` +
+            "<i>Margin reseller tidak pernah diblokir (saldo kas boleh minus sebagai tanda perlu isi ulang). Bonus Undang Teman ditahan kalau kas kurang.</i>",
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
@@ -5569,7 +5862,16 @@ module.exports = async function handler(req, res) {
       if (msg.text) {
         const text = msg.text.trim();
 
-        if (text === "/start") {
+        const startRefMatch = /^\/start\s+ref_(\d{3,15})$/i.exec(text);
+        if (startRefMatch) {
+          try {
+            await recordReferral(senderId, startRefMatch[1], isNewUser);
+          } catch (refErr) {
+            console.error("Referral record error:", refErr);
+          }
+        }
+
+        if (text === "/start" || startRefMatch) {
           const buyerName = escapeHtml((msg.from && msg.from.first_name) || "Kak");
           let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.`;
 
@@ -5578,6 +5880,7 @@ module.exports = async function handler(req, res) {
               "\n\n🛠️ <b>Panel Admin Lengkap (Bot Utama):</b>\n" +
               "• <code>/setmacro</code> — Link & Setting Auto-ACC Makro\n" +
               "• <code>/addsaldo ID NOMINAL</code> | <code>/ceksaldo ID</code> — Kelola Saldo\n" +
+              "• <code>/kashadiah</code> — Saldo kas bonus Undang Teman\n" +
               "• <code>/setbanner</code> | <code>/setqris</code> | <code>/settesti</code> | <code>/broadcast</code>\n" +
               "• <code>/buatvoucher KODE | DISKON | KUOTA</code>\n" +
               "• <code>/setmystery HARGA</code> | <code>/setsold</code> | <code>/resetlb</code> | <code>/hadiahlb</code>\n" +
@@ -5624,11 +5927,18 @@ module.exports = async function handler(req, res) {
           await sendCaraOrder(token, chatId);
         } else if (text === "💎 Info & Channel") {
           await sendChannelLainnya(token, chatId);
+        } else if (text === "/undang" || text === "/referral") {
+          await sendReferralMenu(token, chatId, senderId);
         } else if (text === "🤝 Reseller" || text === "/reseller") {
           await sendResellerMenu(token, chatId, msg.from);
         } else {
           if (["saldo", "depo", "deposit", "topup", "top up"].some((k) => lowerText.includes(k))) {
             await sendSaldoMenu(token, chatId, senderId);
+            return res.status(200).json({ ok: true });
+          }
+
+          if (["undang teman", "referral", "ajak teman"].some((k) => lowerText.includes(k))) {
+            await sendReferralMenu(token, chatId, senderId);
             return res.status(200).json({ ok: true });
           }
 
