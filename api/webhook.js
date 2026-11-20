@@ -6757,6 +6757,33 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // ADMIN: /listmitra
+      if (isAdmin && /^\/listmitra(\s|$)/i.test(rawText)) {
+        const raw = await redisCommand(["HGETALL", REDIS_MITRA_CODE_KEY]);
+        const pairs = [];
+        if (Array.isArray(raw)) for (let i = 0; i < raw.length; i += 2) pairs.push([String(raw[i]), String(raw[i + 1])]);
+        if (!pairs.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Belum ada mitra terdaftar.", reply_to_message_id: msg.message_id });
+          return res.status(200).json({ ok: true });
+        }
+        let out = `🤝 <b>Daftar Mitra</b> (${pairs.length})\n`;
+        let totalKomisi = 0;
+        for (const [kode, uid] of pairs.slice(0, 30)) {
+          const [buyers, m] = await Promise.all([
+            redisCommand(["HLEN", REDIS_MITRA_BUYERS_PREFIX + kode]),
+            getResellerMargin(uid),
+          ]);
+          totalKomisi += m.earned;
+          out +=
+            `\n• <code>${escapeHtml(kode)}</code> — <code>${uid}</code>\n` +
+            `   👥 ${Number(buyers) || 0} pembeli • 💰 ${formatRupiah(m.earned)} • 💳 bisa WD ${formatRupiah(m.available)}`;
+        }
+        out += `\n\n📊 Total komisi semua mitra: <code>${formatRupiah(totalKomisi)}</code>`;
+        if (pairs.length > 30) out += `\n<i>(menampilkan 30 pertama)</i>`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: out, parse_mode: "HTML", reply_to_message_id: msg.message_id });
+        return res.status(200).json({ ok: true });
+      }
+
       // WISHLIST
       if (/^\/wishlist(\s|$)/i.test(rawText) || rawText === "⭐ Wishlist") {
         await sendWishlist(token, chatId, senderId);
