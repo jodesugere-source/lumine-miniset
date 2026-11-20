@@ -6,10 +6,10 @@ const LINK_CH_CADANGAN = "https://t.me/+OGXaaPyrnd5kMmY1";
 const LINK_CH_FREE = "https://t.me/+jf3tLqLIG444MjBI";
 
 // ---- PENGATURAN MENU RESELLER (UBAH SESUAI KEBUTUHAN) ----
-const RETAIL_PRICE_LITE = 5000; // harga retail Paket Lite
-const RETAIL_PRICE_STANDAR = 10000; // harga retail Paket Standar
-const RESELLER_PRICE_LITE = 3500; // harga modal reseller Paket Lite (retail Rp 5.000)
-const RESELLER_PRICE_STANDAR = 7000; // harga modal reseller Paket Standar (retail Rp 10.000)
+const RETAIL_PRICE_LITE = 5000; // harga retail Paket Standar (nama tampilan; variabel LITE = paket Rp 5.000)
+const RETAIL_PRICE_STANDAR = 10000; // harga retail Paket Premium (variabel STANDAR = paket Rp 10.000)
+const RESELLER_PRICE_LITE = 3500; // harga modal reseller Paket Standar (retail Rp 5.000)
+const RESELLER_PRICE_STANDAR = 7000; // harga modal reseller Paket Premium (retail Rp 10.000)
 const RESELLER_MIN_ORDER = 10; // minimal ambil set per order
 const DEFAULT_MACRO_SECRET = "lumineacc2026";
 
@@ -220,7 +220,7 @@ function buildTierSummaryLines(info) {
   const t = info.tier;
   let out =
     `🏅 <b>Tier:</b> ${t.name}\n` +
-    `💲 <b>Harga Tier:</b> Lite <code>${formatRupiah(t.price_lite)}</code> • Standar <code>${formatRupiah(t.price_standar)}</code>\n`;
+    `💲 <b>Harga Tier:</b> Standar <code>${formatRupiah(t.price_lite)}</code> • Premium <code>${formatRupiah(t.price_standar)}</code>\n`;
   out += info.next
     ? `🎯 <b>Naik ke ${info.next.name}:</b> kurang <code>${formatRupiah(info.remaining)}</code> lagi`
     : "🏆 <b>Kamu sudah di tier tertinggi!</b>";
@@ -233,7 +233,7 @@ function buildTierLadderBlock() {
     const syarat = t.min_omset > 0 ? `omset ≥ ${formatRupiah(t.min_omset)}` : "tier awal";
     out +=
       `│ ${t.name} <i>(${syarat})</i>\n` +
-      `│    Lite <code>${formatRupiah(t.price_lite)}</code> • Standar <code>${formatRupiah(t.price_standar)}</code>\n`;
+      `│    Standar <code>${formatRupiah(t.price_lite)}</code> • Premium <code>${formatRupiah(t.price_standar)}</code>\n`;
   }
   out += `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n`;
   out += "╰────────────────────\n\n";
@@ -246,12 +246,12 @@ function buildMyTierBlock(omset, info) {
     "╭─── 🏅 <b>TIER KAMU</b> ───\n" +
     `│ • Tier : <b>${t.name}</b>\n` +
     `│ • Omset : <code>${formatRupiah(omset.rupiah)}</code>\n` +
-    `│ • <b>Paket Lite</b> : <code>${formatRupiah(t.price_lite)}</code>\n` +
-    `│ • <b>Paket Standar</b> : <code>${formatRupiah(t.price_standar)}</code>\n` +
+    `│ • <b>Paket Standar</b> : <code>${formatRupiah(t.price_lite)}</code>\n` +
+    `│ • <b>Paket Premium</b> : <code>${formatRupiah(t.price_standar)}</code>\n` +
     `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n`;
   out += info.next
     ? `│ 🎯 Naik ke <b>${info.next.name}</b> kurang <code>${formatRupiah(info.remaining)}</code> lagi ` +
-      `(Lite ${formatRupiah(info.next.price_lite)} • Standar ${formatRupiah(info.next.price_standar)})\n`
+      `(Standar ${formatRupiah(info.next.price_lite)} • Premium ${formatRupiah(info.next.price_standar)})\n`
     : "│ 🏆 Kamu sudah di tier tertinggi!\n";
   out += "╰────────────────────\n\n";
   return out;
@@ -267,7 +267,7 @@ async function notifyResellerTierUp(token, order, result) {
     text:
       `🎉 <b>SELAMAT, KAMU NAIK TIER!</b>\n\n` +
       `${before.tier.name} ➜ <b>${after.tier.name}</b>\n\n` +
-      `💲 <b>Harga baru:</b> Lite <code>${formatRupiah(after.tier.price_lite)}</code> • Standar <code>${formatRupiah(after.tier.price_standar)}</code>\n\n` +
+      `💲 <b>Harga baru:</b> Standar <code>${formatRupiah(after.tier.price_lite)}</code> • Premium <code>${formatRupiah(after.tier.price_standar)}</code>\n\n` +
       `<i>Hubungi admin saat order grosir biar harga tier barumu dipakai ya!</i>`,
     parse_mode: "HTML",
     reply_markup: {
@@ -1504,8 +1504,8 @@ async function sendMainMenuCard(token, chatId) {
     "✨ <b>LUMINE PHOTOPACK</b> ✨\n" +
     "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n\n" +
     "╭─── 💰 <b>DAFTAR HARGA</b> ───\n" +
-    `│ • <b>Paket Lite</b> : <code>${formatRupiah(RETAIL_PRICE_LITE)}</code>\n` +
-    `│ • <b>Paket Standar</b> : <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
+    `│ • <b>Paket Standar</b> : <code>${formatRupiah(RETAIL_PRICE_LITE)}</code>\n` +
+    `│ • <b>Paket Premium</b> : <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
     `│ • 🎲 <b>Mystery Box Gacha</b> : <code>${formatRupiah(mysteryCfg.price || 3000)}</code>\n` +
     "╰────────────────────\n\n" +
     "💳 Bisa <b>Deposit Saldo (Auto-ACC)</b> untuk checkout 1x klik tanpa kode unik!\n" +
@@ -5667,8 +5667,8 @@ module.exports = async function handler(req, res) {
             const mysteryCfgInfo = await getMysteryConfig();
             replyText =
               "💰 <b>Info Harga Lumine Photopack:</b>\n" +
-              `• Paket Lite : <b>${formatRupiah(RETAIL_PRICE_LITE)}</b>\n` +
-              `• Paket Standar : <b>${formatRupiah(RETAIL_PRICE_STANDAR)}</b>\n` +
+              `• Paket Standar : <b>${formatRupiah(RETAIL_PRICE_LITE)}</b>\n` +
+              `• Paket Premium : <b>${formatRupiah(RETAIL_PRICE_STANDAR)}</b>\n` +
               `• 🎲 <b>Mystery Box Gacha : ${formatRupiah(mysteryCfgInfo.price || 3000)}</b>`;
           }
 
