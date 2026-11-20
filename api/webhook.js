@@ -107,7 +107,8 @@ const REDIS_DEPOSIT_USER_KEY = "lumine_main_depo_users"; // set: id user yang pe
 const SUB_CLAIM_ENABLED = true; // false = matikan klaim subscribe
 const SUB_CLAIM_REWARD = 3000; // saldo per klaim (Rp3.000), dipotong dari kas admin, hanya bisa dibelanjakan di bot
 const SUB_CLAIM_CHANNEL_NAME = "GANTI NAMA CHANNEL"; // nama channel yang tampil ke pembeli
-const SUB_CLAIM_LINK = "https://GANTI-LINK-SUBSCRIBE"; // link subscribe yang dibuka lewat tombol
+const SUB_CLAIM_LINK = "https://GANTI-LINK-SUBSCRIBE"; // link subscribe yang dibuka lewat tombol (nilai awal, bisa diubah lewat /setsub)
+const REDIS_SUB_CFG_KEY = "lumine_main_sub_cfg"; // JSON: { name, link, enabled } hasil /setsub
 const REDIS_SUB_PENDING_KEY = "lumine_main_sub_pending"; // hash: id user -> "waiting" atau id klaim yang menunggu review
 const REDIS_SUB_CLAIMED_KEY = "lumine_main_sub_claimed"; // hash: id user -> id klaim (sudah pernah klaim, hanya sekali)
 const REDIS_SUB_REQ_KEY = "lumine_main_sub_req"; // hash: id klaim -> JSON data klaim
@@ -2161,6 +2162,22 @@ async function doSpin(token, chatId, userId) {
 }
 
 // ---- KLAIM SALDO SUBSCRIBE ----
+// Konfigurasi dibaca dari database (diubah lewat /setsub). Kalau belum pernah diatur, pakai nilai di konstanta.
+async function getSubConfig() {
+  const fallback = { name: SUB_CLAIM_CHANNEL_NAME, link: SUB_CLAIM_LINK, enabled: SUB_CLAIM_ENABLED };
+  const raw = await redisCommand(["GET", REDIS_SUB_CFG_KEY]);
+  if (!raw) return fallback;
+  try {
+    return { ...fallback, ...JSON.parse(raw) };
+  } catch {
+    return fallback;
+  }
+}
+
+async function saveSubConfig(cfg) {
+  await redisCommand(["SET", REDIS_SUB_CFG_KEY, JSON.stringify(cfg)]);
+}
+
 async function getSubReq(reqId) {
   const raw = await redisCommand(["HGET", REDIS_SUB_REQ_KEY, String(reqId)]);
   if (!raw) return null;
@@ -2186,7 +2203,7 @@ async function sendSubInfo(token, chatId, userId) {
   const backBtn = [[{ text: "🔙 Menu Utama", callback_data: "menu_home" }]];
   const uid = String(userId);
 
-  if (!SUB_CLAIM_ENABLED) return sendMsg("⚠️ Klaim saldo subscribe sedang tidak aktif.", { inline_keyboard: backBtn });
+  if (!(await getSubConfig()).enabled) return sendMsg("⚠️ Klaim saldo subscribe sedang tidak aktif.", { inline_keyboard: backBtn });
 
   const claimed = Number(await redisCommand(["HEXISTS", REDIS_SUB_CLAIMED_KEY, uid])) === 1;
   if (claimed) {
@@ -2196,21 +2213,15 @@ async function sendSubInfo(token, chatId, userId) {
   if (pend && pend !== "waiting") {
     return sendMsg("⏳ Bukti subscribe kamu sedang diverifikasi admin. Mohon tunggu ya.", { inline_keyboard: backBtn });
   }
-  if (!(await checkinEligible(userId))) {
-    return sendMsg(
-      "🔒 <b>Klaim saldo subscribe khusus pembeli.</b>\nBelanja atau deposit dulu sekali, lalu kamu bisa klaim.",
-      { inline_keyboard: backBtn }
-    );
-  }
 
   return sendMsg(
     `🎁 <b>KLAIM SALDO ${formatRupiah(SUB_CLAIM_REWARD)}</b>\n\n` +
-      `1️⃣ Subscribe ke <b>${escapeHtml(SUB_CLAIM_CHANNEL_NAME)}</b> lewat tombol di bawah.\n` +
+      `1️⃣ Subscribe ke <b>${escapeHtml((await getSubConfig()).name)}</b> lewat tombol di bawah.\n` +
       `2️⃣ Kembali ke sini, tekan <b>Sudah Subscribe</b>, lalu kirim screenshot bukti subscribe.\n\n` +
       `<i>Saldo ini hanya bisa dipakai belanja di bot dan tidak bisa ditarik tunai. Klaim hanya bisa sekali.</i>`,
     {
       inline_keyboard: [
-        [{ text: "🔔 Subscribe Sekarang", url: SUB_CLAIM_LINK }],
+        [{ text: "🔔 Subscribe Sekarang", url: (await getSubConfig()).link }],
         [{ text: "📸 Sudah Subscribe, Kirim Bukti", callback_data: "sub_start" }],
         ...backBtn,
       ],
@@ -2223,15 +2234,12 @@ async function startSubProof(token, chatId, userId) {
     tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
   const uid = String(userId);
 
-  if (!SUB_CLAIM_ENABLED) return sendMsg("⚠️ Klaim saldo subscribe sedang tidak aktif.");
+  if (!(await getSubConfig()).enabled) return sendMsg("⚠️ Klaim saldo subscribe sedang tidak aktif.");
 
   const claimed = Number(await redisCommand(["HEXISTS", REDIS_SUB_CLAIMED_KEY, uid])) === 1;
   if (claimed) return sendMsg("✅ Kamu sudah pernah klaim saldo subscribe.");
   const pend = await redisCommand(["HGET", REDIS_SUB_PENDING_KEY, uid]);
   if (pend && pend !== "waiting") return sendMsg("⏳ Bukti subscribe kamu sedang diverifikasi admin.");
-  if (!(await checkinEligible(userId))) {
-    return sendMsg("🔒 Klaim saldo subscribe khusus pembeli. Belanja atau deposit dulu sekali ya.");
-  }
 
   await redisCommand(["HSET", REDIS_SUB_PENDING_KEY, uid, "waiting"]);
   return sendMsg(
@@ -2267,7 +2275,7 @@ async function handleSubProof(token, msg, userId) {
         `🎁 <b>KLAIM SUBSCRIBE #${reqId}</b>\n` +
         `👤 ${escapeHtml(name)}${username ? ` (@${escapeHtml(username)})` : ""}\n` +
         `🆔 <code>${escapeHtml(String(userId))}</code>\n` +
-        `📺 ${escapeHtml(SUB_CLAIM_CHANNEL_NAME)}\n` +
+        `📺 ${escapeHtml((await getSubConfig()).name)}\n` +
         `💰 Hadiah: <b>${formatRupiah(SUB_CLAIM_REWARD)}</b>`,
       parse_mode: "HTML",
       reply_markup: {
@@ -6525,6 +6533,51 @@ module.exports = async function handler(req, res) {
             ],
           },
         });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 4C. ADMIN: /setsub (nama, link, dan status klaim subscribe)
+      if (rawText.startsWith("/setsub")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const subArg = rawText.replace(/^\/setsub\s*/i, "").trim();
+        const subCfg = await getSubConfig();
+        const replySub = (text) =>
+          tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+
+        if (!subArg) {
+          await replySub(
+            "🎁 <b>PENGATURAN KLAIM SUBSCRIBE</b>\n\n" +
+              `• Status: ${subCfg.enabled ? "✅ <b>Aktif</b>" : "❌ <b>Nonaktif</b>"}\n` +
+              `• Channel: <b>${escapeHtml(subCfg.name)}</b>\n` +
+              `• Link: ${escapeHtml(subCfg.link)}\n\n` +
+              "<b>Ubah:</b> <code>/setsub NAMA CHANNEL | LINK</code>\n" +
+              "<b>Matikan:</b> <code>/setsub off</code> | <b>Nyalakan:</b> <code>/setsub on</code>"
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        const subLower = subArg.toLowerCase();
+        if (subLower === "on" || subLower === "off") {
+          subCfg.enabled = subLower === "on";
+          await saveSubConfig(subCfg);
+          await replySub(`✅ Klaim subscribe ${subCfg.enabled ? "diaktifkan" : "dinonaktifkan"}.`);
+          return res.status(200).json({ ok: true });
+        }
+
+        const subParts = subArg.split("|").map((s) => s.trim());
+        if (subParts.length !== 2 || !subParts[0] || !/^https?:\/\/\S+$/i.test(subParts[1])) {
+          await replySub(
+            "⚠️ Format salah.\nContoh: <code>/setsub Channel Lumine | https://youtube.com/@namachannel</code>"
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        subCfg.name = subParts[0].slice(0, 60);
+        subCfg.link = subParts[1];
+        await saveSubConfig(subCfg);
+        await replySub(
+          `✅ Klaim subscribe diperbarui:\n📺 <b>${escapeHtml(subCfg.name)}</b>\n🔗 ${escapeHtml(subCfg.link)}`
+        );
         return res.status(200).json({ ok: true });
       }
 
