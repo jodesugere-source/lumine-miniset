@@ -1925,7 +1925,7 @@ function getCompactReplyKeyboard() {
     keyboard: [
       [{ text: "🛍️ Katalog" }, { text: "💰 Saldo & Depo" }],
       [{ text: "🎒 Koleksi Saya" }, { text: "🎲 Mystery Box" }],
-      [{ text: "☰ Lainnya" }],
+      [{ text: "☰ Lainnya" }, { text: "📖 Panduan" }],
     ],
     resize_keyboard: true,
   };
@@ -5241,10 +5241,29 @@ const PANDUAN_TREE = {
   },
   beli: {
     text:
-      "🛍️ <b>Cara Beli</b>\n\n" +
-      "1. Buka menu 🛍️ Katalog\n" +
-      "2. Pilih set yang kamu mau\n" +
-      "3. Pilih metode bayar: Saldo atau QRIS",
+      "🛍️ <b>Cara Beli (4 langkah)</b>\n\n" +
+      "1️⃣ Buka <b>🛍️ Katalog</b>\n" +
+      "2️⃣ Pilih set yang kamu mau, lalu tekan <b>💳 Beli Set Ini</b>\n" +
+      "3️⃣ Pilih cara bayar: <b>Saldo</b> atau <b>QRIS</b>\n" +
+      "4️⃣ File dikirim otomatis setelah pembayaran diterima. Semua file juga tersimpan di <b>🎒 Koleksi Saya</b>.\n\n" +
+      "Mau tahu detail cara bayar? Pilih di bawah:",
+    buttons: [[["💳 Bayar pakai Saldo", "beli_saldo"], ["📲 Bayar pakai QRIS", "beli_qris"]]],
+  },
+  beli_saldo: {
+    text:
+      "💳 <b>Bayar pakai Saldo</b>\n\n" +
+      "• Isi saldo dulu lewat <b>💰 Saldo & Depo</b>.\n" +
+      "• Saat checkout, pilih <b>Saldo</b>. Tidak perlu kode unik, cukup sekali klik.\n" +
+      "• Kalau saldo belum cukup, bot akan memberi tahu. Tambah saldo, lalu coba lagi.",
+    buttons: [],
+  },
+  beli_qris: {
+    text:
+      "📲 <b>Bayar pakai QRIS</b>\n\n" +
+      "• Pilih <b>QRIS</b> saat checkout.\n" +
+      "• Transfer <b>tepat sampai digit terakhir</b>, termasuk kode unik di nominal itu.\n" +
+      "• Pembayaran dicocokkan otomatis, lalu file langsung dikirim.\n" +
+      "• Jangan dibulatkan atau dikurangi, karena pembayaran tidak akan terdeteksi.",
     buttons: [],
   },
   bayar: {
