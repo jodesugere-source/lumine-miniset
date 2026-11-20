@@ -5971,6 +5971,132 @@ async function maybeWinBack(token) {
   if (sent > 0) console.log(`Win-back terkirim: ${sent} pembeli`);
 }
 
+// ==========================================
+// BACKUP PENUH: SEMUA DATA BOT (PENGGUNA, SALDO, ORDER, RESELLER, MITRA, DLL)
+// ==========================================
+const FULLBACKUP_ENABLED = true;
+const FULLBACKUP_HOUR_WIB = 3; // backup otomatis dikirim di update pertama setelah jam ini (WIB)
+const REDIS_FULLBACKUP_DAY_KEY = "lumine_main_fullbackup_day";
+const BACKUP_KEY_PREFIX = "lumine_main_";
+// Kunci sementara yang tidak perlu dicadangkan (rate limit, kunci proses)
+const BACKUP_SKIP_RE = /_rl_|_lock_|_lock$|_day$|_last$/;
+
+// Ambil seluruh data bot dari Redis
+async function dumpAllRedis() {
+  const keys = new Set();
+  let cursor = "0";
+  do {
+    const res = await redisCommand(["SCAN", cursor, "MATCH", `${BACKUP_KEY_PREFIX}*`, "COUNT", "500"]);
+    cursor = String(res[0]);
+    for (const k of res[1] || []) keys.add(String(k));
+  } while (cursor !== "0");
+
+  const data = {};
+  for (const key of keys) {
+    if (BACKUP_SKIP_RE.test(key)) continue;
+    const type = await redisCommand(["TYPE", key]);
+    if (type === "string") {
+      data[key] = { type, value: await redisCommand(["GET", key]) };
+    } else if (type === "hash") {
+      const raw = (await redisCommand(["HGETALL", key])) || [];
+      const obj = {};
+      for (let i = 0; i < raw.length; i += 2) obj[String(raw[i])] = String(raw[i + 1]);
+      data[key] = { type, value: obj };
+    } else if (type === "set") {
+      data[key] = { type, value: (await redisCommand(["SMEMBERS", key])) || [] };
+    } else if (type === "list") {
+      data[key] = { type, value: (await redisCommand(["LRANGE", key, "0", "-1"])) || [] };
+    }
+  }
+  return data;
+}
+
+async function buildFullBackupFile() {
+  const keys = await dumpAllRedis();
+  const payload = JSON.stringify(
+    { version: 1, exported_at: getWibTimestamp(), total_keys: Object.keys(keys).length, keys },
+    null,
+    2
+  );
+  return { payload, total: Object.keys(keys).length };
+}
+
+// Kirim backup ke chat admin (dipakai otomatis dan manual)
+async function sendFullBackup(token, chatId, label) {
+  const { payload, total } = await buildFullBackupFile();
+  const filename = `backup-penuh-${getWibFileStamp()}.json`;
+  const sent = await sendJsonDocument(
+    token,
+    chatId,
+    filename,
+    payload,
+    `🛟 <b>Backup Penuh (${escapeHtml(label)})</b>\n` +
+      `Jumlah data: <b>${total}</b> kunci\n` +
+      `Waktu: ${getWibTimestamp()}\n\n` +
+      `<i>Simpan file ini di tempat aman. Kalau data bermasalah, kirim file ini ke bot dengan caption <code>/restorefull KONFIRM</code>.</i>`
+  );
+  return sent;
+}
+
+// Otomatis sekali sehari
+async function maybeFullBackup(token) {
+  if (!FULLBACKUP_ENABLED) return;
+  const now = Date.now();
+  const wib = new Date(now + 7 * 3600 * 1000);
+  if (wib.getUTCHours() < FULLBACKUP_HOUR_WIB) return;
+  const todayKey = wibDayKey(now);
+  if ((await redisCommand(["GET", REDIS_FULLBACKUP_DAY_KEY])) === todayKey) return;
+  await redisCommand(["SET", REDIS_FULLBACKUP_DAY_KEY, todayKey]);
+
+  const qris = await getQris();
+  const adminChatId = qris && qris.admin_chat_id;
+  if (!adminChatId) return;
+  await sendFullBackup(token, adminChatId, "otomatis harian");
+}
+
+// Pulihkan dari file backup. Hanya jalan kalau caption persis "/restorefull KONFIRM".
+async function restoreFromBackupFile(token, fileId) {
+  const info = await tgRequest(token, "getFile", { file_id: fileId });
+  const filePath = info && info.result && info.result.file_path;
+  if (!filePath) throw new Error("Tidak bisa mengambil file dari Telegram");
+
+  const res = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+  const parsed = JSON.parse(await res.text());
+  if (!parsed || parsed.version !== 1 || !parsed.keys || typeof parsed.keys !== "object") {
+    throw new Error("File bukan backup penuh yang valid");
+  }
+
+  let written = 0;
+  const entries = Object.entries(parsed.keys);
+  for (let i = 0; i < entries.length; i += 20) {
+    await Promise.all(
+      entries.slice(i, i + 20).map(async ([key, item]) => {
+        if (!key.startsWith(BACKUP_KEY_PREFIX)) return;
+        await redisCommand(["DEL", key]);
+        if (item.type === "string") {
+          await redisCommand(["SET", key, item.value]);
+        } else if (item.type === "hash") {
+          const flat = [];
+          for (const [f, v] of Object.entries(item.value)) flat.push(f, v);
+          for (let j = 0; j < flat.length; j += 200) {
+            await redisCommand(["HSET", key, ...flat.slice(j, j + 200)]);
+          }
+        } else if (item.type === "set") {
+          for (let j = 0; j < item.value.length; j += 200) {
+            await redisCommand(["SADD", key, ...item.value.slice(j, j + 200)]);
+          }
+        } else if (item.type === "list") {
+          for (let j = 0; j < item.value.length; j += 200) {
+            await redisCommand(["RPUSH", key, ...item.value.slice(j, j + 200)]);
+          }
+        }
+        written++;
+      })
+    );
+  }
+  return { written, exported_at: parsed.exported_at };
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -6873,6 +6999,13 @@ module.exports = async function handler(req, res) {
         console.error("Win-back error:", wbErr);
       }
 
+      // Backup penuh otomatis (sekali sehari)
+      try {
+        await maybeFullBackup(token);
+      } catch (fbErr) {
+        console.error("Backup penuh error:", fbErr);
+      }
+
       // Ringkasan harian untuk admin (sekali per hari)
       try {
         await maybeSendDailySummary(token);
@@ -7015,6 +7148,40 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
           text: `🆔 <b>Profil Telegram kamu</b>\n\n👤 Nama : ${nama}\n🔖 Username : ${uname}\n🔢 ID : <code>${senderId}</code>\n\n<i>Ketuk ID di atas untuk menyalin.</i>`,
           reply_to_message_id: msg.message_id,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // BACKUP PENUH (ADMIN)
+      if (isAdmin && /^\/fullbackup(\s|$)/i.test(rawText)) {
+        const ok = await sendFullBackup(token, chatId, "manual");
+        if (!ok) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Gagal membuat backup penuh. Coba lagi." });
+        }
+        return res.status(200).json({ ok: true });
+      }
+      if (isAdmin && msg.document && /^\/restorefull\s+KONFIRM\s*$/.test(rawText)) {
+        try {
+          const r = await restoreFromBackupFile(token, msg.document.file_id);
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            parse_mode: "HTML",
+            text: `✅ <b>Restore selesai</b>\nKunci dipulihkan: <b>${r.written}</b>\nDari backup: ${escapeHtml(r.exported_at)}`,
+          });
+        } catch (rsErr) {
+          console.error("Restore penuh error:", rsErr);
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `⚠️ Restore gagal: ${String(rsErr.message || rsErr)}. Data lama tidak diubah kalau file tidak valid.`,
+          });
+        }
+        return res.status(200).json({ ok: true });
+      }
+      if (isAdmin && /^\/restorefull(\s|$)/i.test(rawText) && !msg.document) {
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: "Untuk restore, upload file backup penuh dengan caption <code>/restorefull KONFIRM</code>.\n<i>Ini akan menimpa data bot saat ini.</i>",
         });
         return res.status(200).json({ ok: true });
       }
