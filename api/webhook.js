@@ -4900,6 +4900,400 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
   return false;
 }
 
+// ==========================================
+// FITUR BARU: RATE LIMIT, BLACKLIST, TIKET BANTUAN, ASISTEN PANDUAN
+// ==========================================
+
+// ---- PENGATURAN ----
+const RATE_LIMIT_ENABLED = true;
+const RATE_LIMIT_MAX = 12; // maks pesan/tombol per jendela waktu
+const RATE_LIMIT_WINDOW_SEC = 10; // panjang jendela (detik)
+const TIKET_MAX_LEN = 1000; // batas panjang isi tiket
+const REDIS_RATE_PREFIX = "lumine_main_rl_";
+const REDIS_BLACKLIST_KEY = "lumine_main_blacklist"; // hash: id user -> JSON {alasan, waktu}
+const REDIS_TIKET_SEQ_KEY = "lumine_main_tiket_seq";
+const REDIS_TIKET_PREFIX = "lumine_main_tiket_"; // key per tiket: JSON
+const REDIS_TIKET_USER_KEY = "lumine_main_tiket_user"; // hash: id user -> id tiket yang masih terbuka
+
+// ---- RATE LIMIT ----
+// Hitung aksi per user dalam jendela waktu pendek.
+// Hasil: "ok" | "limit" (baru melewati batas, kirim peringatan sekali) | "blocked" (diabaikan diam-diam)
+// Kalau Redis error, dibiarkan lolos supaya pembeli tidak terblokir karena gangguan teknis.
+async function checkRateLimit(userId) {
+  if (!RATE_LIMIT_ENABLED || !userId) return "ok";
+  try {
+    const key = REDIS_RATE_PREFIX + String(userId);
+    const count = parseInt(await redisCommand(["INCR", key]), 10) || 0;
+    if (count === 1) await redisCommand(["EXPIRE", key, RATE_LIMIT_WINDOW_SEC]);
+    if (count === RATE_LIMIT_MAX + 1) return "limit";
+    if (count > RATE_LIMIT_MAX + 1) return "blocked";
+    return "ok";
+  } catch (e) {
+    console.error("Rate limit error (dilewati):", e);
+    return "ok";
+  }
+}
+
+// ---- BLACKLIST ----
+async function isBanned(userId) {
+  if (!userId) return false;
+  try {
+    return Boolean(await redisCommand(["HGET", REDIS_BLACKLIST_KEY, String(userId)]));
+  } catch (e) {
+    console.error("Cek blacklist error (dilewati):", e);
+    return false;
+  }
+}
+
+// ---- TIKET BANTUAN ----
+async function getTiket(id) {
+  const raw = await redisCommand(["GET", REDIS_TIKET_PREFIX + String(id)]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function saveTiket(tiket) {
+  await redisCommand(["SET", REDIS_TIKET_PREFIX + tiket.id, JSON.stringify(tiket)]);
+}
+
+async function getOpenTiketId(userId) {
+  const raw = await redisCommand(["HGET", REDIS_TIKET_USER_KEY, String(userId)]);
+  return raw ? String(raw) : null;
+}
+
+async function createTiket(from, isi) {
+  const id = String(await redisCommand(["INCR", REDIS_TIKET_SEQ_KEY]));
+  const waktu = getWibTimestamp();
+  const tiket = {
+    id,
+    user_id: String(from.id),
+    nama: from.first_name || "Pembeli",
+    username: from.username || "",
+    status: "terbuka",
+    dibuat: waktu,
+    riwayat: [{ dari: "pembeli", isi, waktu }],
+  };
+  await saveTiket(tiket);
+  await redisCommand(["HSET", REDIS_TIKET_USER_KEY, String(from.id), id]);
+  return tiket;
+}
+
+// Kirim ke admin. Mengembalikan true kalau berhasil.
+async function kirimKeAdmin(token, adminChatId, text) {
+  const r = await tgRequest(token, "sendMessage", {
+    chat_id: adminChatId,
+    text,
+    parse_mode: "HTML",
+  });
+  return Boolean(r && r.ok);
+}
+
+// Dipanggil saat pembeli mengetik /bantuan [isi]
+async function handleBantuan(token, msg, isi) {
+  const chatId = msg.chat.id;
+  const userId = String(msg.from.id);
+  const qris = await getQris();
+  const adminChatId = qris && qris.admin_chat_id;
+
+  if (!adminChatId) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `Maaf, layanan tiket belum aktif. Hubungi @${ADMIN_USERNAME} langsung 🙏`,
+      reply_to_message_id: msg.message_id,
+    });
+    return;
+  }
+
+  if (!isi) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        "🎫 <b>Bantuan Admin</b>\n\n" +
+        "Ketik <code>/bantuan</code> diikuti masalahmu, misalnya:\n" +
+        "<code>/bantuan pesanan saya belum masuk, sudah bayar tadi</code>\n\n" +
+        "Admin akan membalas lewat bot ini. Untuk panduan cepat, ketik /panduan.",
+      parse_mode: "HTML",
+      reply_to_message_id: msg.message_id,
+    });
+    return;
+  }
+
+  const isiAman = isi.slice(0, TIKET_MAX_LEN);
+  const namaAman = escapeHtml(msg.from.first_name || "Pembeli");
+  const userTag = msg.from.username ? ` (@${escapeHtml(msg.from.username)})` : "";
+
+  // Sudah ada tiket terbuka -> jadikan pesan lanjutan
+  const openId = await getOpenTiketId(userId);
+  if (openId) {
+    const tiket = await getTiket(openId);
+    if (tiket && tiket.status === "terbuka") {
+      tiket.riwayat.push({ dari: "pembeli", isi: isiAman, waktu: getWibTimestamp() });
+      await saveTiket(tiket);
+
+      await kirimKeAdmin(
+        token,
+        adminChatId,
+        `💬 <b>Lanjutan tiket #${tiket.id}</b> dari ${namaAman}${userTag}\n\n` +
+          `<i>${escapeHtml(isiAman)}</i>\n\n` +
+          `↩️ Balas: <code>/balas ${tiket.id} pesan</code>`
+      );
+      await tgRequest(token, "sendMessage", {
+        chat_id: chatId,
+        text: `✅ Pesan lanjutan terkirim ke admin untuk tiket #${tiket.id}.`,
+        reply_to_message_id: msg.message_id,
+      });
+      return;
+    }
+  }
+
+  // Tiket baru
+  const tiket = await createTiket(msg.from, isiAman);
+  await kirimKeAdmin(
+    token,
+    adminChatId,
+    `🎫 <b>TIKET BARU #${tiket.id}</b>\n` +
+      `👤 ${namaAman}${userTag}\n` +
+      `🆔 <code>${userId}</code>\n\n` +
+      `<i>${escapeHtml(isiAman)}</i>\n\n` +
+      `↩️ Balas: <code>/balas ${tiket.id} pesan</code>\n` +
+      `✅ Tutup: <code>/tutuptiket ${tiket.id}</code>`
+  );
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      `✅ Tiket <b>#${tiket.id}</b> sudah dikirim ke admin.\n` +
+      "Balasan admin akan muncul di chat ini. Pesan lanjutan bisa dikirim dengan <code>/bantuan</code> lagi.",
+    parse_mode: "HTML",
+    reply_to_message_id: msg.message_id,
+  });
+}
+
+// ---- PERINTAH ADMIN: /ban, /unban, /listban, /balas, /tutuptiket ----
+// Mengembalikan true kalau perintah sudah ditangani.
+async function handleModerationCommands(token, msg, rawText, isAdmin) {
+  const isBanCmd = /^\/(un)?ban(\s|$)/i.test(rawText);
+  const isListBan = /^\/listban(\s|$)/i.test(rawText);
+  const isBalas = /^\/balas(\s|$)/i.test(rawText);
+  const isTutup = /^\/tutuptiket(\s|$)/i.test(rawText);
+  if (!isBanCmd && !isListBan && !isBalas && !isTutup) return false;
+
+  // Bukan admin: abaikan diam-diam
+  if (!isAdmin) return true;
+
+  const chatId = msg.chat.id;
+  const reply = (text) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      reply_to_message_id: msg.message_id,
+    });
+
+  // /listban
+  if (isListBan) {
+    const raw = await redisCommand(["HGETALL", REDIS_BLACKLIST_KEY]);
+    const list = Array.isArray(raw) ? raw : [];
+    if (!list.length) {
+      await reply("Daftar blacklist kosong.");
+      return true;
+    }
+    let out = "🚫 <b>Daftar Blacklist</b>\n";
+    for (let i = 0; i < list.length; i += 2) {
+      let alasan = "";
+      try {
+        alasan = JSON.parse(list[i + 1]).alasan || "";
+      } catch {}
+      out += `\n• <code>${list[i]}</code>${alasan ? " — " + escapeHtml(alasan) : ""}`;
+    }
+    await reply(out);
+    return true;
+  }
+
+  // /ban ID [alasan]  dan  /unban ID
+  if (isBanCmd) {
+    const unban = /^\/unban/i.test(rawText);
+    const args = rawText.replace(/^\/(un)?ban\s*/i, "").trim();
+    const [targetUid, ...rest] = args.split(/\s+/);
+    if (!targetUid || !/^\d{5,15}$/.test(targetUid)) {
+      await reply(
+        "Format: <code>/ban ID_NUMERIK [alasan]</code>\n" +
+          "Atau <code>/unban ID_NUMERIK</code>\n" +
+          "ID adalah ID numerik Telegram pembeli."
+      );
+      return true;
+    }
+
+    if (unban) {
+      await redisCommand(["HDEL", REDIS_BLACKLIST_KEY, targetUid]);
+      await reply(`✅ <code>${targetUid}</code> sudah dibuka blokirnya.`);
+      return true;
+    }
+
+    // Admin tidak boleh diblokir
+    const pinned = await redisCommand(["GET", REDIS_ADMIN_ID_KEY]);
+    if (ADMIN_IDS.includes(targetUid) || String(pinned) === targetUid) {
+      await reply("❌ Akun admin tidak bisa diblokir.");
+      return true;
+    }
+
+    const alasan = rest.join(" ").slice(0, 200);
+    await redisCommand([
+      "HSET",
+      REDIS_BLACKLIST_KEY,
+      targetUid,
+      JSON.stringify({ alasan, waktu: getWibTimestamp() }),
+    ]);
+    await reply(
+      `🚫 <code>${targetUid}</code> diblokir dari bot.` +
+        (alasan ? `\nAlasan: ${escapeHtml(alasan)}` : "")
+    );
+    return true;
+  }
+
+  // /balas ID_TIKET pesan
+  if (isBalas) {
+    const m = /^\/balas\s+(\d+)\s+([\s\S]+)$/i.exec(rawText);
+    if (!m) {
+      await reply("Format: <code>/balas ID_TIKET pesan</code>");
+      return true;
+    }
+    const tiket = await getTiket(m[1]);
+    if (!tiket) {
+      await reply("Tiket tidak ditemukan.");
+      return true;
+    }
+    if (tiket.status !== "terbuka") {
+      await reply(`Tiket #${tiket.id} sudah ditutup.`);
+      return true;
+    }
+
+    const balasan = m[2].trim().slice(0, TIKET_MAX_LEN);
+    tiket.riwayat.push({ dari: "admin", isi: balasan, waktu: getWibTimestamp() });
+    await saveTiket(tiket);
+
+    const r = await tgRequest(token, "sendMessage", {
+      chat_id: tiket.user_id,
+      text:
+        `💬 <b>Balasan admin (tiket #${tiket.id})</b>\n\n${escapeHtml(balasan)}\n\n` +
+        "Masih ada kendala? Ketik <code>/bantuan</code> lalu tulis pesanmu.",
+      parse_mode: "HTML",
+    });
+    if (r && r.ok) {
+      await reply(`✅ Balasan terkirim ke tiket #${tiket.id}.`);
+    } else {
+      await reply(`⚠️ Balasan tersimpan, tapi gagal dikirim ke pembeli (mungkin bot diblokir).`);
+    }
+    return true;
+  }
+
+  // /tutuptiket ID_TIKET
+  if (isTutup) {
+    const id = rawText.replace(/^\/tutuptiket\s*/i, "").trim();
+    const tiket = /^\d+$/.test(id) ? await getTiket(id) : null;
+    if (!tiket) {
+      await reply("Tiket tidak ditemukan.");
+      return true;
+    }
+    tiket.status = "ditutup";
+    await saveTiket(tiket);
+
+    const openId = await getOpenTiketId(tiket.user_id);
+    if (openId === tiket.id) {
+      await redisCommand(["HDEL", REDIS_TIKET_USER_KEY, tiket.user_id]);
+    }
+
+    await tgRequest(token, "sendMessage", {
+      chat_id: tiket.user_id,
+      text: `✅ Tiket #${tiket.id} sudah ditutup. Terima kasih! Butuh bantuan lagi? Ketik /bantuan.`,
+    });
+    await reply(`✅ Tiket #${tiket.id} ditutup.`);
+    return true;
+  }
+
+  return false;
+}
+
+// ---- ASISTEN PANDUAN (MENU BERTINGKAT DENGAN TOMBOL) ----
+// Format tiap baris tombol: [label, kunci_node]
+const PANDUAN_TREE = {
+  root: {
+    text:
+      "👋 <b>Asisten Panduan Lumine Photopack</b>\n\n" +
+      "Pilih topik yang ingin kamu tanyakan:",
+    buttons: [
+      [["🛍️ Cara Beli", "beli"], ["💳 Pembayaran", "bayar"]],
+      [["💰 Saldo & Deposit", "saldo"], ["⏳ Pesanan Belum Masuk", "belum"]],
+      [["💬 Hubungi Admin", "admin"]],
+    ],
+  },
+  beli: {
+    text:
+      "🛍️ <b>Cara Beli</b>\n\n" +
+      "1. Buka menu 🛍️ Katalog\n" +
+      "2. Pilih set yang kamu mau\n" +
+      "3. Pilih metode bayar: Saldo atau QRIS",
+    buttons: [],
+  },
+  bayar: {
+    text:
+      "💳 <b>Pembayaran</b>\n\n" +
+      "• Bayar QRIS <b>tepat sesuai nominal</b> yang tertera, termasuk kode unik. " +
+      "Kode unik dipakai untuk mencocokkan pembayaranmu.\n" +
+      "• Pembayaran pakai Saldo langsung diproses.",
+    buttons: [],
+  },
+  saldo: {
+    text:
+      "💰 <b>Saldo & Deposit</b>\n\n" +
+      "• Isi saldo lewat menu 💰 Saldo & Depo.\n" +
+      "• Check-in harian bisa menambah saldo, dan spin harian dibuka setelah check-in.",
+    buttons: [],
+  },
+  belum: {
+    text:
+      "⏳ <b>Pesanan Belum Masuk</b>\n\n" +
+      "Setelah bayar, tunggu sebentar. Kalau pesanan belum masuk juga, " +
+      "ketik <code>/bantuan</code> lalu sertakan nama set dan jam bayarmu. Admin akan membantu.",
+    buttons: [[["🎫 Cara Kirim Bantuan", "admin"]]],
+  },
+  admin: {
+    text:
+      "💬 <b>Hubungi Admin</b>\n\n" +
+      "Ketik <code>/bantuan</code> diikuti masalahmu. Admin akan membalas lewat bot ini.",
+    buttons: [],
+  },
+};
+
+function buildPanduanMarkup(nodeKey) {
+  const node = PANDUAN_TREE[nodeKey] || PANDUAN_TREE.root;
+  const rows = [...node.buttons];
+  if (nodeKey !== "root") rows.push([["🔙 Kembali", "root"]]);
+  return {
+    inline_keyboard: rows.map((row) =>
+      row.map(([label, key]) => ({ text: label, callback_data: `guide:${key}` }))
+    ),
+  };
+}
+
+// Tampilkan node panduan. Kalau messageId ada (dari tombol), pesan diedit; kalau tidak, kirim baru.
+async function sendPanduan(token, chatId, nodeKey, messageId) {
+  const key = PANDUAN_TREE[nodeKey] ? nodeKey : "root";
+  const payload = {
+    chat_id: chatId,
+    text: PANDUAN_TREE[key].text,
+    parse_mode: "HTML",
+    reply_markup: buildPanduanMarkup(key),
+  };
+  if (messageId) {
+    return tgRequest(token, "editMessageText", { ...payload, message_id: messageId });
+  }
+  return tgRequest(token, "sendMessage", payload);
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -5139,9 +5533,27 @@ module.exports = async function handler(req, res) {
       const callerUsername = (call.from && call.from.username) || "";
       const isCallerAdmin = await isAdminUser(call.from);
 
+      // BLACKLIST & RATE LIMIT (admin dikecualikan)
+      if (!isCallerAdmin) {
+        if (await isBanned(callerId)) return res.status(200).json({ ok: true });
+        const rl = await checkRateLimit(callerId);
+        if (rl !== "ok") {
+          await tgRequest(token, "answerCallbackQuery", {
+            callback_query_id: call.id,
+            text: "⏳ Pelan-pelan ya, tunggu sebentar.",
+          });
+          return res.status(200).json({ ok: true });
+        }
+      }
+
       await tgRequest(token, "answerCallbackQuery", {
         callback_query_id: call.id,
       });
+
+      if (data && data.startsWith("guide:")) {
+        await sendPanduan(token, chatId, data.slice(6), messageId);
+        return res.status(200).json({ ok: true });
+      }
 
       if (data === "menu_home") {
         await sendMainMenuCard(token, chatId);
@@ -5729,6 +6141,20 @@ module.exports = async function handler(req, res) {
       const senderUsername = (msg.from && msg.from.username) || "";
       const isAdmin = await isAdminUser(msg.from);
 
+      // BLACKLIST & RATE LIMIT (admin dikecualikan)
+      if (!isAdmin && senderId) {
+        if (await isBanned(senderId)) return res.status(200).json({ ok: true });
+        const rl = await checkRateLimit(senderId);
+        if (rl === "limit") {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⏳ Kamu terlalu sering mengirim pesan. Tunggu sebentar ya.",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        if (rl === "blocked") return res.status(200).json({ ok: true });
+      }
+
       let isNewUser = false;
       if (msg.chat && msg.chat.type === "private") {
         const addedRes = await redisCommand(["SADD", REDIS_USERS_KEY, String(chatId)]);
@@ -5788,6 +6214,21 @@ module.exports = async function handler(req, res) {
       if (rawText.startsWith("/")) {
         const rbHandled = await handleResellerBotMainCommands(token, req, msg, rawText, isAdmin);
         if (rbHandled) return res.status(200).json({ ok: true });
+      }
+
+      // MODERASI & TIKET
+      if (rawText.startsWith("/")) {
+        if (await handleModerationCommands(token, msg, rawText, isAdmin)) {
+          return res.status(200).json({ ok: true });
+        }
+      }
+      if (/^\/bantuan(\s|$)/i.test(rawText)) {
+        await handleBantuan(token, msg, rawText.replace(/^\/bantuan\s*/i, "").trim());
+        return res.status(200).json({ ok: true });
+      }
+      if (/^\/panduan(\s|$)/i.test(rawText)) {
+        await sendPanduan(token, chatId, "root");
+        return res.status(200).json({ ok: true });
       }
 
       // ADMIN: /addsaldo & /ceksaldo
@@ -7405,6 +7846,11 @@ module.exports = async function handler(req, res) {
         } else if (text === "🤝 Reseller" || text === "/reseller") {
           await sendResellerMenu(token, chatId, msg.from);
         } else {
+          if (["panduan", "bantuan", "help"].some((k) => lowerText.includes(k))) {
+            await sendPanduan(token, chatId, "root");
+            return res.status(200).json({ ok: true });
+          }
+
           if (["saldo", "depo", "deposit", "topup", "top up"].some((k) => lowerText.includes(k))) {
             await sendSaldoMenu(token, chatId, senderId);
             return res.status(200).json({ ok: true });
