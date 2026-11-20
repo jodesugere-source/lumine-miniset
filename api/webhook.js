@@ -11,7 +11,15 @@ const RETAIL_PRICE_STANDAR = 10000; // harga retail Paket Premium (variabel STAN
 const RESELLER_PRICE_LITE = 3500; // harga modal reseller Paket Standar (retail Rp 5.000)
 const RESELLER_PRICE_STANDAR = 7000; // harga modal reseller Paket Premium (retail Rp 10.000)
 const RESELLER_MIN_ORDER = 10; // minimal ambil set per order
-const DEFAULT_MACRO_SECRET = "lumineacc2026";
+const DEFAULT_MACRO_SECRET = "lumineacc2026"; // nilai LAMA — sekarang DITOLAK sebagai secret (ganti lewat /setmacro KODEBARU)
+const nodeCrypto = require("crypto");
+const REDIS_ADMIN_ID_KEY = "lumine_main_admin_id"; // ID numerik admin (dikunci otomatis saat pertama kali admin chat)
+const REDIS_ORDER_LOCK_PREFIX = "lumine_main_order_lock_"; // kunci anti-proses-ganda order bot utama
+// Opsional (disarankan): isi env ADMIN_IDS di Vercel dengan ID Telegram numerik admin, pisah koma bila lebih dari satu.
+const ADMIN_IDS = String(process.env.ADMIN_IDS || process.env.ADMIN_ID || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 // ---- TIER RESELLER (berdasarkan total omset kumulatif; URUT dari kecil ke besar) ----
 // Tier otomatis naik saat omset reseller mencapai min_omset. Ubah angka sesuai kebutuhan.
@@ -97,6 +105,41 @@ const REDIS_REF_BY_KEY = "lumine_main_ref_by"; // hash: id teman -> id pengundan
 const REDIS_REF_REWARDED_KEY = "lumine_main_ref_rewarded"; // hash: id teman yang bonusnya sudah diproses
 const REDIS_REF_TOTAL_KEY = "lumine_main_ref_total"; // hash: id pengundang -> total teman berhasil
 const REDIS_REF_MONTH_PREFIX = "lumine_main_ref_month_"; // hash per bulan: id pengundang -> jumlah
+
+// Perbandingan string anti timing-attack
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ba.length !== bb.length) return false;
+  return nodeCrypto.timingSafeEqual(ba, bb);
+}
+
+// Secret webhook Telegram bot utama. Bisa dioverride env WEBHOOK_SECRET; kalau kosong,
+// diturunkan dari BOT_TOKEN (tidak perlu disimpan, dan tidak bisa ditebak tanpa token).
+function getMainWebhookSecret(token) {
+  if (process.env.WEBHOOK_SECRET) return String(process.env.WEBHOOK_SECRET);
+  return nodeCrypto.createHmac("sha256", String(token)).update("lumine-main-webhook-v1").digest("hex");
+}
+
+// Cek admin lewat ID numerik (bukan username, karena username bisa diganti/dilepas orang lain).
+//  1) Kalau env ADMIN_IDS diisi -> hanya ID itu yang admin.
+//  2) Kalau belum: ID admin dikunci otomatis saat akun @ADMIN_USERNAME pertama kali chat, lalu hanya ID itu yang admin.
+async function isAdminUser(from) {
+  if (!from || !from.id) return false;
+  const uid = String(from.id);
+  if (ADMIN_IDS.length > 0) return ADMIN_IDS.includes(uid);
+
+  const pinned = await redisCommand(["GET", REDIS_ADMIN_ID_KEY]);
+  if (pinned) return String(pinned) === uid;
+
+  const uname = String(from.username || "").toLowerCase();
+  if (uname && uname === ADMIN_USERNAME.toLowerCase()) {
+    await redisCommand(["SET", REDIS_ADMIN_ID_KEY, uid, "NX"]);
+    const now = await redisCommand(["GET", REDIS_ADMIN_ID_KEY]);
+    return String(now) === uid;
+  }
+  return false;
+}
 
 function escapeHtml(str) {
   return String(str || "")
@@ -457,28 +500,29 @@ async function saveTestiConfig(cfg) {
   await redisCommand(["SET", REDIS_TESTI_KEY, JSON.stringify(cfg)]);
 }
 
+// Secret efektif: Redis (/setmacro) -> env MACRO_SECRET. Secret lama bawaan kode TIDAK dipakai lagi.
+function resolveMacroSecret(stored) {
+  for (const c of [stored, process.env.MACRO_SECRET]) {
+    const s = String(c || "").trim();
+    if (s && s !== DEFAULT_MACRO_SECRET) return s;
+  }
+  return "";
+}
+
 async function getMacroConfig() {
   const raw = await redisCommand(["GET", REDIS_MACRO_KEY]);
   if (!raw) {
-    return {
-      enabled: true,
-      secret: process.env.MACRO_SECRET || DEFAULT_MACRO_SECRET,
-      host: "",
-    };
+    return { enabled: true, secret: resolveMacroSecret(""), host: "" };
   }
   try {
     const parsed = JSON.parse(raw);
     return {
       enabled: parsed.enabled !== false,
-      secret: parsed.secret || process.env.MACRO_SECRET || DEFAULT_MACRO_SECRET,
+      secret: resolveMacroSecret(parsed.secret),
       host: parsed.host || "",
     };
   } catch {
-    return {
-      enabled: true,
-      secret: process.env.MACRO_SECRET || DEFAULT_MACRO_SECRET,
-      host: "",
-    };
+    return { enabled: true, secret: resolveMacroSecret(""), host: "" };
   }
 }
 
@@ -1432,7 +1476,25 @@ async function sendTestimonialToChannel(token, order, deliveredName, buyerAllCou
   await tgRequest(token, "sendMessage", payload);
                           }
 async function processAccOrder(token, order) {
-  const result = await processAccOrderCore(token, order);
+  // Kunci per-order: makro + klik ACC manual (atau makro yang retry) tidak boleh memproses order yang sama dua kali.
+  const lockKey = `${REDIS_ORDER_LOCK_PREFIX}${order.id}`;
+  const lock = await redisCommand(["SET", lockKey, "1", "NX", "EX", "259200"]);
+  if (lock === undefined) throw new Error("Gagal membuat kunci order (Redis tidak merespons).");
+  if (lock !== "OK") {
+    return { deliveredName: order.item_nama, deliveredLink: "", duplicate: true };
+  }
+
+  let result;
+  try {
+    result = await processAccOrderCore(token, order);
+  } catch (coreErr) {
+    // Kalau gagal SEBELUM status "acc" tersimpan (belum ada efek samping), lepas kunci agar bisa dicoba ulang.
+    try {
+      const fresh = await getOrder(order.id);
+      if (!fresh || fresh.status !== "acc") await redisCommand(["DEL", lockKey]);
+    } catch (_) {}
+    throw coreErr;
+  }
   try {
     await maybeRewardReferral(token, order);
   } catch (refErr) {
@@ -3942,8 +4004,16 @@ module.exports = async function handler(req, res) {
             })()
           : req.body || {};
 
-      const incomingSecret = String((req.query && req.query.secret) || bodyObj.secret || "").trim();
-      if (!incomingSecret || incomingSecret !== macroCfg.secret) {
+      if (!macroCfg.secret) {
+        return res.status(503).json({
+          ok: false,
+          error: "Secret makro belum diatur. Kirim /setmacro KODERAHASIA ke bot, lalu samakan di makro Android.",
+        });
+      }
+      const incomingSecret = String(
+        (req.query && req.query.secret) || bodyObj.secret || req.headers["x-macro-secret"] || ""
+      ).trim();
+      if (!incomingSecret || !safeEqual(incomingSecret, macroCfg.secret)) {
         return res.status(401).json({ ok: false, error: "Secret makro tidak cocok" });
       }
 
@@ -3987,7 +4057,17 @@ module.exports = async function handler(req, res) {
         });
       }
 
-      const { deliveredName } = await processAnyOrder(token, matchedOrder);
+      const accResult = await processAnyOrder(token, matchedOrder);
+      if (accResult && accResult.duplicate) {
+        return res.status(200).json({
+          ok: true,
+          matched: true,
+          duplicate: true,
+          order_id: matchedOrder.id,
+          message: "Order ini sudah/sedang diproses.",
+        });
+      }
+      const { deliveredName } = accResult;
 
       if (qris && qris.admin_chat_id) {
         const extraNote = matchedOrder.is_deposit
@@ -4033,7 +4113,10 @@ module.exports = async function handler(req, res) {
   if (req.method === "GET") {
     if (req.query.setup === "true") {
       const webhookUrl = `https://${req.headers.host}/api/webhook`;
-      const result = await tgRequest(token, "setWebhook", { url: webhookUrl });
+      const result = await tgRequest(token, "setWebhook", {
+        url: webhookUrl,
+        secret_token: getMainWebhookSecret(token),
+      });
       const macroCfg = await getMacroConfig();
       macroCfg.host = req.headers.host;
       await saveMacroConfig(macroCfg);
@@ -4054,8 +4137,16 @@ module.exports = async function handler(req, res) {
 
   if (req.method !== "POST") {
     return res.status(405).send("Method Not Allowed");
-          }
-          try {
+  }
+
+  // Pastikan request benar-benar dari Telegram (header dari setWebhook secret_token)
+  const hdrSecret = String(req.headers["x-telegram-bot-api-secret-token"] || "");
+  if (!safeEqual(hdrSecret, getMainWebhookSecret(token))) {
+    console.warn("Webhook ditolak: secret_token tidak ada/tidak cocok.");
+    return res.status(401).json({ ok: false });
+  }
+
+  try {
     const update =
       typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
@@ -4116,8 +4207,7 @@ module.exports = async function handler(req, res) {
       const data = call.data;
       const callerId = call.from.id;
       const callerUsername = (call.from && call.from.username) || "";
-      const isCallerAdmin =
-        callerUsername.toLowerCase() === ADMIN_USERNAME.toLowerCase();
+      const isCallerAdmin = await isAdminUser(call.from);
 
       await tgRequest(token, "answerCallbackQuery", {
         callback_query_id: call.id,
@@ -4501,7 +4591,17 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        const { deliveredName } = await processAnyOrder(token, order);
+        const accResult = await processAnyOrder(token, order);
+        if (accResult && accResult.duplicate) {
+          await tgRequest(token, "editMessageText", {
+            chat_id: chatId,
+            message_id: messageId,
+            text: `✅ <b>ORDER #${order.id}</b> sudah diproses (otomatis/ACC sebelumnya). Tidak diproses ulang.`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const { deliveredName } = accResult;
         const adminExtraNote = order.is_deposit
           ? `\n💳 <b>Saldo Masuk:</b> +${formatRupiah(order.base_nominal)}`
           : order.is_mystery
@@ -4669,8 +4769,7 @@ module.exports = async function handler(req, res) {
       const chatId = msg.chat.id;
       const senderId = msg.from && msg.from.id;
       const senderUsername = (msg.from && msg.from.username) || "";
-      const isAdmin =
-        senderUsername.toLowerCase() === ADMIN_USERNAME.toLowerCase();
+      const isAdmin = await isAdminUser(msg.from);
 
       let isNewUser = false;
       if (msg.chat && msg.chat.type === "private") {
@@ -4999,6 +5098,8 @@ module.exports = async function handler(req, res) {
       // 0A. ADMIN: /setmacro (PENGATURAN & LINK AUTO-ACC MAKRO ANDROID)
       if (rawText.startsWith("/setmacro")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
+        // Secret ditampilkan di chat -> hanya boleh di chat pribadi, jangan di grup
+        if (!msg.chat || msg.chat.type !== "private") return res.status(200).json({ ok: true });
         const arg = rawText.replace(/^\/setmacro\s*/i, "").trim();
         const macroCfg = await getMacroConfig();
         const host = macroCfg.host || req.headers.host || "domain-vercel-kamu.vercel.app";
@@ -5026,18 +5127,34 @@ module.exports = async function handler(req, res) {
         }
 
         if (arg && !arg.includes(" ")) {
+          if (!/^[A-Za-z0-9_-]{12,64}$/.test(arg) || arg === DEFAULT_MACRO_SECRET) {
+            await tgRequest(token, "sendMessage", {
+              chat_id: chatId,
+              text:
+                "⚠️ <b>Secret tidak valid.</b>\nPakai <b>12–64 karakter</b> huruf/angka/<code>_</code>/<code>-</code> tanpa spasi, " +
+                "acak & sulit ditebak, dan jangan pakai secret lama.\n" +
+                "Contoh: <code>/setmacro Kx9mQ2vLp7TrZ4wB</code>",
+              parse_mode: "HTML",
+            });
+            return res.status(200).json({ ok: true });
+          }
           macroCfg.secret = arg;
           macroCfg.enabled = true;
           await saveMacroConfig(macroCfg);
         }
 
-        const macroUrl = `https://${host}/api/webhook?autoacc=1&secret=${macroCfg.secret}&text={not_text}`;
+        const secretShown = macroCfg.secret || "";
+        const macroUrl = `https://${host}/api/webhook?autoacc=1&secret=${secretShown || "KODERAHASIA"}&text={not_text}`;
         await tgRequest(token, "sendMessage", {
           chat_id: chatId,
           text:
             "⚡ <b>PENGATURAN AUTO-ACC MAKRO (MACRODROID)</b>\n\n" +
             `• Status: ${macroCfg.enabled ? "✅ <b>AKTIF</b>" : "❌ <b>NONAKTIF</b>"}\n` +
-            `• Secret Key: <code>${escapeHtml(macroCfg.secret)}</code>\n\n` +
+            `• Secret Key: ${
+              secretShown
+                ? `<code>${escapeHtml(secretShown)}</code>`
+                : "❗ <b>BELUM DIATUR</b> — kirim <code>/setmacro KODERAHASIA</code> dulu"
+            }\n\n` +
             "<b>1. Salin URL Webhook ini ke MacroDroid (HTTP Request GET):</b>\n" +
             `<code>${escapeHtml(macroUrl)}</code>\n\n` +
             "<b>2. Perintah Kontrol:</b>\n" +
