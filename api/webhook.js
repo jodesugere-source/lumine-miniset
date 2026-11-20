@@ -1598,6 +1598,11 @@ async function processAccOrder(token, order) {
     console.error("Referral reward error:", refErr);
   }
   try {
+    if (!order.is_deposit) await recordLastBuy(order.buyer_id);
+  } catch (lbErr) {
+    console.error("Catat pembelian terakhir error:", lbErr);
+  }
+  try {
     await maybeRewardMitra(token, order);
   } catch (mitraErr) {
     console.error("Mitra reward error:", mitraErr);
@@ -4264,6 +4269,23 @@ async function handleRbCallback(ctx, call) {
   await tgRequest(ctx.token, "answerCallbackQuery", { callback_query_id: call.id });
   if (!chatId) return;
 
+  // Blacklist & rate limit (pemilik toko dikecualikan)
+  if (String(callerId) !== String(ctx.ownerId)) {
+    if (await isBanned(callerId)) return;
+    const rl = await checkRateLimit(callerId);
+    if (rl !== "ok") return;
+  }
+
+  // Menu yang sedang tampil diganti, bukan ditumpuk chat baru
+  const RB_NAV_NEW = ["rhome", "rbest", "rcara"];
+  if (RB_NAV_NEW.includes(data) && messageId) {
+    try {
+      await tgRequest(ctx.token, "deleteMessage", { chat_id: chatId, message_id: messageId });
+    } catch (delErr) {
+      console.error("Gagal hapus pesan navigasi bot reseller:", delErr);
+    }
+  }
+
   if (data === "rhome") {
     await sendRbMainMenu(ctx, chatId);
   } else if (data === "rkat" || data.startsWith("rpage_")) {
@@ -4354,6 +4376,18 @@ async function handleRbMessage(ctx, msg) {
   if (!msg.chat || msg.chat.type !== "private" || !msg.from) return;
   const chatId = msg.chat.id;
   const isOwner = String(msg.from.id) === String(ctx.ownerId);
+  if (!isOwner) {
+    if (await isBanned(msg.from.id)) return;
+    const rl = await checkRateLimit(msg.from.id);
+    if (rl === "limit") {
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text: "⏳ Kamu terlalu sering mengirim pesan. Tunggu sebentar ya.",
+      });
+      return;
+    }
+    if (rl === "blocked") return;
+  }
   const { cmd, arg } = parseCommand(msg.text || "");
 
   // ---- PERINTAH PEMILIK TOKO ----
@@ -5867,6 +5901,76 @@ async function maybeAwardMitraTop(token) {
   }
 }
 
+// ==========================================
+// WIN-BACK: PEMBELI YANG LAMA TIDAK BELANJA DAPAT SALDO UNTUK KEMBALI
+// ==========================================
+const WINBACK_ENABLED = true;
+const WINBACK_DAYS = 30; // dianggap tidak aktif setelah sekian hari tanpa belanja
+const WINBACK_SALDO = 2000; // saldo hadiah (hanya bisa dipakai belanja di toko)
+const WINBACK_PER_RUN = 25; // batas kirim per hari, supaya tidak kena batas Telegram
+const REDIS_LASTBUY_KEY = "lumine_main_lastbuy"; // hash: id user -> timestamp (ms) pembelian terakhir
+const REDIS_WINBACK_SENT_KEY = "lumine_main_winback_sent"; // hash: id user -> timestamp (ms) terakhir ditawari
+const REDIS_WINBACK_DAY_KEY = "lumine_main_winback_day";
+
+// Dipanggil saat order berhasil di-ACC (bukan deposit)
+async function recordLastBuy(buyerId) {
+  await redisCommand(["HSET", REDIS_LASTBUY_KEY, String(buyerId), String(Date.now())]);
+}
+
+// Jalan sekali sehari, setelah jam 10 WIB
+async function maybeWinBack(token) {
+  if (!WINBACK_ENABLED) return;
+  const now = Date.now();
+  const wib = new Date(now + 7 * 3600 * 1000);
+  if (wib.getUTCHours() < 10) return;
+
+  const todayKey = wibDayKey(now);
+  if ((await redisCommand(["GET", REDIS_WINBACK_DAY_KEY])) === todayKey) return;
+  await redisCommand(["SET", REDIS_WINBACK_DAY_KEY, todayKey]);
+
+  const [lastRaw, sentRaw, users, bannedRaw] = await Promise.all([
+    redisCommand(["HGETALL", REDIS_LASTBUY_KEY]),
+    redisCommand(["HGETALL", REDIS_WINBACK_SENT_KEY]),
+    redisCommand(["SMEMBERS", REDIS_USERS_KEY]),
+    redisCommand(["HKEYS", REDIS_BLACKLIST_KEY]),
+  ]);
+  const toMap = (raw) => {
+    const m = {};
+    if (Array.isArray(raw)) for (let i = 0; i < raw.length; i += 2) m[String(raw[i])] = Number(raw[i + 1]) || 0;
+    return m;
+  };
+  const lastBuy = toMap(lastRaw);
+  const sentAt = toMap(sentRaw);
+  const banned = new Set((Array.isArray(bannedRaw) ? bannedRaw : []).map(String));
+  const cutoff = now - WINBACK_DAYS * 86400000;
+
+  let sent = 0;
+  for (const uid of (Array.isArray(users) ? users : []).map(String)) {
+    if (sent >= WINBACK_PER_RUN) break;
+    if (banned.has(uid)) continue;
+    const last = lastBuy[uid] || 0;
+    if (!last || last > cutoff) continue; // belum pernah beli, atau masih aktif
+    if ((sentAt[uid] || 0) > last) continue; // sudah ditawari setelah pembelian terakhirnya
+
+    const r = await tgRequest(token, "sendMessage", {
+      chat_id: uid,
+      parse_mode: "HTML",
+      text:
+        `🎁 <b>Kangen nih!</b>\n\n` +
+        `Sudah ${WINBACK_DAYS} hari kamu belum mampir. Kami kasih saldo ` +
+        `<code>${formatRupiah(WINBACK_SALDO)}</code> buat belanja lagi.\n\n` +
+        `Cek set terbaru di 🛍️ Katalog 💜`,
+      reply_markup: { inline_keyboard: [[{ text: "🛍️ Buka Katalog", callback_data: "menu_katalog" }]] },
+    });
+    if (!r || !r.ok) continue; // bot diblokir atau gagal kirim: saldo tidak diberikan
+
+    await addUserSaldo(uid, WINBACK_SALDO);
+    await redisCommand(["HSET", REDIS_WINBACK_SENT_KEY, uid, String(now)]);
+    sent++;
+  }
+  if (sent > 0) console.log(`Win-back terkirim: ${sent} pembeli`);
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -6762,6 +6866,13 @@ module.exports = async function handler(req, res) {
         console.error("Hadiah mitra terbaik error:", mtErr);
       }
 
+      // Win-back pembeli tidak aktif (sekali sehari)
+      try {
+        await maybeWinBack(token);
+      } catch (wbErr) {
+        console.error("Win-back error:", wbErr);
+      }
+
       // Ringkasan harian untuk admin (sekali per hari)
       try {
         await maybeSendDailySummary(token);
@@ -7444,7 +7555,9 @@ module.exports = async function handler(req, res) {
       if (rawText.startsWith("/broadcast")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const bcText = rawText.replace(/^\/broadcast\s*/i, "").trim();
-        const userIds = (await redisCommand(["SMEMBERS", REDIS_USERS_KEY])) || [];
+        const allUserIds = (await redisCommand(["SMEMBERS", REDIS_USERS_KEY])) || [];
+        const bannedIds = new Set(((await redisCommand(["HKEYS", REDIS_BLACKLIST_KEY])) || []).map(String));
+        const userIds = allUserIds.filter((uid) => !bannedIds.has(String(uid)));
 
         if (!bcText && (!msg.photo || msg.photo.length === 0)) {
           await tgRequest(token, "sendMessage", {
