@@ -6289,6 +6289,54 @@ function buildRatingBlock(rating) {
   return lines.join("\n") + "\n\n";
 }
 
+// ==========================================
+// CEK KESEHATAN BOT (ADMIN): mencari data dan konfigurasi yang bermasalah
+// ==========================================
+async function runBotHealthCheck() {
+  const issues = [];
+
+  if (!process.env.BOT_TOKEN) issues.push("BOT_TOKEN belum diset di environment");
+
+  // Katalog: ID ganda, nama kosong, harga tidak valid
+  const katalog = await getKatalog();
+  const seen = new Set();
+  for (const k of katalog) {
+    const id = String(k.id);
+    if (seen.has(id)) issues.push(`ID set ganda: ${id}`);
+    seen.add(id);
+    if (!k.nama || !String(k.nama).trim()) issues.push(`Set ID ${id} tidak punya nama`);
+    if (!(parseNominal(k.harga) > 0)) issues.push(`Set "${k.nama || id}" harga tidak valid (${k.harga || "kosong"})`);
+  }
+
+  // Mitra: kode dan pemilik harus saling cocok
+  const codeRaw = (await redisCommand(["HGETALL", REDIS_MITRA_CODE_KEY])) || [];
+  const userRaw = (await redisCommand(["HGETALL", REDIS_MITRA_USER_KEY])) || [];
+  const userMap = {};
+  for (let i = 0; i < userRaw.length; i += 2) userMap[String(userRaw[i])] = String(userRaw[i + 1]);
+  for (let i = 0; i < codeRaw.length; i += 2) {
+    const code = String(codeRaw[i]);
+    const uid = String(codeRaw[i + 1]);
+    if (userMap[uid] !== code) issues.push(`Kode mitra "${code}" tidak cocok dengan pemiliknya (${uid})`);
+  }
+
+  // Blacklist: admin tidak boleh ikut diblokir
+  const banned = (await redisCommand(["HKEYS", REDIS_BLACKLIST_KEY])) || [];
+  for (const id of banned) {
+    if (ADMIN_IDS.includes(String(id))) issues.push(`Admin ${id} ada di blacklist`);
+  }
+
+  return issues;
+}
+
+// ==========================================
+// CHAT LOG MAKRO (bisa dipisah dari chat admin)
+// ==========================================
+const REDIS_MACRO_LOGCHAT_KEY = "lumine_main_macro_logchat";
+async function getMacroLogChatId() {
+  const raw = await redisCommand(["GET", REDIS_MACRO_LOGCHAT_KEY]);
+  return raw ? String(raw) : null;
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -6347,19 +6395,22 @@ module.exports = async function handler(req, res) {
       const nominals = extractNominalsFromNotif(rawNotif);
       const matchedOrder = await findPendingOrderByNominals(nominals);
       const qris = await getQris();
+      const logChatId = (await getMacroLogChatId()) || (qris && qris.admin_chat_id);
 
       if (!matchedOrder) {
-        if (qris && qris.admin_chat_id) {
-          const debugText = escapeHtml(rawNotif || "(KOSONG / TIDAK TERBACA)");
-          const debugNums = nominals.length > 0 ? nominals.join(", ") : "Tidak ada angka";
+        if (logChatId) {
+          const notifTxt = escapeHtml((rawNotif || "(kosong / tidak terbaca)").slice(0, 200));
+          const nomTxt = nominals.length ? nominals.map((n) => formatRupiah(n)).join(", ") : "tidak ada";
           await tgRequest(token, "sendMessage", {
-            chat_id: qris.admin_chat_id,
-            text:
-              `🔍 <b>LOG MAKRO MASUK (BELUM COCOK)</b>\n\n` +
-              `📲 <b>Isi Notif:</b> <i>"${debugText}"</i>\n` +
-              `🔢 <b>Angka Terbaca:</b> <code>${escapeHtml(debugNums)}</code>\n\n` +
-              `<i>Pastikan ada pesanan pending dengan total transfer yang sama persis.</i>`,
+            chat_id: logChatId,
             parse_mode: "HTML",
+            text:
+              `🔴 <b>MAKRO: TIDAK COCOK</b>\n` +
+              `🕒 ${getWibTimestamp()}\n\n` +
+              `📲 <b>Notif:</b> <i>"${notifTxt}"</i>\n` +
+              `🔢 <b>Angka terbaca:</b> ${nomTxt}\n\n` +
+              `⚠️ Tidak ada order pending dengan nominal itu.\n` +
+              `💡 <i>Cek: total transfer harus sama persis dengan total order, termasuk kode unik.</i>`,
           });
         }
 
@@ -6384,31 +6435,27 @@ module.exports = async function handler(req, res) {
       }
       const { deliveredName } = accResult;
 
-      if (qris && qris.admin_chat_id) {
+      if (logChatId) {
         const extraNote = matchedOrder.is_deposit
-          ? `\n💳 <b>Jenis:</b> Deposit Saldo (+${formatRupiah(matchedOrder.base_nominal)})`
+          ? `\n🏷 <b>Jenis:</b> Deposit Saldo (+${formatRupiah(matchedOrder.base_nominal)})`
           : matchedOrder.is_resprem
-          ? `\n💎 <b>Jenis:</b> Reseller Prem (+bonus saldo ${formatRupiah(RESELLER_PREM_BONUS_SALDO)})`
+          ? `\n🏷 <b>Jenis:</b> Reseller Prem (+bonus ${formatRupiah(RESELLER_PREM_BONUS_SALDO)})`
           : matchedOrder.is_mystery
-          ? `\n🎲 <b>Hadiah Gacha:</b> ${escapeHtml(deliveredName)}`
+          ? `\n🏷 <b>Gacha:</b> ${escapeHtml(deliveredName)}`
           : "";
-        const notifSnippet = escapeHtml(rawNotif.slice(0, 140));
-        const footerNote = matchedOrder.is_deposit
-          ? "✅ <i>Saldo otomatis ditambahkan ke akun pembeli!</i>"
-          : matchedOrder.is_resprem
-          ? "✅ <i>Status reseller & saldo awal otomatis aktif!</i>"
-          : "✅ <i>Link otomatis terkirim ke pembeli, Bestseller, Leaderboard & Testimoni!</i>";
-
+        const notifSnippet = escapeHtml(rawNotif.slice(0, 200));
         await tgRequest(token, "sendMessage", {
-          chat_id: qris.admin_chat_id,
-          text:
-            `⚡ <b>AUTO-ACC MAKRO BERHASIL (#${matchedOrder.id})</b>\n\n` +
-            `👤 <b>Pembeli:</b> ${escapeHtml(matchedOrder.buyer_name)} (${escapeHtml(matchedOrder.buyer_username)})\n` +
-            `📦 <b>Paket:</b> ${escapeHtml(matchedOrder.item_nama)}${extraNote}\n` +
-            `💰 <b>Nominal Cocok:</b> <code>${formatRupiah(matchedOrder.total_nominal)}</code>\n` +
-            `📲 <b>Notif HP:</b> <i>"${notifSnippet}"</i>\n\n` +
-            footerNote,
+          chat_id: logChatId,
           parse_mode: "HTML",
+          text:
+            `🟢 <b>MAKRO: ORDER #${matchedOrder.id} DIACC OTOMATIS</b>\n` +
+            `🕒 ${getWibTimestamp()}\n\n` +
+            `👤 <b>Pembeli:</b> ${escapeHtml(matchedOrder.buyer_name)} (${escapeHtml(matchedOrder.buyer_username)})\n` +
+            `🆔 <code>${matchedOrder.buyer_id}</code>\n` +
+            `📦 <b>Paket:</b> ${escapeHtml(matchedOrder.item_nama)}${extraNote}\n` +
+            `💰 <b>Nominal:</b> <code>${formatRupiah(matchedOrder.total_nominal)}</code>\n` +
+            `📲 <b>Notif:</b> <i>"${notifSnippet}"</i>\n\n` +
+            `✅ <i>Pembeli sudah dapat file/saldo otomatis.</i>`,
         });
       }
 
@@ -7435,6 +7482,108 @@ module.exports = async function handler(req, res) {
           out += "\n";
         }
         await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: out, reply_to_message_id: msg.message_id });
+        return res.status(200).json({ ok: true });
+      }
+
+      // CEK TOP UP (ADMIN): ringkasan dan daftar top up yang bermasalah
+      if (isAdmin && /^\/cektopup(\s|$)/i.test(rawText)) {
+        const seqRaw = await redisCommand(["GET", REDIS_ORDER_SEQ_KEY]);
+        const maxId = parseInt(seqRaw, 10) || 0;
+        const scanFrom = Math.max(1, maxId - 199);
+        const ids = [];
+        for (let id = maxId; id >= scanFrom; id--) ids.push(id);
+
+        const counts = { pending: 0, waiting_acc: 0, acc: 0, rejected: 0, cancelled: 0 };
+        const problems = [];
+        for (let i = 0; i < ids.length; i += 40) {
+          const raws = await Promise.all(ids.slice(i, i + 40).map((id) => redisCommand(["GET", `${REDIS_ORDER_PREFIX}${id}`])));
+          for (const raw of raws) {
+            if (!raw) continue;
+            let o;
+            try {
+              o = typeof raw === "string" ? JSON.parse(raw) : raw;
+            } catch {
+              continue;
+            }
+            if (!o || !o.is_deposit) continue;
+            const st = String(o.status || "");
+            if (counts[st] !== undefined) counts[st]++;
+            if (st === "waiting_acc" || st === "rejected" || st === "cancelled") {
+              problems.push({ id: o.id, st, buyer: o.buyer_name || "-", uid: o.buyer_id, nominal: o.total_nominal });
+            }
+          }
+        }
+
+        const totalDepo = Object.values(counts).reduce((a, b) => a + b, 0);
+        let out =
+          `🔎 <b>Cek Top Up</b>\n<i>Memeriksa ${ids.length} order terakhir</i>\n\n` +
+          `📊 Total top up : <b>${totalDepo}</b>\n` +
+          `✅ Berhasil (acc) : <b>${counts.acc}</b>\n` +
+          `⏳ Menunggu bayar (pending) : <b>${counts.pending}</b>\n` +
+          `🕓 Menunggu ACC admin : <b>${counts.waiting_acc}</b>\n` +
+          `❌ Ditolak : <b>${counts.rejected}</b>\n` +
+          `🚫 Dibatalkan : <b>${counts.cancelled}</b>\n`;
+
+        if (problems.length) {
+          out += `\n⚠️ <b>Perlu dicek</b> (${problems.length})\n`;
+          const label = { waiting_acc: "🕓 tunggu ACC", rejected: "❌ ditolak", cancelled: "🚫 batal" };
+          for (const p of problems.slice(0, 15)) {
+            out += `\n• #${p.id} — ${escapeHtml(p.buyer)} <code>${p.uid}</code>\n   ${formatRupiah(Number(p.nominal) || 0)} • ${label[p.st]}`;
+          }
+          if (problems.length > 15) out += `\n\n<i>...+${problems.length - 15} lainnya</i>`;
+        } else {
+          out += `\n✅ Tidak ada top up yang bermasalah.`;
+        }
+        out += `\n\n<i>Catatan: order belum menyimpan waktu, jadi "pending lama" belum bisa dideteksi.</i>`;
+
+        await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: out, reply_to_message_id: msg.message_id });
+        return res.status(200).json({ ok: true });
+      }
+
+      // CEK KESEHATAN BOT (ADMIN)
+      if (isAdmin && /^\/cekbot(\s|$)/i.test(rawText)) {
+        const issues = await runBotHealthCheck();
+        let out;
+        if (!issues.length) {
+          out = "✅ <b>Pemeriksaan selesai</b>\nKatalog, mitra, dan blacklist tidak menemukan masalah.";
+        } else {
+          out = `⚠️ <b>Ditemukan ${issues.length} masalah</b>\n`;
+          for (const it of issues.slice(0, 30)) out += `\n• ${escapeHtml(it)}`;
+          if (issues.length > 30) out += `\n\n<i>...+${issues.length - 30} lainnya</i>`;
+        }
+        await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: out, reply_to_message_id: msg.message_id });
+        return res.status(200).json({ ok: true });
+      }
+
+      // SET CHAT LOG MAKRO (ADMIN): /setlogmakro CHAT_ID | /setlogmakro reset
+      if (isAdmin && /^\/setlogmakro(\s|$)/i.test(rawText)) {
+        const arg = rawText.replace(/^\/setlogmakro\s*/i, "").trim();
+        let reply;
+        if (!arg || arg.toLowerCase() === "reset") {
+          await redisCommand(["DEL", REDIS_MACRO_LOGCHAT_KEY]);
+          reply = "✅ Log makro kembali ke chat admin.";
+        } else if (/^-?\d{5,20}$/.test(arg)) {
+          await redisCommand(["SET", REDIS_MACRO_LOGCHAT_KEY, arg]);
+          reply = `✅ Log makro sekarang dikirim ke chat <code>${escapeHtml(arg)}</code>.\n\n<i>Pastikan bot sudah dijadikan admin di chat/channel itu.</i>`;
+        } else {
+          reply = "Format: <code>/setlogmakro CHAT_ID</code> atau <code>/setlogmakro reset</code>.\nCHAT_ID channel biasanya diawali <code>-100</code>.";
+        }
+        await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: reply, reply_to_message_id: msg.message_id });
+        return res.status(200).json({ ok: true });
+      }
+
+      // CEK ID CHAT / CHANNEL (ADMIN): /cekid, atau teruskan pesan dari channel/grup ke bot
+      if (isAdmin && (msg.forward_from_chat || /^\/cekid(\s|$)/i.test(rawText))) {
+        const src = msg.forward_from_chat || msg.chat;
+        const tipe = { private: "Chat pribadi", group: "Grup", supergroup: "Supergrup", channel: "Channel" }[src.type] || src.type;
+        const judul = escapeHtml(src.title || src.username || src.first_name || "-");
+        const info =
+          `🆔 <b>Info Chat</b>\n\n` +
+          `📛 Nama : ${judul}\n` +
+          `🏷 Jenis : ${tipe}\n` +
+          `🔢 ID : <code>${src.id}</code>\n\n` +
+          `<i>Salin ID di atas untuk dipakai di /setlogmakro.</i>`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: info, reply_to_message_id: msg.message_id });
         return res.status(200).json({ ok: true });
       }
 
