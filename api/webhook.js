@@ -6097,6 +6097,79 @@ async function restoreFromBackupFile(token, fileId) {
   return { written, exported_at: parsed.exported_at };
 }
 
+// ==========================================
+// PAPAN PERINGKAT SALDO (TANPA MENAMPILKAN JUMLAH SALDO)
+// ==========================================
+const RANK_TOP_N = 10; // jumlah peringkat teratas yang ditampilkan
+const RANK_MAX_USERS = 500; // batas pengguna yang dihitung, supaya tidak berat
+const RANK_CACHE_SEC = 600; // hasil peringkat disimpan 10 menit
+const REDIS_RANK_CACHE_KEY = "lumine_main_rank_cache";
+
+// Urutan uid pembeli dari saldo terbesar. Jumlah saldo tidak disimpan di hasil, hanya urutannya.
+async function getSaldoRanking() {
+  const cached = await redisCommand(["GET", REDIS_RANK_CACHE_KEY]);
+  if (cached) {
+    try {
+      const c = JSON.parse(cached);
+      if (Date.now() - c.ts < RANK_CACHE_SEC * 1000) return c.order;
+    } catch {}
+  }
+
+  const users = ((await redisCommand(["SMEMBERS", REDIS_USERS_KEY])) || [])
+    .map(String)
+    .slice(0, RANK_MAX_USERS);
+  const bannedRaw = (await redisCommand(["HKEYS", REDIS_BLACKLIST_KEY])) || [];
+  const banned = new Set(bannedRaw.map(String));
+
+  const rows = [];
+  for (let i = 0; i < users.length; i += 50) {
+    const chunk = users.slice(i, i + 50).filter((u) => !banned.has(u));
+    const saldos = await Promise.all(chunk.map((u) => getUserSaldo(u)));
+    chunk.forEach((u, j) => {
+      const s = Number(saldos[j]) || 0;
+      if (s > 0) rows.push({ uid: u, s });
+    });
+  }
+  rows.sort((a, b) => b.s - a.s);
+  const order = rows.map((r) => r.uid);
+
+  await redisCommand(["SET", REDIS_RANK_CACHE_KEY, JSON.stringify({ ts: Date.now(), order })]);
+  return order;
+}
+
+// Nama disamarkan: hanya 4 digit terakhir ID yang terlihat
+function maskPeringkatId(uid) {
+  return `Pembeli ****${String(uid).slice(-4)}`;
+}
+
+async function sendPeringkat(token, chatId, uid) {
+  const order = await getSaldoRanking();
+  if (!order.length) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: "🏆 Papan peringkat belum ada. Isi saldo untuk jadi yang pertama!",
+    });
+    return;
+  }
+
+  const medal = ["🥇", "🥈", "🥉"];
+  let text =
+    "🏆 <b>Papan Peringkat Pembeli</b>\n" +
+    "<i>Peringkat berdasarkan saldo. Jumlah saldo tidak ditampilkan.</i>\n\n";
+  order.slice(0, RANK_TOP_N).forEach((u, i) => {
+    const label = medal[i] || `${i + 1}.`;
+    text += `${label} ${maskPeringkatId(u)}${u === String(uid) ? " ← kamu" : ""}\n`;
+  });
+
+  const pos = order.indexOf(String(uid));
+  text +=
+    pos >= 0
+      ? `\n📍 Kamu di peringkat <b>${pos + 1}</b> dari ${order.length} pembeli.`
+      : `\n📍 Isi saldo untuk masuk papan peringkat.`;
+
+  await tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -7183,6 +7256,30 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
           text: "Untuk restore, upload file backup penuh dengan caption <code>/restorefull KONFIRM</code>.\n<i>Ini akan menimpa data bot saat ini.</i>",
         });
+        return res.status(200).json({ ok: true });
+      }
+
+      // PAPAN PERINGKAT (tanpa menampilkan jumlah saldo)
+      if (/^\/peringkat(\s|$)/i.test(rawText) && msg.chat.type === "private") {
+        await sendPeringkat(token, chatId, senderId);
+        return res.status(200).json({ ok: true });
+      }
+
+      // LEADERBOARD SALDO KHUSUS ADMIN (menampilkan jumlah saldo)
+      if (isAdmin && /^\/lbsaldo(\s|$)/i.test(rawText)) {
+        const order = await getSaldoRanking();
+        const top = order.slice(0, RANK_TOP_N);
+        if (!top.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Belum ada pembeli yang punya saldo.", reply_to_message_id: msg.message_id });
+          return res.status(200).json({ ok: true });
+        }
+        const amounts = await Promise.all(top.map((u) => getUserSaldo(u)));
+        let out = "🏦 <b>Leaderboard Saldo (ADMIN)</b>\n<i>Hanya untuk admin, jangan dibagikan.</i>\n\n";
+        top.forEach((u, i) => {
+          out += `${i + 1}. <code>${u}</code> — <code>${formatRupiah(Number(amounts[i]) || 0)}</code>\n`;
+        });
+        out += `\nJumlah pembeli yang punya saldo: <b>${order.length}</b>\n<i>Data diperbarui tiap 10 menit.</i>`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: out, parse_mode: "HTML", reply_to_message_id: msg.message_id });
         return res.status(200).json({ ok: true });
       }
 
