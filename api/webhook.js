@@ -2608,6 +2608,7 @@ async function sendMainMenuCard(token, chatId) {
     ]);
   }
   if (VIP_ENABLED) keyboard.push([{ text: "💎 VIP Semua Set", callback_data: "vip_menu" }]);
+  keyboard.push([{ text: "🧺 Pilih Beberapa Set", callback_data: "pick_menu" }]);
   keyboard.push([{ text: "🔥 Lihat Top Bestseller", callback_data: "menu_bestseller" }]);
   keyboard.push([{ text: "🔙 Menu Utama", callback_data: "menu_home" }]);
 
@@ -3096,6 +3097,330 @@ async function sendTestiReminder(token, userId) {
   });
 }
 
+// ---- MYSTERY BOX SPIN x5 (bayar sekali via saldo, 5 box langsung dibuka) ----
+const MYSTERY_MULTI_COUNT = 5;
+
+async function sendMysteryMulti(token, chatId, userId) {
+  const cfg = await getMysteryConfig();
+  const katalogList = await getKatalog();
+  if (!cfg.enabled || katalogList.length === 0) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Mystery Box sedang tidak tersedia." });
+    return;
+  }
+  const perBox = cfg.price || 3000;
+  const total = perBox * MYSTERY_MULTI_COUNT;
+  const saldo = await getUserSaldo(userId);
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      `🎲 <b>SPIN MYSTERY BOX x${MYSTERY_MULTI_COUNT}</b>\n\n` +
+      `Kamu dapat <b>${MYSTERY_MULTI_COUNT} box</b> sekaligus, tiap box dapat hadiah acak sendiri.\n\n` +
+      `💰 Harga: <code>${formatRupiah(total)}</code> (${formatRupiah(perBox)} × ${MYSTERY_MULTI_COUNT})\n` +
+      `💳 Saldo kamu: <code>${formatRupiah(saldo)}</code>\n` +
+      "<i>Pembayaran lewat saldo. Hadiah masuk ke 🎒 Koleksi Saya.</i>",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `✅ Spin x${MYSTERY_MULTI_COUNT} (${formatRupiah(total)})`, callback_data: "mys5_pay" }],
+        [{ text: "➕ Isi Saldo", callback_data: "menu_saldo" }],
+        [{ text: "🔙 Mystery Box", callback_data: "menu_mystery" }],
+      ],
+    },
+  });
+}
+
+async function payMysteryMulti(token, chatId, from) {
+  const userId = String(from.id);
+  const cfg = await getMysteryConfig();
+  const katalogList = await getKatalog();
+  if (!cfg.enabled || katalogList.length === 0) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Mystery Box sedang tidak tersedia." });
+    return;
+  }
+  const perBox = cfg.price || 3000;
+  const total = perBox * MYSTERY_MULTI_COUNT;
+
+  const deduction = await deductUserSaldo(userId, total);
+  if (!deduction.ok) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text:
+        `⚠️ <b>Saldo Tidak Cukup!</b>\nHarga Spin x${MYSTERY_MULTI_COUNT}: <code>${formatRupiah(total)}</code>\n` +
+        `Saldo kamu: <code>${formatRupiah(deduction.balance)}</code>`,
+      reply_markup: { inline_keyboard: [[{ text: "➕ Isi Saldo Sekarang", callback_data: "menu_saldo" }]] },
+    });
+    return;
+  }
+
+  let done = 0;
+  try {
+    for (let i = 0; i < MYSTERY_MULTI_COUNT; i++) {
+      const order = await createOrder(
+        from,
+        "🎲 Mystery Box Gacha Photopack",
+        perBox,
+        "MYSTERY_GACHA",
+        true,
+        "",
+        {
+          skip_unique: true,
+          paid_with_saldo: true,
+          preset_discount: 0,
+          skip_discount_lookup: true,
+          target_links: [],
+          target_files: [],
+        }
+      );
+      await processAccOrder(token, order);
+      done++;
+    }
+  } catch (err) {
+    // kembalikan saldo untuk box yang belum sempat dibuka
+    const refund = perBox * (MYSTERY_MULTI_COUNT - done);
+    if (refund > 0) await addUserSaldo(userId, refund);
+    console.error("Spin x5 gagal di tengah jalan, saldo dikembalikan:", err);
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `⚠️ Terjadi gangguan. ${done} box sudah dibuka, sisanya ${formatRupiah(refund)} dikembalikan ke saldo.`,
+    });
+    return;
+  }
+
+  const qris = await getQris();
+  if (qris && qris.admin_chat_id) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: qris.admin_chat_id,
+      parse_mode: "HTML",
+      text:
+        `🎲 <b>SPIN MYSTERY x${MYSTERY_MULTI_COUNT} OTOMATIS</b>\n` +
+        `👤 ${escapeHtml(from.first_name || "Pembeli")} (<code>${escapeHtml(userId)}</code>)\n` +
+        `💰 Potong saldo: <code>${formatRupiah(total)}</code>\n` +
+        `💳 Sisa saldo user: <code>${formatRupiah(deduction.balance)}</code>`,
+    });
+  }
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: `🎉 ${MYSTERY_MULTI_COUNT} box sudah dibuka! Cek hadiahnya di atas, dan semuanya tersimpan di 🎒 Koleksi Saya.`,
+  });
+}
+
+// ---- PILIH BEBERAPA SET (centang beberapa set, bayar sekali pakai saldo) ----
+const PICK_MAX_ITEMS = 10; // batas set per pembelian (agar proses tidak timeout)
+const REDIS_PICK_PREFIX = "lumine_main_pick_"; // per user: JSON array id set terpilih
+
+async function getPickSel(userId) {
+  const arr = parseJsonSafe(await redisCommand(["GET", REDIS_PICK_PREFIX + String(userId)]));
+  return Array.isArray(arr) ? arr.map(String) : [];
+}
+
+async function setPickSel(userId, arr) {
+  await redisCommand(["SET", REDIS_PICK_PREFIX + String(userId), JSON.stringify(arr)]);
+}
+
+function getPickableItems(katalogList) {
+  return katalogList.filter((k) => {
+    if (!k || !k.id || !isCategoryEnabled(k)) return false;
+    const hasLinks = (Array.isArray(k.links) && k.links.length > 0) || !!k.link;
+    const hasFiles = Array.isArray(k.files) && k.files.length > 0;
+    return hasLinks || hasFiles;
+  });
+}
+
+async function sendPickPage(token, chatId, userId, page = 0) {
+  const katalogList = await getKatalog();
+  const items = getPickableItems(katalogList);
+  const sel = await getPickSel(userId);
+  if (items.length === 0) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `📂 Belum ada set yang bisa dipilih. Hubungi @${ADMIN_USERNAME} untuk info stok terbaru.`,
+    });
+    return;
+  }
+
+  const selItems = items.filter((k) => sel.includes(String(k.id)));
+  const total = selItems.reduce((sum, k) => sum + parseNominal(k.harga), 0);
+  const totalPages = Math.max(1, Math.ceil(items.length / LUMINE_ITEMS_PER_PAGE));
+  const p = Math.min(Math.max(0, parseInt(page, 10) || 0), totalPages - 1);
+  const slice = items.slice(p * LUMINE_ITEMS_PER_PAGE, (p + 1) * LUMINE_ITEMS_PER_PAGE);
+
+  const rows = slice.map((k) => {
+    const on = sel.includes(String(k.id));
+    return [
+      {
+        text: `${on ? "✅" : "⬜"} ${k.nama} — ${k.harga}`.slice(0, 62),
+        callback_data: `pick_t_${k.id}_${p}`,
+      },
+    ];
+  });
+  const nav = buildLuminePageNav(`pick_p_`, p, totalPages);
+  if (nav) rows.push(nav);
+  if (selItems.length > 0) {
+    rows.push([{ text: `🛒 Lanjut Bayar (${selItems.length} set • ${formatRupiah(total)})`, callback_data: "pick_go" }]);
+    rows.push([{ text: "🗑 Kosongkan Pilihan", callback_data: "pick_clear" }]);
+  }
+  rows.push([{ text: "🔙 Katalog", callback_data: "menu_katalog" }]);
+
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      "🧺 <b>PILIH BEBERAPA SET</b>\n" +
+      "Tap set untuk pilih atau batal. Bisa pilih sampai " +
+      `<b>${PICK_MAX_ITEMS} set</b> sekali bayar.\n\n` +
+      `✅ Terpilih: <b>${selItems.length}</b> set • Total: <code>${formatRupiah(total)}</code>\n` +
+      (totalPages > 1 ? `Hal <b>${p + 1}/${totalPages}</b>` : ""),
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+async function togglePickItem(token, chatId, userId, itemId, page) {
+  const katalogList = await getKatalog();
+  const items = getPickableItems(katalogList);
+  const exists = items.some((k) => String(k.id) === String(itemId));
+  const sendMsg = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+  if (!exists) {
+    await sendMsg("⚠️ Set ini sudah tidak tersedia. Pilihan kamu sudah diperbarui.");
+  } else {
+    let sel = await getPickSel(userId);
+    if (sel.includes(String(itemId))) {
+      sel = sel.filter((x) => x !== String(itemId));
+    } else {
+      if (sel.length >= PICK_MAX_ITEMS) {
+        await sendMsg(`⚠️ Maksimal ${PICK_MAX_ITEMS} set per pembelian. Bayar dulu, lalu pilih lagi.`);
+        return sendPickPage(token, chatId, userId, page);
+      }
+      sel.push(String(itemId));
+    }
+    await setPickSel(userId, sel);
+  }
+  return sendPickPage(token, chatId, userId, page);
+}
+
+async function resolvePickTargets(userId, ids) {
+  const targets = [];
+  for (const id of ids) {
+    const t = await resolvePurchaseTarget(String(id), userId);
+    if (!t || !t.ok) {
+      return { ok: false, error: (t && t.error) || "⚠️ Ada set yang sudah tidak tersedia." };
+    }
+    targets.push(t);
+  }
+  return { ok: true, targets, total: targets.reduce((s, t) => s + (Number(t.baseNominal) || 0), 0) };
+}
+
+async function sendPickConfirm(token, chatId, userId) {
+  const sel = await getPickSel(userId);
+  const sendMsg = (text, markup) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text,
+      ...(markup ? { reply_markup: markup } : {}),
+    });
+  if (sel.length === 0) {
+    return sendMsg("🧺 Kamu belum memilih set.", {
+      inline_keyboard: [[{ text: "🧺 Pilih Set", callback_data: "pick_menu" }]],
+    });
+  }
+  const r = await resolvePickTargets(userId, sel);
+  if (!r.ok) {
+    return sendMsg(`${r.error}\nBuka 🧺 Pilih Set untuk memperbarui pilihan.`, {
+      inline_keyboard: [[{ text: "🧺 Pilih Set", callback_data: "pick_menu" }]],
+    });
+  }
+  const saldo = await getUserSaldo(userId);
+  const list = r.targets.map((t, i) => `${i + 1}. ${escapeHtml(t.itemNama)} — ${formatRupiah(t.baseNominal)}`).join("\n");
+  const kurang = saldo < r.total;
+  return sendMsg(
+    `🛒 <b>KONFIRMASI PEMBELIAN</b>\n\n${list}\n\n` +
+      `💰 Total: <b>${formatRupiah(r.total)}</b>\n` +
+      `💳 Saldo kamu: <code>${formatRupiah(saldo)}</code>\n` +
+      (kurang ? "\n⚠️ Saldo belum cukup." : "\n<i>Pembayaran lewat saldo. Semua set langsung dikirim.</i>"),
+    kurang
+      ? { inline_keyboard: [[{ text: "➕ Isi Saldo Sekarang", callback_data: "menu_saldo" }], [{ text: "🔙 Ubah Pilihan", callback_data: "pick_menu" }]] }
+      : {
+          inline_keyboard: [
+            [{ text: `✅ Bayar ${formatRupiah(r.total)}`, callback_data: "pick_pay" }],
+            [{ text: "🔙 Ubah Pilihan", callback_data: "pick_menu" }],
+          ],
+        }
+  );
+}
+
+async function payPickSelection(token, chatId, from) {
+  const userId = String(from.id);
+  const sel = await getPickSel(userId);
+  if (sel.length === 0) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "🧺 Pilihan kamu kosong. Pilih set dulu ya." });
+    return;
+  }
+  const r = await resolvePickTargets(userId, sel);
+  if (!r.ok) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: `${r.error}\nBuka 🧺 Pilih Set untuk memperbarui pilihan.` });
+    return;
+  }
+
+  const deduction = await deductUserSaldo(userId, r.total);
+  if (!deduction.ok) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text:
+        `⚠️ <b>Saldo Tidak Cukup!</b>\nTotal: <code>${formatRupiah(r.total)}</code>\n` +
+        `Saldo kamu: <code>${formatRupiah(deduction.balance)}</code>`,
+      reply_markup: { inline_keyboard: [[{ text: "➕ Isi Saldo Sekarang", callback_data: "menu_saldo" }]] },
+    });
+    return;
+  }
+
+  let done = 0;
+  let refund = 0;
+  try {
+    for (const t of r.targets) {
+      const order = await createOrder(from, t.itemNama, t.baseNominal, t.targetLink, false, t.itemId, {
+        skip_unique: true,
+        paid_with_saldo: true,
+        preset_discount: 0,
+        skip_discount_lookup: true,
+        target_links: t.targetLinks || [],
+        target_files: t.targetFiles || [],
+        ...(t.extra || {}),
+      });
+      await processAccOrder(token, order);
+      done++;
+    }
+  } catch (err) {
+    refund = r.targets.slice(done).reduce((s, t) => s + (Number(t.baseNominal) || 0), 0);
+    if (refund > 0) await addUserSaldo(userId, refund);
+    console.error("Pilih beberapa set gagal di tengah jalan, sisa saldo dikembalikan:", err);
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `⚠️ Terjadi gangguan. ${done} set sudah dikirim, sisanya ${formatRupiah(refund)} dikembalikan ke saldo.`,
+    });
+    return;
+  }
+
+  await setPickSel(userId, []);
+  const qris = await getQris();
+  if (qris && qris.admin_chat_id) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: qris.admin_chat_id,
+      parse_mode: "HTML",
+      text:
+        `🛒 <b>PILIH BEBERAPA SET OTOMATIS (${done} set)</b>\n` +
+        `👤 ${escapeHtml(from.first_name || "Pembeli")} (<code>${escapeHtml(userId)}</code>)\n` +
+        `💰 Potong saldo: <code>${formatRupiah(r.total)}</code>\n` +
+        `💳 Sisa saldo user: <code>${formatRupiah(deduction.balance)}</code>`,
+    });
+  }
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: `🎉 ${done} set sudah dikirim! Semua tersimpan di 🎒 Koleksi Saya.`,
+  });
+}
+
 async function sendKatalogCreatorMenu(token, chatId) {
   const katalogList = await getKatalog();
   const creatorGroups = getCreatorGroups(katalogList);
@@ -3357,6 +3682,12 @@ async function sendMysteryMenu(token, chatId) {
           {
             text: `🎲 Spin Mystery Box (${formatRupiah(cfg.price)})`,
             callback_data: "buy_mystery",
+          },
+        ],
+        [
+          {
+            text: `🎲 Spin x${MYSTERY_MULTI_COUNT} (${formatRupiah(cfg.price * MYSTERY_MULTI_COUNT)})`,
+            callback_data: "mys5_menu",
           },
         ],
         [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
@@ -7206,7 +7537,7 @@ module.exports = async function handler(req, res) {
 
       // NAVIGASI: menu yang sedang tampil diganti, bukan ditumpuk chat baru.
       // Hanya tombol navigasi yang di-whitelist. Tombol bayar, WD, ACC admin, dan lainnya TIDAK dihapus.
-      const NAV_PREFIXES = ["menu_", "detail_", "lb_", "rhome", "rkat", "rcreator", "rbest", "rcara", "wlr_", "kcat_", "kcr_", "creator_list_"];
+      const NAV_PREFIXES = ["menu_", "detail_", "lb_", "rhome", "rkat", "rcreator", "rbest", "rcara", "wlr_", "kcat_", "kcr_", "creator_list_", "pick_"];
       if (NAV_PREFIXES.some((p) => data && data.startsWith(p))) {
         try {
           await tgRequest(token, "deleteMessage", { chat_id: chatId, message_id: messageId });
@@ -7243,6 +7574,24 @@ module.exports = async function handler(req, res) {
         await buyVipViaSaldo(token, chatId, call.from);
       } else if (data.startsWith("vipget_")) {
         await sendVipGet(token, chatId, call.from, data.replace("vipget_", ""));
+      } else if (data === "pick_menu") {
+        await sendPickPage(token, chatId, callerId, 0);
+      } else if (data.startsWith("pick_p_")) {
+        await sendPickPage(token, chatId, callerId, data.replace("pick_p_", ""));
+      } else if (data.startsWith("pick_t_")) {
+        const m = data.match(/^pick_t_(.+)_(\d+)$/);
+        if (m) await togglePickItem(token, chatId, callerId, m[1], m[2]);
+      } else if (data === "pick_clear") {
+        await setPickSel(callerId, []);
+        await sendPickPage(token, chatId, callerId, 0);
+      } else if (data === "pick_go") {
+        await sendPickConfirm(token, chatId, callerId);
+      } else if (data === "pick_pay") {
+        await payPickSelection(token, chatId, call.from);
+      } else if (data === "mys5_menu") {
+        await sendMysteryMulti(token, chatId, callerId);
+      } else if (data === "mys5_pay") {
+        await payMysteryMulti(token, chatId, call.from);
       } else if (data === "menu_katalog") {
         await sendKatalogMenu(token, chatId);
       } else if (data === "menu_katalog_mini") {
@@ -7906,7 +8255,7 @@ module.exports = async function handler(req, res) {
       const lowerText = rawText.toLowerCase();
 
       // REFERRAL APLIKASI: input ID / nama dari member (perintah / selain /batal diabaikan)
-      if (!isAdmin && rawText && (!rawText.startsWith("/") || /^\/batal$/i.test(rawText))) {
+      if (rawText && (!rawText.startsWith("/") || /^\/batal$/i.test(rawText))) {
         if (await handleApprefText(token, msg, senderId, rawText)) {
           return res.status(200).json({ ok: true });
         }
@@ -9828,7 +10177,7 @@ module.exports = async function handler(req, res) {
       }
 
       // 12A. SCREENSHOT REFERRAL APLIKASI (hanya saat user sedang di langkah 3)
-      if (msg.photo && msg.photo.length > 0 && !isAdmin) {
+      if (msg.photo && msg.photo.length > 0) {
         if (await handleApprefPhoto(token, msg, senderId)) {
           return res.status(200).json({ ok: true });
         }
