@@ -492,7 +492,21 @@ async function saveKatalog(list) {
   } catch {}
   await redisCommand(["SET", REDIS_KEY, JSON.stringify(list)]);
   try {
-    await notifyWishlistChanges(before, list);
+    // Hanya set yang muncul/hilang/berubah nama-harganya yang perlu dicek wishlist.
+    // Sebelumnya semua set dicek (1 round trip Redis per set), bikin perintah seperti /setcreator lambat.
+    const oldMap = new Map(before.map((i) => [String(i.id), i]));
+    const newMap = new Map(list.map((i) => [String(i.id), i]));
+    const changedIds = new Set();
+    for (const id of new Set([...oldMap.keys(), ...newMap.keys()])) {
+      const a = oldMap.get(id);
+      const b = newMap.get(id);
+      if (!a || !b || a.nama !== b.nama || a.harga !== b.harga) changedIds.add(id);
+    }
+    if (changedIds.size > 0) {
+      const beforeChanged = before.filter((i) => changedIds.has(String(i.id)));
+      const afterChanged = list.filter((i) => changedIds.has(String(i.id)));
+      await notifyWishlistChanges(beforeChanged, afterChanged);
+    }
   } catch (e) {
     console.error("Notif wishlist gagal:", e);
   }
