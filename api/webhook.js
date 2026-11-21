@@ -9303,6 +9303,69 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 0G. ADMIN: /users (ringkasan member) dan /user ID (data satu member)
+      if (/^\/users$/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const [totalUsers, buyers, vipCount, resellerCount, saldoVals, undianKey] = await Promise.all([
+          redisCommand(["SCARD", REDIS_USERS_KEY]),
+          redisCommand(["HLEN", REDIS_LB_ALLCNT_KEY]),
+          redisCommand(["HLEN", REDIS_VIP_KEY]),
+          redisCommand(["HLEN", REDIS_RESELLER_KEY]),
+          redisCommand(["HVALS", REDIS_SALDO_KEY]),
+          Promise.resolve(getUndianNextKey()),
+        ]);
+        const totalSaldo = (Array.isArray(saldoVals) ? saldoVals : []).reduce((s, v) => s + (parseInt(v, 10) || 0), 0);
+        const pemegangSaldo = (Array.isArray(saldoVals) ? saldoVals : []).filter((v) => (parseInt(v, 10) || 0) > 0).length;
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            "👥 <b>RINGKASAN MEMBER</b>\n\n" +
+            `• Total member (pernah chat bot): <b>${totalUsers || 0}</b>\n` +
+            `• Pernah beli: <b>${buyers || 0}</b>\n` +
+            `• VIP: <b>${vipCount || 0}</b>\n` +
+            `• Reseller: <b>${resellerCount || 0}</b>\n` +
+            `• Punya saldo: <b>${pemegangSaldo}</b> member\n` +
+            `• Total saldo member: <code>${formatRupiah(totalSaldo)}</code>\n` +
+            `• Undian ${formatUndianDate(undianKey)}\n\n` +
+            "<i>Cek satu member: /user ID_TELEGRAM</i>",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      if (/^\/user\s+\d+$/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const uid = rawText.replace(/^\/user\s+/i, "").trim();
+        const [saldo, buyCount, koleksi, vipDate, reseller, banned, tiket] = await Promise.all([
+          getUserSaldo(uid),
+          redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, uid]),
+          getKoleksi(uid),
+          redisCommand(["HGET", REDIS_VIP_KEY, uid]),
+          isReseller(uid),
+          isBanned(uid),
+          redisCommand(["HGET", REDIS_UNDIAN_TIX_PREFIX + getUndianNextKey(), uid]),
+        ]);
+        const koleksiList = Array.isArray(koleksi) ? koleksi : [];
+        const lastItems = koleksiList.slice(-3).reverse().map((k) => `  • ${escapeHtml(k.nama)} (${escapeHtml(k.date || "-")})`).join("\n");
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `👤 <b>DATA MEMBER</b>\n` +
+            `🆔 <code>${escapeHtml(uid)}</code>\n\n` +
+            `💳 Saldo: <code>${formatRupiah(saldo)}</code>\n` +
+            `🛒 Total pembelian: <b>${Number(buyCount) || 0}</b>\n` +
+            `🎒 Koleksi tersimpan: <b>${koleksiList.length}</b> set\n` +
+            (lastItems ? `${lastItems}\n` : "") +
+            `💎 VIP: ${vipDate ? `✅ sejak ${escapeHtml(String(vipDate).slice(0, 10))}` : "❌ belum"}\n` +
+            `🤝 Reseller: ${reseller ? "✅ ya" : "❌ tidak"}\n` +
+            `🎟 Tiket undian minggu ini: <b>${Number(tiket) || 0}</b>\n` +
+            `🚫 Diblokir: ${banned ? "✅ ya" : "❌ tidak"}\n\n` +
+            "<i>Nama Telegram belum tersimpan, jadi yang ditampilkan cuma ID.</i>",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 0E. ADMIN: /undian (status undian minggu ini & hasil terakhir)
       if (/^\/undian$/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
