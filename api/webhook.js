@@ -1403,6 +1403,7 @@ async function sendUpsellOffer(token, order, ctx) {
   const candidates = (ctx.katalogList || [])
     .filter((k) => {
       if (!k || !k.id || String(k.id) === String(ctx.boughtItemId)) return false;
+      if (!isCategoryEnabled(k)) return false;
       if (ownedNames.has(k.nama)) return false;
       const hasLinks = (Array.isArray(k.links) && k.links.length > 0) || Boolean(k.link);
       const hasFiles = Array.isArray(k.files) && k.files.length > 0;
@@ -1601,6 +1602,11 @@ async function processAccOrder(token, order) {
     if (!order.is_deposit) await recordLastBuy(order.buyer_id);
   } catch (lbErr) {
     console.error("Catat pembelian terakhir error:", lbErr);
+  }
+  try {
+    await maybeRewardShare(token, order);
+  } catch (shErr) {
+    console.error("Bonus berbagi error:", shErr);
   }
   try {
     await maybeRewardMitra(token, order);
@@ -2568,10 +2574,10 @@ async function sendMainMenuCard(token, chatId) {
 
   const miniCount = katalogList.filter((k) => (k.kategori || "mini") !== "full").length;
   const fullCount = katalogList.filter((k) => k.kategori === "full").length;
-  const creatorGroups = getCreatorGroups(katalogList);
+  const creatorGroups = getCreatorGroups(katalogList.filter(isCategoryEnabled));
 
   const keyboard = [
-    [{ text: `🧩 Mini Set (${miniCount})`, callback_data: "menu_katalog_mini" }],
+    ...(MINI_SET_ENABLED ? [[{ text: `🧩 Mini Set (${miniCount})`, callback_data: "menu_katalog_mini" }]] : []),
     [{ text: `📦 Full Set (${fullCount})`, callback_data: "menu_katalog_full" }],
   ];
   if (creatorGroups.length > 0) {
@@ -2693,7 +2699,7 @@ async function sendKatalogListByCreator(token, chatId, creatorIdx) {
 
 async function sendKatalogListByCategory(token, chatId, kategori) {
   const katalogList = await getKatalog();
-  const filtered = katalogList.filter((item) => (item.kategori || "mini") === kategori);
+  const filtered = katalogList.filter((item) => (item.kategori || "mini") === kategori && isCategoryEnabled(item));
 
   if (filtered.length === 0) {
     await tgRequest(token, "sendMessage", {
@@ -3904,7 +3910,7 @@ async function sendRbCatalog(ctx, chatId, messageId) {
   const creatorGroups = getCreatorGroups(items);
 
   const kb = [
-    [{ text: `🧩 Mini Set (${miniCount})`, callback_data: "rcat_mini_0" }],
+    ...(MINI_SET_ENABLED ? [[{ text: `🧩 Mini Set (${miniCount})`, callback_data: "rcat_mini_0" }]] : []),
     [{ text: `📦 Full Set (${fullCount})`, callback_data: "rcat_full_0" }],
   ];
   if (creatorGroups.length > 0) {
@@ -4015,7 +4021,7 @@ async function sendRbCreatorList(ctx, chatId, creatorIdx, page, messageId) {
 async function sendRbCategoryList(ctx, chatId, kategori, page, messageId) {
   const { items } = await getResellerBotItems(ctx.ownerId, ctx.rb);
   const kat = kategori === "full" ? "full" : "mini";
-  const filtered = items.filter((x) => (kat === "full" ? x.kategori === "full" : x.kategori !== "full"));
+  const filtered = items.filter((x) => (kat === "full" ? x.kategori === "full" : x.kategori !== "full") && isCategoryEnabled(x));
 
   if (filtered.length === 0) {
     await rbEditOrSend(ctx, chatId, messageId, "📂 Belum ada produk di kategori ini. Coba kategori lain ya 🙏", {
@@ -6170,6 +6176,79 @@ async function sendPeringkat(token, chatId, uid) {
   await tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
 }
 
+// ==========================================
+// BAGIKAN SET: PEMBELI BERBAGI LINK SET, TEMAN BELI PERTAMA KALI, PEMBAGI DAPAT SALDO
+// ==========================================
+const SHARE_ENABLED = true;
+const SHARE_REWARD_SALDO = 500; // bonus saldo untuk pembagi (hanya bisa dipakai belanja di toko)
+const SHARE_WINDOW_DAYS = 7; // teman harus beli dalam jangka waktu ini setelah masuk lewat link
+const REDIS_SHARE_REF_KEY = "lumine_main_share_ref"; // hash: id pembeli baru -> JSON {sharer, item, ts}
+const REDIS_SHARE_PAID_KEY = "lumine_main_share_paid"; // hash: id pembeli -> 1 (bonus hanya sekali)
+let BOT_USERNAME_CACHE = null;
+
+async function getBotUsername(token) {
+  if (BOT_USERNAME_CACHE) return BOT_USERNAME_CACHE;
+  const me = await tgRequest(token, "getMe", {});
+  BOT_USERNAME_CACHE = (me && me.result && me.result.username) || "";
+  return BOT_USERNAME_CACHE;
+}
+
+function buildShareUrl(uname, sharerId, itemId, nama) {
+  const link = `https://t.me/${uname}?start=s_${sharerId}_${itemId}`;
+  const text = `Cek ${nama} di Lumine Photopack 🛍️`;
+  return `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(text)}`;
+}
+
+// Dipanggil saat pembeli baru masuk lewat link bagikan (/start s_PEMBAGI_ITEM)
+async function recordShareReferral(buyerId, sharerId, itemId, isNewUser) {
+  if (!SHARE_ENABLED || !isNewUser) return;
+  if (String(sharerId) === String(buyerId)) return;
+  await redisCommand([
+    "HSETNX",
+    REDIS_SHARE_REF_KEY,
+    String(buyerId),
+    JSON.stringify({ sharer: String(sharerId), item: String(itemId), ts: Date.now() }),
+  ]);
+}
+
+// Dipanggil setelah order di-ACC: bonus untuk pembagi saat teman pertama kali beli set yang dibagikan
+async function maybeRewardShare(token, order) {
+  if (!SHARE_ENABLED || !order || order.is_deposit || order.rbot_owner || order.paid_with_saldo) return;
+  const buyerId = String(order.buyer_id);
+  const raw = await redisCommand(["HGET", REDIS_SHARE_REF_KEY, buyerId]);
+  if (!raw) return;
+
+  let ref;
+  try {
+    ref = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (String(ref.item) !== String(order.item_id)) return;
+  if (Date.now() - Number(ref.ts) > SHARE_WINDOW_DAYS * 86400000) return;
+
+  const first = await redisCommand(["HSETNX", REDIS_SHARE_PAID_KEY, buyerId, "1"]);
+  if (Number(first) !== 1) return;
+
+  await addUserSaldo(ref.sharer, SHARE_REWARD_SALDO);
+  await tgRequest(token, "sendMessage", {
+    chat_id: ref.sharer,
+    parse_mode: "HTML",
+    text:
+      `🎁 <b>Bonus berbagi!</b>\n\n` +
+      `Temanmu baru saja membeli set yang kamu bagikan. Saldo ` +
+      `<code>+${formatRupiah(SHARE_REWARD_SALDO)}</code> sudah masuk ke akunmu. Terus bagikan ya! 💜`,
+  });
+}
+
+// ==========================================
+// SAKLAR KATEGORI: MINI SET DINONAKTIFKAN (data lama tetap tersimpan, hanya disembunyikan)
+// ==========================================
+const MINI_SET_ENABLED = false;
+function isCategoryEnabled(item) {
+  return MINI_SET_ENABLED || (item.kategori || "mini") === "full";
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -6594,6 +6673,12 @@ module.exports = async function handler(req, res) {
         };
 
         inlineMarkup.inline_keyboard.splice(1, 0, wlRowMarkup);
+        const botUname = await getBotUsername(token);
+        if (botUname && /^[A-Za-z0-9_-]{1,30}$/.test(String(item.id))) {
+          inlineMarkup.inline_keyboard.splice(2, 0, [
+            { text: "📤 Bagikan Set", url: buildShareUrl(botUname, callerId, item.id, item.nama) },
+          ]);
+        }
 
         if (item.photo_id) {
           await tgRequest(token, "sendPhoto", {
@@ -8460,8 +8545,8 @@ module.exports = async function handler(req, res) {
             .map((s) => s.trim())
             .filter(Boolean)
             .map(normalizeUrl);
-          const kategoriRaw = (parts[4] || "mini").toLowerCase();
-          const kategori = kategoriRaw.includes("full") ? "full" : "mini";
+          const kategoriRaw = (parts[4] || "full").toLowerCase();
+          const kategori = kategoriRaw.includes("mini") && MINI_SET_ENABLED ? "mini" : "full";
           const creator = (parts[5] || "").replace(/\s+/g, " ").trim().slice(0, 60);
 
           const newItem = {
@@ -8840,6 +8925,14 @@ module.exports = async function handler(req, res) {
           }
         }
 
+        const startShareMatch = /^\/start\s+s_(\d{5,15})_([A-Za-z0-9_-]{1,30})$/i.exec(text);
+        if (startShareMatch) {
+          try {
+            await recordShareReferral(senderId, startShareMatch[1], startShareMatch[2], isNewUser);
+          } catch (shareRecErr) {
+            console.error("Share record error:", shareRecErr);
+          }
+        }
         const startMitraMatch = /^\/start\s+m_([a-z0-9]{3,16})$/i.exec(text);
         if (startMitraMatch) {
           try {
@@ -8849,7 +8942,7 @@ module.exports = async function handler(req, res) {
           }
         }
 
-        if (text === "/start" || startRefMatch || startMitraMatch) {
+        if (text === "/start" || startRefMatch || startMitraMatch || startShareMatch) {
           const buyerName = escapeHtml((msg.from && msg.from.first_name) || "Kak");
           let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.\n🆔 ID kamu: <code>${senderId}</code>`;
 
