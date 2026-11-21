@@ -1630,6 +1630,11 @@ async function processAccOrder(token, order) {
   } catch (mitraErr) {
     console.error("Mitra reward error:", mitraErr);
   }
+  try {
+    await sendTestiReminder(token, order.buyer_id);
+  } catch (tiErr) {
+    console.error("Pengingat testimoni error:", tiErr);
+  }
   return result;
 }
 
@@ -2797,6 +2802,300 @@ async function sendVipGet(token, chatId, from, itemId) {
   });
 }
 
+// ---- REFERRAL APLIKASI (member kirim ID + nama profil + screenshot, admin ACC, saldo masuk) ----
+const APPREF_ENABLED = true;
+const APPREF_REWARD = 5000; // hadiah per akun yang di-ACC (Rp)
+const APPREF_DAILY_CAP = 5; // maksimal klaim ter-ACC per member per hari (WIB)
+const APPREF_DEFAULT_NAME = "Aplikasi Referral";
+const APPREF_DEFAULT_LINK = "https://GANTI-LINK-REFERRAL";
+const REDIS_APPREF_CFG_KEY = "lumine_main_appref_cfg"; // JSON: { name, link, enabled } hasil /setappref
+const REDIS_APPREF_STATE_KEY = "lumine_main_appref_state"; // hash: id user -> JSON { step, appId, name }
+const REDIS_APPREF_REQ_KEY = "lumine_main_appref_req"; // hash: id klaim -> JSON data klaim
+const REDIS_APPREF_SEQ_KEY = "lumine_main_appref_seq";
+const REDIS_APPREF_IDS_KEY = "lumine_main_appref_ids"; // hash: ID aplikasi -> id klaim (anti pakai ulang)
+const REDIS_APPREF_DAILY_PREFIX = "lumine_main_appref_day_"; // hash per hari (WIB): id user -> jumlah ACC
+
+function getApprefDayKey() {
+  return new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+function parseJsonSafe(raw) {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function getApprefCfg() {
+  const cfg = { name: APPREF_DEFAULT_NAME, link: APPREF_DEFAULT_LINK, enabled: true };
+  const saved = parseJsonSafe(await redisCommand(["GET", REDIS_APPREF_CFG_KEY]));
+  if (saved) Object.assign(cfg, saved);
+  return cfg;
+}
+
+function isUsableLink(link) {
+  return /^https?:\/\/\S+\.\S+/.test(String(link || "")) && !String(link).includes("GANTI");
+}
+
+async function getApprefDailyUsed(userId) {
+  return Number(await redisCommand(["HGET", REDIS_APPREF_DAILY_PREFIX + getApprefDayKey(), String(userId)])) || 0;
+}
+
+async function sendApprefInfo(token, chatId, userId) {
+  const cfg = await getApprefCfg();
+  const sendMsg = (text, markup) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text,
+      parse_mode: "HTML",
+      ...(markup ? { reply_markup: markup } : {}),
+    });
+  const backBtn = [[{ text: "🔙 Menu Lainnya", callback_data: "menu_lainnya" }]];
+  if (!APPREF_ENABLED || !cfg.enabled) {
+    return sendMsg("⚠️ Referral aplikasi sedang tidak aktif.", { inline_keyboard: backBtn });
+  }
+  const used = await getApprefDailyUsed(userId);
+  const btns = [];
+  if (isUsableLink(cfg.link)) btns.push([{ text: "🔗 Download & Daftar", url: cfg.link }]);
+  btns.push([{ text: "📝 Kirim Bukti Referral", callback_data: "appref_start" }]);
+  btns.push(...backBtn);
+  return sendMsg(
+    `📱 <b>REFERRAL ${escapeHtml(cfg.name.toUpperCase())}</b>\n\n` +
+      "1️⃣ Download dan daftar lewat tombol di bawah.\n" +
+      "2️⃣ Buka <b>profil</b> di aplikasi, lalu salin <b>ID</b>-mu.\n" +
+      "3️⃣ Tekan <b>Kirim Bukti Referral</b>, isi ID, nama profil, dan screenshot.\n\n" +
+      `💰 Hadiah: <b>${formatRupiah(APPREF_REWARD)}</b> per akun yang di-ACC, masuk ke saldo.\n` +
+      `📊 Klaim di-ACC hari ini: ${used}/${APPREF_DAILY_CAP}\n` +
+      "<i>Bukti dicek admin. ID dan nama profil di bukti harus sama dengan yang kamu isi.</i>",
+    { inline_keyboard: btns }
+  );
+}
+
+async function startApprefClaim(token, chatId, userId) {
+  const cfg = await getApprefCfg();
+  const sendMsg = (text) => tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+  if (!APPREF_ENABLED || !cfg.enabled) return sendMsg("⚠️ Referral aplikasi sedang tidak aktif.");
+  const used = await getApprefDailyUsed(userId);
+  if (used >= APPREF_DAILY_CAP) {
+    return sendMsg(`⏳ Batas klaim hari ini (${APPREF_DAILY_CAP}) sudah tercapai. Coba lagi besok ya.`);
+  }
+  await redisCommand(["HSET", REDIS_APPREF_STATE_KEY, String(userId), JSON.stringify({ step: "id" })]);
+  return sendMsg(
+    "📝 <b>Langkah 1/3</b>\nKirim <b>ID</b> profil kamu di aplikasi (salin dari halaman profil, lalu paste ke sini).\n" +
+      "<i>Ketik /batal untuk membatalkan.</i>"
+  );
+}
+
+// Dipanggil untuk pesan teks member. Return true kalau pesan ini bagian dari alur referral.
+async function handleApprefText(token, msg, userId, text) {
+  const chatId = msg.chat.id;
+  const uid = String(userId);
+  const st = parseJsonSafe(await redisCommand(["HGET", REDIS_APPREF_STATE_KEY, uid]));
+  if (!st) return false;
+  const sendMsg = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+  const input = String(text || "").trim();
+
+  if (/^\/batal$/i.test(input)) {
+    await redisCommand(["HDEL", REDIS_APPREF_STATE_KEY, uid]);
+    await sendMsg("❌ Klaim referral dibatalkan.");
+    return true;
+  }
+
+  if (st.step === "id") {
+    if (!/^[A-Za-z0-9_-]{3,40}$/.test(input)) {
+      await sendMsg("⚠️ ID tidak valid. Salin ulang ID dari profil (tanpa spasi), atau ketik /batal.");
+      return true;
+    }
+    if (Number(await redisCommand(["HEXISTS", REDIS_APPREF_IDS_KEY, input])) === 1) {
+      await redisCommand(["HDEL", REDIS_APPREF_STATE_KEY, uid]);
+      await sendMsg("⚠️ ID ini sudah pernah diklaim, jadi tidak bisa dipakai lagi.");
+      return true;
+    }
+    await redisCommand(["HSET", REDIS_APPREF_STATE_KEY, uid, JSON.stringify({ step: "name", appId: input })]);
+    await sendMsg("📝 <b>Langkah 2/3</b>\nKirim <b>nama profil</b> kamu persis seperti di aplikasi.");
+    return true;
+  }
+
+  if (st.step === "name") {
+    const nm = input.replace(/\s+/g, " ").slice(0, 40);
+    if (!nm) {
+      await sendMsg("⚠️ Nama profil tidak boleh kosong. Kirim ulang namanya.");
+      return true;
+    }
+    await redisCommand([
+      "HSET",
+      REDIS_APPREF_STATE_KEY,
+      uid,
+      JSON.stringify({ step: "shot", appId: st.appId, name: nm }),
+    ]);
+    await sendMsg(
+      "📸 <b>Langkah 3/3</b>\nKirim <b>screenshot</b> halaman profil yang memperlihatkan ID dan nama profil. Kirim sebagai <b>foto</b>."
+    );
+    return true;
+  }
+
+  await sendMsg("📸 Kirim <b>foto screenshot</b> profilmu, bukan teks. Atau ketik /batal.");
+  return true;
+}
+
+// Dipanggil untuk foto dari member. Return true kalau foto ini bagian dari alur referral.
+async function handleApprefPhoto(token, msg, userId) {
+  const chatId = msg.chat.id;
+  const uid = String(userId);
+  const st = parseJsonSafe(await redisCommand(["HGET", REDIS_APPREF_STATE_KEY, uid]));
+  if (!st || st.step !== "shot") return false;
+  const sendMsg = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+
+  if ((await getApprefDailyUsed(uid)) >= APPREF_DAILY_CAP) {
+    await redisCommand(["HDEL", REDIS_APPREF_STATE_KEY, uid]);
+    await sendMsg(`⏳ Batas klaim hari ini (${APPREF_DAILY_CAP}) sudah tercapai. Coba lagi besok ya.`);
+    return true;
+  }
+  if (Number(await redisCommand(["HEXISTS", REDIS_APPREF_IDS_KEY, st.appId])) === 1) {
+    await redisCommand(["HDEL", REDIS_APPREF_STATE_KEY, uid]);
+    await sendMsg("⚠️ ID ini sudah pernah diklaim, jadi tidak bisa dipakai lagi.");
+    return true;
+  }
+
+  const fileId = msg.photo[msg.photo.length - 1].file_id;
+  const reqId = String(await redisCommand(["INCR", REDIS_APPREF_SEQ_KEY]));
+  const tgName = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ") || "Pembeli";
+  const username = (msg.from && msg.from.username) || "";
+  const data = {
+    id: reqId,
+    user_id: uid,
+    app_id: st.appId,
+    profile_name: st.name,
+    tg_name: tgName,
+    username,
+    status: "pending",
+    created: getWibTimestamp(),
+  };
+  await redisCommand(["HSET", REDIS_APPREF_REQ_KEY, reqId, JSON.stringify(data)]);
+  await redisCommand(["HSET", REDIS_APPREF_IDS_KEY, st.appId, reqId]);
+  await redisCommand(["HDEL", REDIS_APPREF_STATE_KEY, uid]);
+
+  const cfg = await getApprefCfg();
+  const qris = await getQris();
+  const adminChat = qris && qris.admin_chat_id;
+  if (adminChat) {
+    await tgRequest(token, "sendPhoto", {
+      chat_id: adminChat,
+      photo: fileId,
+      caption:
+        `📱 <b>KLAIM REFERRAL #${reqId}</b>\n` +
+        `🧩 Aplikasi: ${escapeHtml(cfg.name)}\n` +
+        `🆔 ID aplikasi: <code>${escapeHtml(st.appId)}</code>\n` +
+        `🧾 Nama profil: <b>${escapeHtml(st.name)}</b>\n` +
+        `👤 Telegram: ${escapeHtml(tgName)}${username ? ` (@${escapeHtml(username)})` : ""}\n` +
+        `🆔 Telegram ID: <code>${escapeHtml(uid)}</code>\n` +
+        `💰 Hadiah: <b>${formatRupiah(APPREF_REWARD)}</b>\n` +
+        "<i>Cocokkan ID dan nama dengan referral di aplikasi sebelum ACC.</i>",
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ ACC", callback_data: `apprefacc_${reqId}` },
+            { text: "❌ Tolak", callback_data: `apprefrej_${reqId}` },
+          ],
+        ],
+      },
+    });
+  } else {
+    console.error("Referral aplikasi: admin_chat_id belum diset, bukti tidak terkirim ke admin.");
+  }
+
+  await sendMsg("📨 Bukti referral kamu sudah dikirim. Admin akan mengecek, dan saldo masuk setelah di-ACC.");
+  return true;
+}
+
+async function processApprefReview(token, chatId, reqId, isAcc) {
+  const req = parseJsonSafe(await redisCommand(["HGET", REDIS_APPREF_REQ_KEY, String(reqId)]));
+  const sendAdmin = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+  if (!req || req.status !== "pending") {
+    await sendAdmin(`⚠️ Klaim referral #${escapeHtml(String(reqId))} tidak ditemukan atau sudah diproses.`);
+    return;
+  }
+  const uid = req.user_id;
+
+  if (!isAcc) {
+    req.status = "rejected";
+    await redisCommand(["HSET", REDIS_APPREF_REQ_KEY, String(reqId), JSON.stringify(req)]);
+    // lepas ID supaya bisa dicoba ulang dengan bukti yang benar
+    if (String(await redisCommand(["HGET", REDIS_APPREF_IDS_KEY, req.app_id])) === String(reqId)) {
+      await redisCommand(["HDEL", REDIS_APPREF_IDS_KEY, req.app_id]);
+    }
+    await sendAdmin(`❌ Klaim referral #${reqId} ditolak.`);
+    await tgRequest(token, "sendMessage", {
+      chat_id: uid,
+      parse_mode: "HTML",
+      text:
+        "❌ Bukti referral kamu ditolak.\nPastikan ID dan nama profil terlihat jelas di screenshot dan sesuai dengan yang kamu isi, lalu coba lagi.",
+    });
+    return;
+  }
+
+  const fundId = await getReferralFundId();
+  if (!fundId) {
+    await sendAdmin("⚠️ Kas admin belum diset, klaim belum bisa di-ACC.");
+    return;
+  }
+  const dayKey = REDIS_APPREF_DAILY_PREFIX + getApprefDayKey();
+  if ((Number(await redisCommand(["HGET", dayKey, uid])) || 0) >= APPREF_DAILY_CAP) {
+    await sendAdmin(`⏳ Member ini sudah mencapai batas ${APPREF_DAILY_CAP} klaim hari ini. ACC ditunda.`);
+    return;
+  }
+
+  const d = await deductUserSaldo(fundId, APPREF_REWARD);
+  if (!d.ok) {
+    await sendAdmin(
+      `⚠️ <b>Saldo kas tidak cukup untuk ACC klaim #${reqId}.</b>\n` +
+        `💳 Saldo kas: <b>${formatRupiah(d.balance)}</b>\n` +
+        `Isi ulang: <code>/addsaldo ${escapeHtml(fundId)} NOMINAL</code>, lalu tekan ACC lagi.`
+    );
+    return;
+  }
+
+  let newSaldo;
+  try {
+    newSaldo = await addUserSaldo(uid, APPREF_REWARD);
+  } catch (addErr) {
+    await addUserSaldo(fundId, APPREF_REWARD);
+    throw addErr;
+  }
+
+  req.status = "acc";
+  await redisCommand(["HSET", REDIS_APPREF_REQ_KEY, String(reqId), JSON.stringify(req)]);
+  await redisCommand(["HINCRBY", dayKey, uid, 1]);
+
+  await sendAdmin(`✅ Klaim referral #${reqId} di-ACC. Saldo ${formatRupiah(APPREF_REWARD)} masuk ke member.`);
+  await tgRequest(token, "sendMessage", {
+    chat_id: uid,
+    parse_mode: "HTML",
+    text:
+      `🎉 <b>Referral kamu di-ACC!</b>\n` +
+      `💰 Saldo masuk: <b>+${formatRupiah(APPREF_REWARD)}</b>\n` +
+      `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>\n\n` +
+      "<i>Saldo ini hanya bisa dipakai belanja di bot.</i>",
+  });
+}
+
+// Pengingat cek channel testimoni setelah pembelian berhasil
+async function sendTestiReminder(token, userId) {
+  const testi = await getTestiConfig();
+  if (!testi || !testi.channel_username) return;
+  await tgRequest(token, "sendMessage", {
+    chat_id: userId,
+    parse_mode: "HTML",
+    text: "🙏 Terima kasih sudah belanja! Cek channel testimoni kami untuk lihat pengalaman member lain.",
+    reply_markup: {
+      inline_keyboard: [[{ text: "🧾 Cek Channel Testimoni", url: `https://t.me/${testi.channel_username}` }]],
+    },
+  });
+}
+
 async function sendKatalogCreatorMenu(token, chatId) {
   const katalogList = await getKatalog();
   const creatorGroups = getCreatorGroups(katalogList);
@@ -3270,6 +3569,7 @@ async function sendMoreMenu(token, chatId) {
           { text: "🤝 Reseller", callback_data: "menu_reseller" },
           { text: "📋 Cara Order", callback_data: "menu_cara" },
         ],
+        [{ text: "📱 Referral Aplikasi", callback_data: "menu_appref" }],
         [
           { text: "🔗 Channel Resmi", callback_data: "menu_channel" },
           { text: `💬 Admin`, url: `https://t.me/${ADMIN_USERNAME}` },
@@ -7430,6 +7730,14 @@ module.exports = async function handler(req, res) {
             parse_mode: "HTML",
           });
         }
+      } else if (data === "menu_appref") {
+        await sendApprefInfo(token, chatId, callerId);
+      } else if (data === "appref_start") {
+        await startApprefClaim(token, chatId, callerId);
+      } else if (data.startsWith("apprefacc_") || data.startsWith("apprefrej_")) {
+        if (!isCallerAdmin) return res.status(200).json({ ok: true });
+        const isAccA = data.startsWith("apprefacc_");
+        await processApprefReview(token, chatId, data.replace(isAccA ? "apprefacc_" : "apprefrej_", ""), isAccA);
       } else if (data.startsWith("subacc_") || data.startsWith("subrej_")) {
         if (!isCallerAdmin) return res.status(200).json({ ok: true });
         const isAccSub = data.startsWith("subacc_");
@@ -7596,6 +7904,13 @@ module.exports = async function handler(req, res) {
 
       const rawText = (msg.text || msg.caption || "").trim();
       const lowerText = rawText.toLowerCase();
+
+      // REFERRAL APLIKASI: input ID / nama dari member (perintah / selain /batal diabaikan)
+      if (!isAdmin && rawText && (!rawText.startsWith("/") || /^\/batal$/i.test(rawText))) {
+        if (await handleApprefText(token, msg, senderId, rawText)) {
+          return res.status(200).json({ ok: true });
+        }
+      }
 
       // RATING: TANGKAP KOMENTAR SETELAH PILIH BINTANG
       if (msg.text && !rawText.startsWith("/")) {
@@ -8327,6 +8642,44 @@ module.exports = async function handler(req, res) {
           text: `✅ Jumlah terjual <b>${escapeHtml(katalogList[idx].nama)}</b> diatur ke <b>${newSold}x</b>!`,
           parse_mode: "HTML",
         });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0D. ADMIN: /setappref (NAMA & LINK REFERRAL APLIKASI)
+      if (/^\/setappref(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/setappref\s*/i, "").trim();
+        const cur = await getApprefCfg();
+        const sendAdm = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+        if (!arg) {
+          await sendAdm(
+            `📱 <b>REFERRAL APLIKASI</b>\n` +
+              `Status: ${cur.enabled ? "✅ aktif" : "⏸ nonaktif"}\n` +
+              `Nama: <b>${escapeHtml(cur.name)}</b>\n` +
+              `Link: ${escapeHtml(cur.link)}\n\n` +
+              "Atur: <code>/setappref NAMA | LINK</code>\n" +
+              "Matikan / nyalakan: <code>/setappref off</code> | <code>/setappref on</code>"
+          );
+          return res.status(200).json({ ok: true });
+        }
+        if (/^(on|off)$/i.test(arg)) {
+          cur.enabled = arg.toLowerCase() === "on";
+          await redisCommand(["SET", REDIS_APPREF_CFG_KEY, JSON.stringify(cur)]);
+          await sendAdm(`✅ Referral aplikasi ${cur.enabled ? "diaktifkan" : "dinonaktifkan"}.`);
+          return res.status(200).json({ ok: true });
+        }
+        const parts = arg.split("|").map((s) => s.trim());
+        if (parts.length < 2 || !isUsableLink(parts[1])) {
+          await sendAdm(
+            "⚠️ Format: <code>/setappref NAMA | LINK</code>\n" +
+              "<i>Contoh: /setappref Aplikasi X | https://link-referral-kamu</i>"
+          );
+          return res.status(200).json({ ok: true });
+        }
+        cur.name = parts[0].slice(0, 40) || APPREF_DEFAULT_NAME;
+        cur.link = parts[1];
+        await redisCommand(["SET", REDIS_APPREF_CFG_KEY, JSON.stringify(cur)]);
+        await sendAdm(`✅ Referral aplikasi disimpan.\nNama: <b>${escapeHtml(cur.name)}</b>\nLink: ${escapeHtml(cur.link)}`);
         return res.status(200).json({ ok: true });
       }
 
@@ -9472,6 +9825,13 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
+      }
+
+      // 12A. SCREENSHOT REFERRAL APLIKASI (hanya saat user sedang di langkah 3)
+      if (msg.photo && msg.photo.length > 0 && !isAdmin) {
+        if (await handleApprefPhoto(token, msg, senderId)) {
+          return res.status(200).json({ ok: true });
+        }
       }
 
       // 12B. BUKTI SUBSCRIBE UNTUK KLAIM SALDO (hanya saat user sedang menunggu)
