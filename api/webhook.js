@@ -1698,7 +1698,7 @@ async function processAccOrder(token, order) {
     console.error("Mitra reward error:", mitraErr);
   }
   try {
-    await addUndianTickets(order);
+    await addUndianTickets(token, order);
   } catch (utErr) {
     console.error("Tiket undian error:", utErr);
   }
@@ -3561,11 +3561,20 @@ function formatUndianDate(key) {
   return `Minggu, ${dd}/${m}/${y} • 20:00 WIB`;
 }
 
-async function addUndianTickets(order) {
+async function addUndianTickets(token, order) {
   if (!UNDIAN_ENABLED || !order || !order.buyer_id) return;
   const n = Math.floor((Number(order.total_nominal) || 0) / UNDIAN_TICKET_STEP);
   if (n <= 0) return;
-  await redisCommand(["HINCRBY", REDIS_UNDIAN_TIX_PREFIX + getUndianNextKey(), String(order.buyer_id), n]);
+  const key = getUndianNextKey();
+  const total = Number(await redisCommand(["HINCRBY", REDIS_UNDIAN_TIX_PREFIX + key, String(order.buyer_id), n])) || n;
+  await tgRequest(token, "sendMessage", {
+    chat_id: order.buyer_id,
+    parse_mode: "HTML",
+    text:
+      `🎟 <b>Kamu dapat +${n} tiket undian!</b>\n` +
+      `Tiket kamu minggu ini: <b>${total}</b>\n` +
+      `📅 Undian: ${formatUndianDate(key)}`,
+  });
 }
 
 function pickUndianWinners(entries, k) {
