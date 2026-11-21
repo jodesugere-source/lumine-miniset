@@ -1009,6 +1009,16 @@ function extractNominalsFromNotif(rawText) {
   return results;
 }
 
+const QRIS_EXPIRE_MINUTES = 60; // pesanan QRIS yang belum dibayar kedaluwarsa setelah ini
+
+// Pesanan QRIS (punya kode unik) yang masih pending dan sudah lewat batas waktu dianggap kedaluwarsa.
+function isQrisOrderExpired(order) {
+  if (!order || order.status !== "pending") return false;
+  if (!(Number(order.kode_unik) > 0)) return false; // saldo & voucher tidak pakai kode unik
+  if (!order.created_ms) return false; // order lama sebelum fitur ini tetap berlaku seperti biasa
+  return Date.now() - Number(order.created_ms) > QRIS_EXPIRE_MINUTES * 60 * 1000;
+}
+
 async function findPendingOrderByNominals(nominalList) {
   if (!Array.isArray(nominalList) || nominalList.length === 0) return null;
   const rawMap = await redisCommand(["HGETALL", REDIS_PENDING_MAP_KEY]);
@@ -1027,6 +1037,12 @@ async function findPendingOrderByNominals(nominalList) {
   const valid = [];
   for (const c of candidates) {
     const order = await getOrder(c.orderId);
+    if (isQrisOrderExpired(order)) {
+      order.status = "expired";
+      await saveOrder(c.orderId, order);
+      await redisCommand(["HDEL", REDIS_PENDING_MAP_KEY, String(c.orderId)]);
+      continue;
+    }
     if (order && (order.status === "pending" || order.status === "waiting_acc")) {
       valid.push(order);
     } else {
@@ -1595,6 +1611,7 @@ async function createOrder(
     is_mystery: isMystery,
     is_deposit: isDeposit,
     status: "pending",
+    created_ms: Date.now(),
     ...extraFields,
   };
 
@@ -3693,6 +3710,161 @@ async function getOwnedNameSet(userId) {
   return new Set((Array.isArray(list) ? list : []).map((x) => String((x && x.nama) || "").toLowerCase().trim()));
 }
 
+// ---- HARGA KHUSUS PEMBELI BARU (wajib verifikasi nomor HP, satu nomor = satu akun) ----
+const NEW_USER_PRICE_MAP = { 5000: 3000, 10000: 7000 }; // harga normal -> harga khusus; lainnya tetap
+const REDIS_PHONE_KEY = "lumine_main_phone"; // hash: id user -> nomor HP terverifikasi
+const REDIS_PHONE_OWNER_KEY = "lumine_main_phone_owner"; // hash: nomor HP -> id user pemiliknya
+
+function getNewUserPrice(retail) {
+  const sp = NEW_USER_PRICE_MAP[Number(retail)];
+  return sp && sp < Number(retail) ? sp : null;
+}
+
+async function isNewBuyer(userId) {
+  const cnt = Number(await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(userId)])) || 0;
+  return cnt === 0;
+}
+
+async function isPhoneVerified(userId) {
+  return Number(await redisCommand(["HEXISTS", REDIS_PHONE_KEY, String(userId)])) === 1;
+}
+
+async function sendVerifyPhonePrompt(token, chatId) {
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      "📱 <b>VERIFIKASI NOMOR</b>\n\n" +
+      "Harga khusus pembeli baru hanya untuk akun dengan nomor yang terverifikasi.\n" +
+      "Tekan tombol di bawah lalu pilih <b>nomor kamu sendiri</b>.\n" +
+      "<i>Satu nomor hanya bisa dipakai untuk satu akun.</i>",
+    reply_markup: {
+      keyboard: [[{ text: "📱 Bagikan Nomor Saya", request_contact: true }]],
+      resize_keyboard: true,
+      one_time_keyboard: true,
+    },
+  });
+}
+
+async function handleContactShare(token, msg) {
+  const chatId = msg.chat.id;
+  const senderId = String(msg.from.id);
+  const c = msg.contact;
+  const sendMsg = (text, markup) =>
+    tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text,
+      ...(markup ? { reply_markup: markup } : {}),
+    });
+  if (String(c.user_id || "") !== senderId) {
+    await sendMsg("⚠️ Bagikan <b>nomor kamu sendiri</b> lewat tombol, bukan kontak orang lain.", { remove_keyboard: true });
+    return;
+  }
+  const phone = String(c.phone_number || "").replace(/\D/g, "");
+  if (phone.length < 8) {
+    await sendMsg("⚠️ Nomor tidak terbaca. Coba bagikan lagi.");
+    return;
+  }
+  const owner = await redisCommand(["HGET", REDIS_PHONE_OWNER_KEY, phone]);
+  if (owner && String(owner) !== senderId) {
+    await sendMsg("⚠️ Nomor ini sudah dipakai untuk akun lain, jadi tidak bisa dipakai untuk harga khusus.", { remove_keyboard: true });
+    return;
+  }
+  await redisCommand(["HSET", REDIS_PHONE_KEY, senderId, phone]);
+  await redisCommand(["HSET", REDIS_PHONE_OWNER_KEY, phone, senderId]);
+  await sendMsg("✅ <b>Nomor terverifikasi!</b>\nHarga khusus pembeli baru sudah aktif untuk akunmu.", {
+    remove_keyboard: true,
+  });
+  await sendMsg("Silakan buka katalog dan pilih set yang kamu mau 👇", {
+    inline_keyboard: [[{ text: "🛍️ Buka Katalog", callback_data: "menu_katalog" }]],
+  });
+}
+
+// ---- EDIT HARGA MASSAL (admin): pilih sasaran, preview, lalu konfirmasi ----
+const REDIS_HARGA_MASS_KEY = "lumine_main_harga_mass_pending"; // JSON perintah yang menunggu konfirmasi (5 menit)
+const HARGA_MASS_PROTECT_MIN = 20000; // set di atas harga ini tidak ikut perubahan massal umum
+const HARGA_MASS_MAX_PCT = 30; // perubahan persen maksimal ±30%
+
+function parseHargaMassArgs(tokens) {
+  const usage =
+    "⚠️ Format:\n" +
+    "<code>/hargamassal semua 6000</code>\n" +
+    "<code>/hargamassal mini 6000</code> | <code>/hargamassal full 50000</code>\n" +
+    "<code>/hargamassal harga 5000 6000</code> (ubah semua set Rp 5.000 jadi Rp 6.000)\n" +
+    "<code>/hargamassal creator NAMA 7000</code>\n" +
+    "<code>/hargamassal semua +10%</code> atau <code>-10%</code>";
+  if (!tokens || tokens.length < 2) return { ok: false, error: usage };
+  const kind = String(tokens[0]).toLowerCase();
+  const last = String(tokens[tokens.length - 1]);
+  let sel;
+  if (kind === "semua" || kind === "mini" || kind === "full") {
+    if (tokens.length !== 2) return { ok: false, error: usage };
+    sel = { type: kind };
+  } else if (kind === "harga") {
+    if (tokens.length !== 3) return { ok: false, error: usage };
+    const from = parseInt(String(tokens[1]).replace(/\D/g, ""), 10);
+    if (!from) return { ok: false, error: usage };
+    sel = { type: "harga", from };
+  } else if (kind === "creator") {
+    const name = tokens.slice(1, -1).join(" ").trim();
+    if (!name) return { ok: false, error: usage };
+    sel = { type: "creator", name };
+  } else {
+    return { ok: false, error: usage };
+  }
+  let rule;
+  const pct = last.match(/^([+-]?\d+(?:\.\d+)?)%$/);
+  if (pct) {
+    const p = parseFloat(pct[1]);
+    if (Math.abs(p) > HARGA_MASS_MAX_PCT) {
+      return { ok: false, error: `⚠️ Perubahan persen maksimal ±${HARGA_MASS_MAX_PCT}% sekali edit.` };
+    }
+    rule = { type: "pct", pct: p };
+  } else {
+    const price = parseInt(last.replace(/\D/g, ""), 10);
+    if (!price || price < 500) return { ok: false, error: usage };
+    rule = { type: "set", price };
+  }
+  return { ok: true, sel, rule };
+}
+
+function hargaMassMatches(item, sel) {
+  const retail = parseNominal(item.harga);
+  if (sel.type === "semua") return true;
+  if (sel.type === "mini") return item.kategori !== "full";
+  if (sel.type === "full") return item.kategori === "full";
+  if (sel.type === "harga") return retail === sel.from;
+  if (sel.type === "creator") return String(item.creator || "").toLowerCase() === sel.name.toLowerCase();
+  return false;
+}
+
+function hargaMassNewValue(item, rule) {
+  const retail = parseNominal(item.harga);
+  if (rule.type === "set") return rule.price;
+  const raw = retail * (1 + rule.pct / 100);
+  return Math.max(500, Math.round(raw / 500) * 500);
+}
+
+function buildHargaMassPlan(katalog, parsed) {
+  const changes = [];
+  let skipped = 0;
+  const broad = parsed.sel.type === "semua" || parsed.sel.type === "mini" || parsed.sel.type === "full";
+  for (const item of katalog) {
+    if (!item || !hargaMassMatches(item, parsed.sel)) continue;
+    const oldVal = parseNominal(item.harga);
+    // Pengaman: perintah umum tidak menyentuh set mahal (20.000 ke atas)
+    if (broad && oldVal >= HARGA_MASS_PROTECT_MIN) {
+      skipped++;
+      continue;
+    }
+    const newVal = hargaMassNewValue(item, parsed.rule);
+    if (newVal !== oldVal) changes.push({ item, oldVal, newVal });
+  }
+  changes.skipped = skipped;
+  return changes;
+}
+
 async function sendKatalogCreatorMenu(token, chatId) {
   const katalogList = await getKatalog();
   const creatorGroups = getCreatorGroups(katalogList);
@@ -4234,11 +4406,18 @@ async function sendMoreMenu(token, chatId) {
       ? [item.link]
       : [];
   const itemFiles = Array.isArray(item.files) ? item.files : [];
+  let baseNominal = parseNominal(item.harga);
+  if (userId) {
+    const sp = getNewUserPrice(baseNominal);
+    if (sp && (await isNewBuyer(userId)) && (await isPhoneVerified(userId))) {
+      baseNominal = sp;
+    }
+  }
   return {
     ok: true,
     itemId: String(item.id),
     itemNama: item.nama,
-    baseNominal: parseNominal(item.harga),
+    baseNominal,
     targetLink: itemLinks[0] || "",
     targetLinks: itemLinks,
     targetFiles: itemFiles,
@@ -4285,6 +4464,9 @@ async function sendQrisInvoiceForTarget(token, chatId, user, target) {
     `━━━━━━━━━━━━━━━━━━━━\n` +
     `💰 <b>TOTAL TRANSFER: <code>${formatRupiah(order.total_nominal)}</code></b>\n` +
     `━━━━━━━━━━━━━━━━━━━━\n\n` +
+    (Number(order.kode_unik) > 0 && order.created_ms
+      ? `⏰ <b>Bayar sebelum: ${formatWibClock(Number(order.created_ms) + QRIS_EXPIRE_MINUTES * 60 * 1000)} WIB</b>\n\n`
+      : "") +
     `⚠️ <b>PENTING:</b> Scan QRIS di atas dan transfer <b>TEPAT sampai digit terakhir</b> (<b>${formatRupiah(order.total_nominal)}</b>) agar sistem otomatis memverifikasi pembayaranmu.\n\n` +
     `Setelah transfer berhasil, link file otomatis dikirim atau klik tombol <b>Konfirmasi Pembayaran</b> di bawah 👇`;
 
@@ -7862,6 +8044,8 @@ module.exports = async function handler(req, res) {
         await sendPickConfirm(token, chatId, callerId);
       } else if (data === "pick_pay") {
         await payPickSelection(token, chatId, call.from);
+      } else if (data === "verify_phone") {
+        await sendVerifyPhonePrompt(token, chatId);
       } else if (data === "mys5_menu") {
         await sendMysteryMulti(token, chatId, callerId);
       } else if (data === "mys5_pay") {
@@ -8011,6 +8195,18 @@ module.exports = async function handler(req, res) {
         inlineMarkup.inline_keyboard.splice(1, 0, wlRowMarkup);
         if (VIP_ENABLED && (await isVipUser(callerId))) {
           inlineMarkup.inline_keyboard[0] = [{ text: "🎁 Ambil Gratis (VIP)", callback_data: `vipget_${item.id}` }];
+        }
+        const newUserSpecial = getNewUserPrice(parseNominal(item.harga));
+        if (newUserSpecial && (await isNewBuyer(callerId))) {
+          if (await isPhoneVerified(callerId)) {
+            inlineMarkup.inline_keyboard[0] = [
+              { text: `💳 Beli Set Ini (${formatRupiah(newUserSpecial)} • harga khusus)`, callback_data: `buy_${item.id}` },
+            ];
+          } else {
+            inlineMarkup.inline_keyboard.unshift([
+              { text: "📱 Verifikasi Nomor untuk Harga Khusus", callback_data: "verify_phone" },
+            ]);
+          }
         }
         const botUname = await getBotUsername(token);
         if (botUname && /^[A-Za-z0-9_-]{1,30}$/.test(String(item.id))) {
@@ -8182,6 +8378,17 @@ module.exports = async function handler(req, res) {
         }
 
         if (order.status !== "pending") {
+          return res.status(200).json({ ok: true });
+        }
+
+        if (isQrisOrderExpired(order)) {
+          order.status = "expired";
+          await saveOrder(orderId, order);
+          await redisCommand(["HDEL", REDIS_PENDING_MAP_KEY, String(orderId)]);
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⏰ Pesanan ini sudah kedaluwarsa karena belum dibayar dalam " + QRIS_EXPIRE_MINUTES + " menit. Silakan buat pesanan baru ya.",
+          });
           return res.status(200).json({ ok: true });
         }
 
@@ -8529,6 +8736,12 @@ module.exports = async function handler(req, res) {
 
       const rawText = (msg.text || msg.caption || "").trim();
       const lowerText = rawText.toLowerCase();
+
+      // VERIFIKASI NOMOR: member membagikan kontak miliknya
+      if (msg.contact) {
+        await handleContactShare(token, msg);
+        return res.status(200).json({ ok: true });
+      }
 
       // UNDIAN: undi otomatis kalau sudah jatuh tempo
       try {
@@ -9363,6 +9576,67 @@ module.exports = async function handler(req, res) {
             `🚫 Diblokir: ${banned ? "✅ ya" : "❌ tidak"}\n\n` +
             "<i>Nama Telegram belum tersimpan, jadi yang ditampilkan cuma ID.</i>",
         });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0H. ADMIN: /hargamassal (edit harga banyak set sekaligus, dengan preview & konfirmasi)
+      if (/^\/hargamassal(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const argRaw = rawText.replace(/^\/hargamassal\s*/i, "").trim();
+        const sendAdm = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+
+        if (/^ya$/i.test(argRaw)) {
+          const pending = parseJsonSafe(await redisCommand(["GET", REDIS_HARGA_MASS_KEY]));
+          if (!pending || !pending.tokens) {
+            await sendAdm("⚠️ Tidak ada perubahan harga yang menunggu konfirmasi (atau sudah lewat 5 menit).");
+            return res.status(200).json({ ok: true });
+          }
+          const parsed = parseHargaMassArgs(pending.tokens);
+          const katalog = await getKatalog();
+          const changes = buildHargaMassPlan(katalog, parsed);
+          if (changes.length === 0) {
+            await redisCommand(["DEL", REDIS_HARGA_MASS_KEY]);
+            await sendAdm("ℹ️ Tidak ada set yang berubah harganya.");
+            return res.status(200).json({ ok: true });
+          }
+          for (const c of changes) c.item.harga = formatRupiah(c.newVal);
+          await saveKatalog(katalog);
+          await redisCommand(["DEL", REDIS_HARGA_MASS_KEY]);
+          await sendAdm(
+            `✅ Harga <b>${changes.length} set</b> sudah diubah.\n` +
+              "Harga reseller ikut menyesuaikan otomatis. Member yang wishlist set yang turun harganya akan dikabari."
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        const tokens = argRaw.split(/\s+/).filter(Boolean);
+        const parsed = parseHargaMassArgs(tokens);
+        if (!parsed.ok) {
+          await sendAdm(parsed.error);
+          return res.status(200).json({ ok: true });
+        }
+        const katalog = await getKatalog();
+        const changes = buildHargaMassPlan(katalog, parsed);
+        if (changes.length === 0) {
+          await sendAdm(
+            "ℹ️ Tidak ada set yang cocok dengan sasaran itu, atau harganya tidak berubah." +
+              (changes.skipped ? `\n🔒 ${changes.skipped} set harga ${formatRupiah(HARGA_MASS_PROTECT_MIN)} ke atas dilewati (dilindungi).` : "")
+          );
+          return res.status(200).json({ ok: true });
+        }
+        await redisCommand(["SET", REDIS_HARGA_MASS_KEY, JSON.stringify({ tokens }), "EX", "300"]);
+        const sample = changes
+          .slice(0, 10)
+          .map((c) => `• ${escapeHtml(c.item.nama)}: ${formatRupiah(c.oldVal)} → <b>${formatRupiah(c.newVal)}</b>`)
+          .join("\n");
+        await sendAdm(
+          `🔍 <b>PREVIEW EDIT HARGA</b>\n` +
+            `Akan mengubah <b>${changes.length} set</b>${changes.length > 10 ? " (menampilkan 10 pertama)" : ""}:\n\n` +
+            `${sample}\n\n` +
+            (changes.skipped ? `🔒 ${changes.skipped} set harga ${formatRupiah(HARGA_MASS_PROTECT_MIN)} ke atas dilewati (dilindungi).\n` : "") +
+            "✅ Terapkan: <code>/hargamassal ya</code>\n" +
+            "<i>Perubahan ini menunggu konfirmasi selama 5 menit.</i>"
+        );
         return res.status(200).json({ ok: true });
       }
 
@@ -10669,6 +10943,7 @@ module.exports = async function handler(req, res) {
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
               "• <code>/error</code> — lihat error terakhir | <code>/error clear</code>\n" +
+              "• <code>/hargamassal semua|mini|full|harga|creator ... HARGA/%</code> — edit harga banyak set\n" +
               "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
               "• <code>/setharga_admin ID NO HARGA</code> — kunci harga jual bot reseller (min = harga toko)\n" +
               "• <code>/listmargin</code> | <code>/bayarmargin ID NOMINAL</code> — margin bot reseller\n" +
