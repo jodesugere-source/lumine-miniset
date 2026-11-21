@@ -2602,6 +2602,7 @@ async function sendMainMenuCard(token, chatId) {
       { text: `👤 Pilih Creator (${creatorGroups.length})`, callback_data: "menu_katalog_creator" },
     ]);
   }
+  if (VIP_ENABLED) keyboard.push([{ text: "💎 VIP Semua Set", callback_data: "vip_menu" }]);
   keyboard.push([{ text: "🔥 Lihat Top Bestseller", callback_data: "menu_bestseller" }]);
   keyboard.push([{ text: "🔙 Menu Utama", callback_data: "menu_home" }]);
 
@@ -2669,6 +2670,131 @@ async function sendPhotopackTextList(token, chatId) {
   for (const part of chunks) {
     await tgRequest(token, "sendMessage", { chat_id: chatId, text: part, parse_mode: "HTML" });
   }
+}
+
+// ---- VIP SEMUA SET (sekali bayar via saldo, semua set bisa diambil gratis) ----
+const VIP_ENABLED = true;
+const VIP_PRICE = 500000; // harga VIP (Rp)
+const REDIS_VIP_KEY = "lumine_main_vip"; // hash: id user -> tanggal beli VIP
+
+async function isVipUser(userId) {
+  const v = await redisCommand(["HGET", REDIS_VIP_KEY, String(userId)]);
+  return !!v;
+}
+
+async function sendVipMenu(token, chatId, userId) {
+  const katalog = await getKatalog();
+  const saldo = await getUserSaldo(userId);
+  if (await isVipUser(userId)) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text:
+        "💎 <b>VIP SEMUA SET</b>\n\n" +
+        "✅ Kamu sudah VIP. Semua set di katalog bisa kamu ambil <b>gratis</b>, termasuk set yang ditambahkan nanti.\n\n" +
+        "<i>Buka set di katalog lalu tekan 🎁 Ambil Gratis (VIP).</i>",
+      reply_markup: { inline_keyboard: [[{ text: "🛍️ Buka Katalog", callback_data: "menu_katalog" }]] },
+    });
+    return;
+  }
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      "💎 <b>VIP SEMUA SET</b>\n\n" +
+      `Bayar sekali <b>${formatRupiah(VIP_PRICE)}</b> dari saldo, lalu semua set di katalog bisa kamu ambil gratis, termasuk set baru.\n\n` +
+      `📦 Set tersedia saat ini: <b>${katalog.length}</b>\n` +
+      `💳 Saldo kamu: <code>${formatRupiah(saldo)}</code>`,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: `💳 Beli VIP (${formatRupiah(VIP_PRICE)})`, callback_data: "vip_buy" }],
+        [{ text: "➕ Isi Saldo", callback_data: "menu_saldo" }],
+        [{ text: "🔙 Katalog", callback_data: "menu_katalog" }],
+      ],
+    },
+  });
+}
+
+async function buyVipViaSaldo(token, chatId, from) {
+  const userId = String(from.id);
+  if (await isVipUser(userId)) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Kamu sudah VIP." });
+    return;
+  }
+  const d = await deductUserSaldo(userId, VIP_PRICE);
+  if (!d.ok) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      parse_mode: "HTML",
+      text:
+        `⚠️ <b>Saldo Tidak Cukup!</b>\nHarga VIP: <code>${formatRupiah(VIP_PRICE)}</code>\n` +
+        `Saldo kamu: <code>${formatRupiah(d.balance)}</code>`,
+      reply_markup: { inline_keyboard: [[{ text: "➕ Isi Saldo Sekarang", callback_data: "menu_saldo" }]] },
+    });
+    return;
+  }
+  const set = Number(await redisCommand(["HSETNX", REDIS_VIP_KEY, userId, new Date().toISOString()]));
+  if (set !== 1) {
+    // sudah VIP (klik ganda): kembalikan saldo
+    await addUserSaldo(userId, VIP_PRICE);
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Kamu sudah VIP. Saldo dikembalikan." });
+    return;
+  }
+  try {
+    await addStoreOmset(VIP_PRICE);
+  } catch (e) {
+    console.error("Omset VIP gagal dicatat:", e);
+  }
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      `🎉 <b>VIP aktif!</b>\nSemua set di katalog sekarang bisa kamu ambil gratis.\n` +
+      `💳 Sisa saldo: <code>${formatRupiah(d.balance)}</code>`,
+    reply_markup: { inline_keyboard: [[{ text: "🛍️ Buka Katalog", callback_data: "menu_katalog" }]] },
+  });
+}
+
+async function sendVipGet(token, chatId, from, itemId) {
+  const userId = String(from.id);
+  if (!(await isVipUser(userId))) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: "💎 Fitur ini khusus member VIP.",
+      reply_markup: { inline_keyboard: [[{ text: "💎 Lihat VIP", callback_data: "vip_menu" }]] },
+    });
+    return;
+  }
+  const katalog = await getKatalog();
+  const item = katalog.find((k) => String(k.id) === String(itemId));
+  if (!item) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Set ini sudah dihapus atau diperbarui oleh admin." });
+    return;
+  }
+  const links = Array.isArray(item.links) && item.links.length > 0 ? item.links : item.link ? [item.link] : [];
+  if (links.length === 0) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `📂 Set <b>${escapeHtml(item.nama)}</b> dikirim manual oleh admin. Hubungi @${ADMIN_USERNAME} ya.`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  const normalized = links.map(normalizeUrl);
+  await addKoleksi(userId, item.nama, normalized[0] || "");
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      `🎁 <b>${escapeHtml(item.nama)}</b> (VIP, gratis)\n` +
+      normalized.map((l) => `🔗 ${escapeHtml(l)}`).join("\n") +
+      "\n\n<i>Tersimpan juga di 🎒 Koleksi Saya.</i>",
+    reply_markup: {
+      inline_keyboard: normalized.slice(0, 8).map((link, i) => [
+        { text: normalized.length > 1 ? `📂 Buka File ${i + 1}` : "📂 Buka Link File Sekarang", url: link },
+      ]),
+    },
+  });
 }
 
 async function sendKatalogCreatorMenu(token, chatId) {
@@ -6811,6 +6937,12 @@ module.exports = async function handler(req, res) {
       } else if (data.startsWith("depo_")) {
         const nominal = parseInt(data.replace("depo_", ""), 10) || 0;
         await createAndSendDepositInvoice(token, chatId, call.from, nominal);
+      } else if (data === "vip_menu") {
+        await sendVipMenu(token, chatId, callerId);
+      } else if (data === "vip_buy") {
+        await buyVipViaSaldo(token, chatId, call.from);
+      } else if (data.startsWith("vipget_")) {
+        await sendVipGet(token, chatId, call.from, data.replace("vipget_", ""));
       } else if (data === "menu_katalog") {
         await sendKatalogMenu(token, chatId);
       } else if (data === "menu_katalog_mini") {
@@ -6954,6 +7086,9 @@ module.exports = async function handler(req, res) {
         };
 
         inlineMarkup.inline_keyboard.splice(1, 0, wlRowMarkup);
+        if (VIP_ENABLED && (await isVipUser(callerId))) {
+          inlineMarkup.inline_keyboard[0] = [{ text: "🎁 Ambil Gratis (VIP)", callback_data: `vipget_${item.id}` }];
+        }
         const botUname = await getBotUsername(token);
         if (botUname && /^[A-Za-z0-9_-]{1,30}$/.test(String(item.id))) {
           inlineMarkup.inline_keyboard.splice(2, 0, [
