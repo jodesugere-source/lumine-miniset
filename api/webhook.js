@@ -3621,6 +3621,7 @@ async function getResellerBotItems(ownerId, rb) {
   const [katalog, omset] = await Promise.all([getKatalog(), getResellerOmset(ownerId)]);
   const tier = getResellerTierInfo(omset.rupiah).tier;
   const prices = (rb && rb.prices) || {};
+  const adminPrices = (rb && rb.admin_prices) || {};
   const items = [];
 
   for (const k of katalog) {
@@ -3633,11 +3634,27 @@ async function getResellerBotItems(ownerId, rb) {
     const retail = parseNominal(k.harga);
     const modal = getResellerModalPrice(retail, tier);
     const bounds = getResellerSellBounds(retail, modal);
-    if (modal >= bounds.max) continue; // tidak ada ruang margin
 
-    const custom = Number(prices[String(k.id)]);
-    const wanted = custom > 0 ? custom : retail;
-    const sell = Math.min(bounds.max, Math.max(bounds.min, wanted));
+    // Harga yang di-set admin (/setharga_admin): dikunci, minimal = harga toko utama, tanpa batas maksimal.
+    const adminPrice = Number(adminPrices[String(k.id)]);
+    const locked = adminPrice > 0 && adminPrice >= retail;
+
+    if (!locked && modal >= bounds.max) continue; // tidak ada ruang margin
+
+    let sell;
+    let minSell;
+    let maxSell;
+    if (locked) {
+      sell = adminPrice;
+      minSell = adminPrice;
+      maxSell = adminPrice;
+    } else {
+      const custom = Number(prices[String(k.id)]);
+      const wanted = custom > 0 ? custom : retail;
+      sell = Math.min(bounds.max, Math.max(bounds.min, wanted));
+      minSell = bounds.min;
+      maxSell = bounds.max;
+    }
 
     items.push({
       id: String(k.id),
@@ -3651,8 +3668,9 @@ async function getResellerBotItems(ownerId, rb) {
       files,
       retail,
       modal,
-      min_sell: bounds.min,
-      max_sell: bounds.max,
+      min_sell: minSell,
+      max_sell: maxSell,
+      locked,
       sell,
       margin: sell - modal,
     });
@@ -4491,7 +4509,9 @@ async function handleRbMessage(ctx, msg) {
       text +=
         `${i + 1}. <b>${escapeHtml(x.nama)}</b>\n` +
         `   Modal ${formatRupiah(x.modal)} • Jual <code>${formatRupiah(x.sell)}</code> • Untung ${formatRupiah(x.margin)}\n` +
-        `   <i>Boleh diatur ${formatRupiah(x.min_sell)} – ${formatRupiah(x.max_sell)}</i>\n`;
+        (x.locked
+          ? "   <i>🔒 Harga diatur admin, tidak bisa diubah</i>\n"
+          : `   <i>Boleh diatur ${formatRupiah(x.min_sell)} – ${formatRupiah(x.max_sell)}</i>\n`);
     });
     text +=
       "\nUbah harga:\n<code>/setharga NO HARGA</code>\n<code>/setharga semua HARGA</code>";
@@ -4520,6 +4540,7 @@ async function handleRbMessage(ctx, msg) {
     if (target === "semua") {
       let adjusted = 0;
       for (const x of items) {
+        if (x.locked) continue; // harga dikunci admin
         const clamped = Math.min(x.max_sell, Math.max(x.min_sell, price));
         if (clamped !== price) adjusted++;
         rb.prices[x.id] = clamped;
@@ -4544,6 +4565,14 @@ async function handleRbMessage(ctx, msg) {
       return;
     }
     const x = items[idx];
+    if (x.locked) {
+      await tgRequest(ctx.token, "sendMessage", {
+        chat_id: chatId,
+        text: `🔒 Harga <b>${escapeHtml(x.nama)}</b> diatur oleh admin (${formatRupiah(x.sell)}). Tidak bisa diubah.`,
+        parse_mode: "HTML",
+      });
+      return;
+    }
     if (price < x.min_sell) {
       await tgRequest(ctx.token, "sendMessage", {
         chat_id: chatId,
@@ -4862,7 +4891,7 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
   }
 
   // ----- admin -----
-  const adminCmds = ["/listbot", "/matikanbot", "/aktifkanbot", "/listmargin", "/bayarmargin", "/listwd", "/setwdch"];
+  const adminCmds = ["/listbot", "/matikanbot", "/aktifkanbot", "/listmargin", "/bayarmargin", "/listwd", "/setwdch", "/setharga_admin"];
   if (!adminCmds.includes(cmd)) return false;
   if (!isAdmin) return true;
 
@@ -4959,6 +4988,84 @@ async function handleResellerBotMainCommands(token, req, msg, rawText, isAdmin) 
         `  💸 Margin belum dibayar: <code>${formatRupiah(m.owed)}</code>\n`;
     }
     await sendLongText(token, chatId, text);
+    return true;
+  }
+
+  if (cmd === "/setharga_admin") {
+    const parts = arg.trim().split(/\s+/);
+    const rid = parts[0] || "";
+    const target = String(parts[1] || "").toLowerCase();
+    const rawPrice = String(parts[2] || "").toLowerCase();
+    const usage =
+      "⚠️ Format:\n" +
+      "<code>/setharga_admin ID_RESELLER NO HARGA</code>\n" +
+      "<code>/setharga_admin ID_RESELLER 1,2,3 HARGA</code>\n" +
+      "<code>/setharga_admin ID_RESELLER semua HARGA</code>\n" +
+      "<code>/setharga_admin ID_RESELLER NO hapus</code> (kembali ke aturan reseller)\n" +
+      "NO = nomor set di katalog utama (lihat /setcreator). Harga minimal = harga toko utama, tanpa batas maksimal.";
+    if (!/^\d+$/.test(rid) || !target || !rawPrice) {
+      await reply(usage);
+      return true;
+    }
+    const rb = await getResellerBot(rid);
+    if (!rb) {
+      await reply("⚠️ Bot reseller dengan ID itu tidak ditemukan (lihat /listbot).");
+      return true;
+    }
+
+    const katalog = await getKatalog();
+    let indices = [];
+    if (target === "semua") {
+      indices = katalog.map((_, i) => i);
+    } else {
+      for (const s of target.split(",").map((x) => x.trim()).filter(Boolean)) {
+        const n = parseInt(s, 10) - 1;
+        if (isNaN(n) || n < 0 || n >= katalog.length) {
+          await reply(`⚠️ Nomor set <b>${escapeHtml(s)}</b> tidak valid (total katalog: ${katalog.length}).`);
+          return true;
+        }
+        if (!indices.includes(n)) indices.push(n);
+      }
+    }
+    if (indices.length === 0) {
+      await reply(usage);
+      return true;
+    }
+
+    rb.admin_prices = rb.admin_prices || {};
+
+    if (rawPrice === "hapus") {
+      for (const idx of indices) delete rb.admin_prices[String(katalog[idx].id)];
+      await saveResellerBot(rid, rb);
+      await reply(`✅ Harga admin dihapus dari ${indices.length} set. Bot @${escapeHtml(rb.username)} kembali pakai aturan reseller.`);
+      return true;
+    }
+
+    const price = parseInt(rawPrice.replace(/\D/g, ""), 10);
+    if (!price) {
+      await reply(usage);
+      return true;
+    }
+
+    let applied = 0;
+    const skipped = [];
+    for (const idx of indices) {
+      const k = katalog[idx];
+      const retail = parseNominal(k.harga);
+      if (price < retail) {
+        skipped.push(`#${idx + 1} ${escapeHtml(k.nama)} (harga toko ${formatRupiah(retail)})`);
+        continue;
+      }
+      rb.admin_prices[String(k.id)] = price;
+      applied++;
+    }
+    await saveResellerBot(rid, rb);
+
+    let msg = `✅ Harga <b>${formatRupiah(price)}</b> dikunci ke ${applied} set untuk bot @${escapeHtml(rb.username)}.`;
+    if (skipped.length > 0) {
+      msg += `\n⚠️ Dilewati karena di bawah harga toko utama:\n• ${skipped.join("\n• ")}`;
+    }
+    await reply(msg);
     return true;
   }
 
@@ -9312,6 +9419,7 @@ module.exports = async function handler(req, res) {
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
               "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
+              "• <code>/setharga_admin ID NO HARGA</code> — kunci harga jual bot reseller (min = harga toko)\n" +
               "• <code>/listmargin</code> | <code>/bayarmargin ID NOMINAL</code> — margin bot reseller\n" +
               "• <code>/listwd</code> — WD reseller pending (ACC/Tolak lewat tombol)\n" +
               "• <code>/setwdch</code> — channel bukti WD (default: Channel Testimoni)\n" +
