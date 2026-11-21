@@ -7410,6 +7410,34 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // CHECKLIST HARGA (ADMIN): lihat harga apa saja yang dipakai dan berapa set di tiap harga
+      if (isAdmin && /^\/hargalist(\s|$)/i.test(rawText)) {
+        const katalog = await getKatalog();
+        if (!katalog.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Katalog masih kosong.", reply_to_message_id: msg.message_id });
+          return res.status(200).json({ ok: true });
+        }
+        const groups = new Map();
+        for (const k of katalog) {
+          const n = parseNominal(k.harga) || 0;
+          if (!groups.has(n)) groups.set(n, []);
+          groups.get(n).push(k);
+        }
+        const keys = [...groups.keys()].sort((a, b) => a - b);
+        let out = `📋 <b>Checklist Harga</b>\n<i>${keys.length} titik harga, ${katalog.length} set total</i>\n`;
+        for (const n of keys) {
+          const list = groups.get(n);
+          const label = n > 0 ? formatRupiah(n) : "Harga tidak valid";
+          out += `\n☑️ <b>${label}</b> — ${list.length} set\n`;
+          const names = list.slice(0, 5).map((k) => `• ${escapeHtml(k.nama)} (${(k.kategori || "mini") === "full" ? "Full" : "Mini"})`);
+          out += names.join("\n");
+          if (list.length > 5) out += `\n• ...+${list.length - 5} lainnya`;
+          out += "\n";
+        }
+        await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: out, reply_to_message_id: msg.message_id });
+        return res.status(200).json({ ok: true });
+      }
+
       // WISHLIST
       if (/^\/wishlist(\s|$)/i.test(rawText) || rawText === "⭐ Wishlist") {
         await sendWishlist(token, chatId, senderId);
