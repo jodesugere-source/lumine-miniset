@@ -1997,6 +1997,31 @@ async function processAccOrderCore(token, order) {
   }
   await Promise.all(omsetTasks);
 
+  // Notif omset langsung ke admin setiap ada penjualan lunas (bisa dimatikan lewat OMSET_LIVE_NOTIF)
+  if (OMSET_LIVE_NOTIF && !order.is_deposit) {
+    try {
+      const qrisLive = await getQris();
+      const adminLive = qrisLive && qrisLive.admin_chat_id;
+      const liveTarget = await resolveOmsetTarget(adminLive);
+      if (liveTarget) {
+        const todayLive = await getDailyOmset(wibDayKey(Date.now()));
+        const metode = order.paid_with_saldo ? "Saldo" : "QRIS";
+        await tgRequest(token, "sendMessage", {
+          chat_id: liveTarget,
+          parse_mode: "HTML",
+          text:
+            `🧾 <b>#${order.id}</b> • ${escapeHtml(getWibTimestamp())}\n` +
+            `👤 ${escapeHtml(order.buyer_name || "Member")}\n` +
+            `📦 ${escapeHtml(order.item_nama || "Pesanan")}\n` +
+            `💰 <b>+${formatRupiah(order.total_nominal)}</b> • ${metode}\n` +
+            `📊 Omset hari ini: <b>${formatRupiah(todayLive.rupiah)}</b> (${todayLive.count} transaksi)`,
+        });
+      }
+    } catch (liveErr) {
+      console.error("Notif omset live error:", liveErr);
+    }
+  }
+
   const updatedAllCnt = await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(order.buyer_id)]);
   await sendTestimonialToChannel(token, order, deliveredName, updatedAllCnt);
 
@@ -2067,8 +2092,9 @@ function normalizeUrl(rawUrl) {
 function getCompactReplyKeyboard() {
   return {
     keyboard: [
-      [{ text: "🛍️ Belanja" }, { text: "💰 Saldo" }],
-      [{ text: "🎁 Gratis" }, { text: "👤 Akun" }],
+      [{ text: "🛍️ Katalog" }, { text: "💰 Saldo & Depo" }],
+      [{ text: "🎒 Koleksi Saya" }, { text: "🎲 Mystery Box" }],
+      [{ text: "☰ Lainnya" }, { text: "📖 Panduan" }],
     ],
     resize_keyboard: true,
   };
@@ -2656,21 +2682,30 @@ async function sendMainMenuCard(token, chatId) {
   const banner = await getBanner();
   const mysteryCfg = await getMysteryConfig();
   const cardText =
-    "✨ <b>LUMINE PHOTOPACK</b>\n" +
-    `Standar ${formatRupiah(RETAIL_PRICE_LITE)} • Premium ${formatRupiah(RETAIL_PRICE_STANDAR)}\n\n` +
+    "✨ <b>LUMINE PHOTOPACK</b> ✨\n" +
+    "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n\n" +
+    `• <b>Standar:</b> <code>${formatRupiah(RETAIL_PRICE_LITE)}</code> | <b>Premium:</b> <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
+    `• <b>Mystery Box:</b> <code>${formatRupiah(mysteryCfg.price || 3000)}</code>\n\n` +
     "Pilih menu di bawah 👇";
 
   const inlineMarkup = {
     inline_keyboard: [
       [
-        { text: "🛍️ Belanja", callback_data: "menu_katalog" },
-        { text: "💰 Saldo", callback_data: "menu_saldo" },
+        { text: "🛍️ Katalog", callback_data: "menu_katalog" },
+        { text: "🔥 Bestseller", callback_data: "menu_bestseller" },
       ],
       [
-        { text: "🎁 Gratis & Undian", callback_data: "menu_gratis" },
-        { text: "👤 Akun", callback_data: "menu_akun" },
+        { text: "💰 Saldo & Depo", callback_data: "menu_saldo" },
+        { text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" },
       ],
-      [{ text: "💬 Admin", url: `https://t.me/${ADMIN_USERNAME}` }],
+      [
+        { text: "🎲 Mystery Box", callback_data: "menu_mystery" },
+        { text: "🏆 Leaderboard", callback_data: "menu_lb" },
+      ],
+      [
+        { text: "☰ Menu Lainnya", callback_data: "menu_lainnya" },
+        { text: "💬 Admin", url: `https://t.me/${ADMIN_USERNAME}` },
+      ],
     ],
   };
 
@@ -2708,13 +2743,18 @@ async function sendMainMenuCard(token, chatId) {
   const fullCount = katalogList.filter((k) => k.kategori === "full").length;
   const creatorGroups = getCreatorGroups(katalogList.filter(isCategoryEnabled));
 
-  const keyboard = [];
-  if (MINI_SET_ENABLED) keyboard.push([{ text: `🧩 Mini Set (${miniCount})`, callback_data: "menu_katalog_mini" }]);
-  keyboard.push([{ text: `📦 Full Set (${fullCount})`, callback_data: "menu_katalog_full" }]);
+  const keyboard = [
+    ...(MINI_SET_ENABLED ? [[{ text: `🧩 Mini Set (${miniCount})`, callback_data: "menu_katalog_mini" }]] : []),
+    [{ text: `📦 Full Set (${fullCount})`, callback_data: "menu_katalog_full" }],
+  ];
   if (creatorGroups.length > 0) {
-    keyboard.push([{ text: `👤 Pilih Creator (${creatorGroups.length})`, callback_data: "menu_katalog_creator" }]);
+    keyboard.push([
+      { text: `👤 Pilih Creator (${creatorGroups.length})`, callback_data: "menu_katalog_creator" },
+    ]);
   }
-  keyboard.push([{ text: "⭐ Opsi Lanjutan", callback_data: "menu_katalog_more" }]);
+  if (VIP_ENABLED) keyboard.push([{ text: "💎 VIP Semua Set", callback_data: "vip_menu" }]);
+  keyboard.push([{ text: "🧺 Pilih Beberapa Set", callback_data: "pick_menu" }]);
+  keyboard.push([{ text: "🔥 Lihat Top Bestseller", callback_data: "menu_bestseller" }]);
   keyboard.push([{ text: "🔙 Menu Utama", callback_data: "menu_home" }]);
 
   await tgRequest(token, "sendMessage", {
@@ -3768,6 +3808,15 @@ async function handleContactShare(token, msg) {
 
 // ---- EDIT HARGA MASSAL (admin): pilih sasaran, preview, lalu konfirmasi ----
 const REDIS_HARGA_MASS_KEY = "lumine_main_harga_mass_pending"; // JSON perintah yang menunggu konfirmasi (5 menit)
+const REDIS_OMSET_CH_KEY = "lumine_main_omset_ch"; // tujuan notif omset: chat_id channel, "__makro__", atau kosong = chat admin
+async function resolveOmsetTarget(fallbackAdminChat) {
+  const omCh = await redisCommand(["GET", REDIS_OMSET_CH_KEY]);
+  if (omCh === "__makro__") return (await getMacroLogChatId()) || fallbackAdminChat;
+  if (omCh) return String(omCh);
+  return fallbackAdminChat;
+}
+
+const OMSET_LIVE_NOTIF = true; // true = admin dapat notif omset setiap ada penjualan lunas
 const HARGA_MASS_PROTECT_MIN = 20000; // set di atas harga ini tidak ikut perubahan massal umum
 const HARGA_MASS_MAX_PCT = 30; // perubahan persen maksimal ±30%
 
@@ -3848,90 +3897,6 @@ function buildHargaMassPlan(katalog, parsed) {
   }
   changes.skipped = skipped;
   return changes;
-}
-
-// ---- VERSI UJI: menu sederhana ----
-async function sendGratisMenu(token, chatId) {
-  await tgRequest(token, "sendMessage", {
-    chat_id: chatId,
-    parse_mode: "HTML",
-    text: "🎁 <b>GRATIS & UNDIAN</b>\nKumpulkan saldo tanpa bayar, lalu pakai buat belanja.",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🎡 Spin Harian", callback_data: "spin_info" },
-          { text: "✅ Check-in", callback_data: "checkin" },
-        ],
-        [
-          { text: "🎟 Undian Mingguan", callback_data: "menu_undian" },
-          { text: "📱 Referral Aplikasi", callback_data: "menu_appref" },
-        ],
-        [
-          { text: "🎁 Klaim Subscribe", callback_data: "sub_info" },
-          { text: "🤝 Undang Teman", callback_data: "menu_undang" },
-        ],
-        [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
-      ],
-    },
-  });
-}
-
-async function sendAkunMenu(token, chatId) {
-  await tgRequest(token, "sendMessage", {
-    chat_id: chatId,
-    parse_mode: "HTML",
-    text: "👤 <b>AKUN & BANTUAN</b>",
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" },
-          { text: "🏆 Leaderboard", callback_data: "menu_lb" },
-        ],
-        [
-          { text: "📋 Cara Order", callback_data: "menu_cara" },
-          { text: "💬 Bantuan", callback_data: "guide:root" },
-        ],
-        [
-          { text: "💎 Info & Channel", callback_data: "menu_channel" },
-          { text: "🤝 Reseller", callback_data: "menu_reseller" },
-        ],
-        [{ text: "🔙 Menu Utama", callback_data: "menu_home" }],
-      ],
-    },
-  });
-}
-
-async function sendKatalogMore(token, chatId) {
-  await tgRequest(token, "sendMessage", {
-    chat_id: chatId,
-    parse_mode: "HTML",
-    text: "⭐ <b>OPSI LANJUTAN</b>",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🎲 Mystery Box", callback_data: "menu_mystery" }],
-        [{ text: "🧺 Pilih Beberapa Set", callback_data: "pick_menu" }],
-        [{ text: "💎 VIP Semua Set", callback_data: "vip_menu" }],
-        [{ text: "🔥 Bestseller", callback_data: "menu_bestseller" }],
-        [{ text: "🔙 Katalog", callback_data: "menu_katalog" }],
-      ],
-    },
-  });
-}
-
-async function sendOnboardingCard(token, chatId) {
-  await tgRequest(token, "sendMessage", {
-    chat_id: chatId,
-    parse_mode: "HTML",
-    text: "👋 Kamu lagi cari apa hari ini?",
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "🧩 Mini Set", callback_data: "onb_mini" }],
-        [{ text: "📦 Full Set", callback_data: "onb_full" }],
-        [{ text: "👤 Creator tertentu", callback_data: "onb_creator" }],
-        [{ text: "📋 Lihat semua menu", callback_data: "onb_menu" }],
-      ],
-    },
-  });
 }
 
 async function sendKatalogCreatorMenu(token, chatId) {
@@ -7142,6 +7107,21 @@ async function maybeSendDailySummary(token) {
     (antrean > 0 ? `\nAda ${antrean} antrean menunggu. 💪` : `\nTidak ada antrean. ✅`);
 
   await tgRequest(token, "sendMessage", { chat_id: adminChatId, text, parse_mode: "HTML" });
+
+  // Rekap omset kemarin juga dikirim ke tujuan omset (channel), kalau sudah diatur
+  const omsetTargetDaily = await resolveOmsetTarget(null);
+  if (omsetTargetDaily && String(omsetTargetDaily) !== String(adminChatId)) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: omsetTargetDaily,
+      parse_mode: "HTML",
+      text:
+        `📒 <b>REKAP OMSET ${escapeHtml(yesterdayKey)}</b>\n` +
+        "━━━━━━━━━━━━━━━━━━━━\n" +
+        `💰 Total : <b>${formatRupiah(harian.rupiah)}</b>\n` +
+        `🧾 Transaksi : <b>${harian.count}</b>\n` +
+        `💼 Omset keseluruhan : ${formatRupiah(omset.rupiah)}`,
+    });
+  }
 }
 
 // Reward saldo untuk ulasan, hanya sekali per order
@@ -8119,20 +8099,6 @@ module.exports = async function handler(req, res) {
         await sendMysteryMulti(token, chatId, callerId);
       } else if (data === "mys5_pay") {
         await payMysteryMulti(token, chatId, call.from);
-      } else if (data === "menu_gratis") {
-        await sendGratisMenu(token, chatId);
-      } else if (data === "menu_akun") {
-        await sendAkunMenu(token, chatId);
-      } else if (data === "menu_katalog_more") {
-        await sendKatalogMore(token, chatId);
-      } else if (data === "onb_mini") {
-        await sendKatalogListByCategory(token, chatId, "mini", 0);
-      } else if (data === "onb_full") {
-        await sendKatalogListByCategory(token, chatId, "full", 0);
-      } else if (data === "onb_creator") {
-        await sendKatalogCreatorMenu(token, chatId);
-      } else if (data === "onb_menu") {
-        await sendMainMenuCard(token, chatId);
       } else if (data === "menu_katalog") {
         await sendKatalogMenu(token, chatId);
       } else if (data === "menu_katalog_mini") {
@@ -9723,6 +9689,70 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 0J. ADMIN: /setomset (tujuan notif omset: channel, log makro, atau chat admin)
+      if (/^\/setomset(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/setomset\s*/i, "").trim().toLowerCase();
+        const sendAdm = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+        if (!arg) {
+          const cur = await redisCommand(["GET", REDIS_OMSET_CH_KEY]);
+          const label = !cur ? "chat admin (pribadi)" : cur === "__makro__" ? "channel log makro" : `channel <code>${escapeHtml(String(cur))}</code>`;
+          await sendAdm(
+            `💰 Notif omset dikirim ke: <b>${label}</b>\n\n` +
+              "Atur: <code>/setomset CHAT_ID</code> (channel/grup)\n" +
+              "<code>/setomset makro</code> (pakai channel log makro)\n" +
+              "<code>/setomset off</code> (kembali ke chat admin)\n" +
+              "<i>Bot harus jadi admin di channel itu.</i>"
+          );
+          return res.status(200).json({ ok: true });
+        }
+        if (arg === "off") {
+          await redisCommand(["DEL", REDIS_OMSET_CH_KEY]);
+          await sendAdm("✅ Notif omset kembali ke chat admin.");
+          return res.status(200).json({ ok: true });
+        }
+        if (arg === "makro") {
+          const logId = await getMacroLogChatId();
+          if (!logId) {
+            await sendAdm("⚠️ Channel log makro belum diset. Atur dulu dengan /setlogmakro CHAT_ID.");
+            return res.status(200).json({ ok: true });
+          }
+          await redisCommand(["SET", REDIS_OMSET_CH_KEY, "__makro__"]);
+          await sendAdm("✅ Notif omset sekarang masuk ke channel log makro.");
+          return res.status(200).json({ ok: true });
+        }
+        if (/^-?\d{5,20}$/.test(arg)) {
+          await redisCommand(["SET", REDIS_OMSET_CH_KEY, arg]);
+          await sendAdm(`✅ Notif omset sekarang dikirim ke <code>${escapeHtml(arg)}</code>.\nPastikan bot sudah jadi admin di channel itu.`);
+          return res.status(200).json({ ok: true });
+        }
+        await sendAdm("⚠️ Format: <code>/setomset CHAT_ID</code>, <code>/setomset makro</code>, atau <code>/setomset off</code>.");
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0I. ADMIN: /omset (omset hari ini, kemarin, dan total kapan saja)
+      if (/^\/omset$/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const now = Date.now();
+        const [today, yesterday, total] = await Promise.all([
+          getDailyOmset(wibDayKey(now)),
+          getDailyOmset(wibDayKey(now - 86400000)),
+          getStoreOmset(),
+        ]);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            "💰 <b>OMSET TOKO</b>\n" +
+            "━━━━━━━━━━━━━━━━━━━━\n" +
+            `📅 Hari ini : <code>${formatRupiah(today.rupiah)}</code> (${today.count} transaksi)\n` +
+            `📅 Kemarin : <code>${formatRupiah(yesterday.rupiah)}</code> (${yesterday.count} transaksi)\n` +
+            `💼 Total : <code>${formatRupiah(total.rupiah)}</code>\n\n` +
+            "<i>Omset hari ini dihitung dari pesanan yang sudah lunas. Ringkasan lengkap tiap pagi dikirim otomatis.</i>",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 0E. ADMIN: /undian (status undian minggu ini & hasil terakhir)
       if (/^\/undian$/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -11010,7 +11040,7 @@ module.exports = async function handler(req, res) {
 
         if (text === "/start" || startRefMatch || startMitraMatch || startShareMatch) {
           const buyerName = escapeHtml((msg.from && msg.from.first_name) || "Kak");
-          let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.`;
+          let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.\n🆔 ID kamu: <code>${senderId}</code>`;
 
           if (isAdmin) {
             headerText +=
@@ -11026,6 +11056,7 @@ module.exports = async function handler(req, res) {
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
               "• <code>/error</code> — lihat error terakhir | <code>/error clear</code>\n" +
+              "• <code>/omset</code> — omset hari ini, kemarin, dan total | <code>/setomset</code> — tujuan notif omset\n" +
               "• <code>/hargamassal semua|mini|full|harga|creator ... HARGA/%</code> — edit harga banyak set\n" +
               "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
               "• <code>/setharga_admin ID NO HARGA</code> — kunci harga jual bot reseller (min = harga toko)\n" +
@@ -11042,21 +11073,9 @@ module.exports = async function handler(req, res) {
             reply_markup: getCompactReplyKeyboard(),
           });
 
-          if (!isAdmin && (await isNewBuyer(senderId))) {
-            await sendOnboardingCard(token, chatId);
-          } else {
-            await sendMainMenuCard(token, chatId);
-          }
+          await sendMainMenuCard(token, chatId);
         } else if (text === "💰 Saldo & Depo" || text === "💰 Saldo & Deposit") {
           await sendSaldoMenu(token, chatId, senderId);
-        } else if (text === "🛍️ Belanja") {
-          await sendKatalogMenu(token, chatId);
-        } else if (text === "💰 Saldo") {
-          await sendSaldoMenu(token, chatId, senderId);
-        } else if (text === "🎁 Gratis") {
-          await sendGratisMenu(token, chatId);
-        } else if (text === "👤 Akun") {
-          await sendAkunMenu(token, chatId);
         } else if (text === "🛍️ Katalog" || text === "🛍️ Katalog Mini Set" || text === "🛍️ Katalog Set Pool" || text === "🛍️ Katalog Photopack") {
           await sendKatalogMenu(token, chatId);
         } else if (text === "🔥 Bestseller" || text === "/bestseller") {
