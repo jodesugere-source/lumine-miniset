@@ -9361,7 +9361,7 @@ module.exports = async function handler(req, res) {
           await sendResellerMenu(token, chatId, msg.from);
         } else {
           if (
-            /^(list|daftar)(\s+(photopack|photo pack|photopek|set|katalog))?$/.test(lowerText.trim()) ||
+            /^\/?(list|daftar)(\s+(photopack|photo pack|photopek|set|katalog))?$/.test(lowerText.trim()) ||
             ["list photopack", "daftar photopack", "lihat photopack", "photopack apa aja", "photopack apa saja"].some((k) => lowerText.includes(k))
           ) {
             await sendPhotopackTextList(token, chatId);
