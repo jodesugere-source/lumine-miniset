@@ -1,4 +1,67 @@
 // ==========================================
+// 0. PENCATAT ERROR (semua console.error otomatis disimpan ke Redis, admin bisa cek lewat /error)
+// ==========================================
+const REDIS_ERRLOG_KEY = "lumine_main_errlog";
+const REDIS_ERR_ALERT_PREFIX = "lumine_main_erralert_";
+const ERR_LOG_MAX = 100; // jumlah error yang disimpan
+const ERR_ALERT_COOLDOWN_SEC = 600; // notif error yang sama hanya sekali tiap 10 menit
+const _origConsoleError = console.error.bind(console);
+const pendingErrLogs = [];
+let inErrLog = false;
+
+function formatErrArgs(args) {
+  return args
+    .map((a) => {
+      if (a instanceof Error) {
+        const stackHead = a.stack ? a.stack.split("\n").slice(0, 3).join("\n") : "";
+        return `${a.message}${stackHead ? "\n" + stackHead : ""}`;
+      }
+      if (typeof a === "string") return a;
+      try {
+        return JSON.stringify(a);
+      } catch {
+        return String(a);
+      }
+    })
+    .join(" ")
+    .slice(0, 1500);
+}
+
+async function persistErrorLog(text) {
+  const entry = JSON.stringify({ t: getWibTimestamp(), msg: text });
+  await redisCommand(["LPUSH", REDIS_ERRLOG_KEY, entry]);
+  await redisCommand(["LTRIM", REDIS_ERRLOG_KEY, "0", String(ERR_LOG_MAX - 1)]);
+
+  const token = process.env.BOT_TOKEN;
+  const qris = await getQris();
+  if (!token || !qris || !qris.admin_chat_id) return;
+  const keyPart = text.slice(0, 60).replace(/[^A-Za-z0-9]+/g, "_");
+  const ok = await redisCommand(["SET", REDIS_ERR_ALERT_PREFIX + keyPart, "1", "NX", "EX", String(ERR_ALERT_COOLDOWN_SEC)]);
+  if (ok !== "OK") return;
+  await tgRequest(token, "sendMessage", {
+    chat_id: qris.admin_chat_id,
+    text: "🚨 Ada error di bot:\n" + text.slice(0, 500) + "\n\nLihat riwayat lengkap: /error",
+  });
+}
+
+console.error = (...args) => {
+  _origConsoleError(...args);
+  if (inErrLog) return;
+  const p = (async () => {
+    inErrLog = true;
+    try {
+      await persistErrorLog(formatErrArgs(args));
+    } catch (e) {
+      _origConsoleError("Gagal mencatat error:", e && e.message);
+    } finally {
+      inErrLog = false;
+    }
+  })();
+  pendingErrLogs.push(p);
+  if (pendingErrLogs.length > 50) pendingErrLogs.shift();
+};
+
+// ==========================================
 // 1. PENGATURAN UTAMA (BOT UTAMA — FULL FITUR + AUTO-ACC MAKRO + DEPO SALDO)
 // ==========================================
 const ADMIN_USERNAME = "Fellstore1"; // Tanpa tanda @
@@ -960,17 +1023,21 @@ async function findPendingOrderByNominals(nominalList) {
     }
   }
 
-  candidates.sort((a, b) => Number(b.orderId) - Number(a.orderId));
-
+  // Order yang masih pending maupun yang sudah tekan Konfirmasi (waiting_acc) boleh dicocokkan makro.
+  const valid = [];
   for (const c of candidates) {
     const order = await getOrder(c.orderId);
     if (order && (order.status === "pending" || order.status === "waiting_acc")) {
-      return order;
+      valid.push(order);
     } else {
       await redisCommand(["HDEL", REDIS_PENDING_MAP_KEY, String(c.orderId)]);
     }
   }
-  return null;
+
+  // Pengaman: kalau ada lebih dari satu order aktif dengan nominal yang sama, jangan tebak.
+  // Dibiarkan untuk di-ACC manual supaya uang tidak masuk ke order orang lain.
+  if (valid.length !== 1) return null;
+  return valid[0];
 }
 
 function parseNominal(hargaStr) {
@@ -7511,6 +7578,7 @@ module.exports = async function handler(req, res) {
               `📲 <b>Notif:</b> <i>"${notifTxt}"</i>\n` +
               `🔢 <b>Angka terbaca:</b> ${nomTxt}\n\n` +
               `⚠️ Tidak ada order pending dengan nominal itu.\n` +
+              `🔒 Kalau ada lebih dari satu order dengan nominal sama, makro tidak auto-ACC. ACC manual.\n` +
               `💡 <i>Cek: total transfer harus sama persis dengan total order, termasuk kode unik.</i>`,
           });
         }
@@ -9161,6 +9229,32 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 0F. ADMIN: /error (lihat / hapus riwayat error bot)
+      if (/^\/error(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/error\s*/i, "").trim().toLowerCase();
+        if (arg === "clear" || arg === "hapus") {
+          await redisCommand(["DEL", REDIS_ERRLOG_KEY]);
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Riwayat error dihapus." });
+          return res.status(200).json({ ok: true });
+        }
+        const rows = (await redisCommand(["LRANGE", REDIS_ERRLOG_KEY, "0", "9"])) || [];
+        if (rows.length === 0) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Tidak ada error tercatat. Bot aman." });
+          return res.status(200).json({ ok: true });
+        }
+        const lines = rows.map((r, i) => {
+          const e = parseJsonSafe(r) || { t: "-", msg: String(r) };
+          return `${i + 1}. <b>${escapeHtml(e.t)}</b>\n<code>${escapeHtml(String(e.msg).slice(0, 300))}</code>`;
+        });
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: `🚨 <b>ERROR TERAKHIR</b> (10 terbaru)\n\n${lines.join("\n\n")}\n\n<i>Hapus riwayat: /error clear</i>`,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 0E. ADMIN: /undian (status undian minggu ini & hasil terakhir)
       if (/^\/undian$/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -10463,6 +10557,7 @@ module.exports = async function handler(req, res) {
               "• <code>/tambahfile NO</code> | <code>/hapusfile NO NO</code> | <code>/listfile NO</code> — lampirkan banyak file/link\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
+              "• <code>/error</code> — lihat error terakhir | <code>/error clear</code>\n" +
               "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
               "• <code>/setharga_admin ID NO HARGA</code> — kunci harga jual bot reseller (min = harga toko)\n" +
               "• <code>/listmargin</code> | <code>/bayarmargin ID NOMINAL</code> — margin bot reseller\n" +
@@ -10589,6 +10684,7 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Webhook Error:", err);
+    await Promise.allSettled(pendingErrLogs.splice(0));
     return res.status(200).json({ ok: true });
   }
 };
