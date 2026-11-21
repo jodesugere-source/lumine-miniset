@@ -1886,6 +1886,7 @@ async function processAccOrderCore(token, order) {
   let soldItemId = order.item_id || "";
   let buyerText = "";
 
+  let isDupeSaldo = false;
   if (order.is_mystery) {
     const pool = katalogList.map((k) => ({
       id: String(k.id),
@@ -1895,14 +1896,28 @@ async function processAccOrderCore(token, order) {
         Array.isArray(k.links) && k.links.length > 0 ? k.links : k.link ? [k.link] : [],
       files: Array.isArray(k.files) ? k.files : [],
     }));
-    const won =
-      pool.length > 0
-        ? pickMysteryPrize(pool)
-        : { id: "", nama: "Paket Spesial Lumine", links: [`https://t.me/${ADMIN_USERNAME}`], files: [] };
+    const ownedSet = await getOwnedNameSet(order.buyer_id);
+    const freshPool = pool.filter((p) => !ownedSet.has(String(p.nama).toLowerCase().trim()));
+    let won;
+    if (pool.length === 0) {
+      won = { id: "", nama: "Paket Spesial Lumine", links: [`https://t.me/${ADMIN_USERNAME}`], files: [] };
+    } else if (freshPool.length === 0) {
+      won = null; // semua set sudah dimiliki member
+    } else {
+      won = pickMysteryPrize(freshPool);
+    }
 
-    soldItemId = won.id;
-    deliveredName = won.nama;
-    deliveredLinks = (won.links || []).map(normalizeUrl);
+    if (!won) {
+      isDupeSaldo = true;
+      await addUserSaldo(order.buyer_id, MYSTERY_DUPE_SALDO);
+      soldItemId = "";
+      deliveredName = `Saldo Pengganti ${formatRupiah(MYSTERY_DUPE_SALDO)}`;
+      deliveredLinks = [];
+    } else {
+      soldItemId = won.id;
+      deliveredName = won.nama;
+      deliveredLinks = (won.links || []).map(normalizeUrl);
+    }
     deliveredFiles = won.files || [];
 
     const linksBlock =
@@ -1917,6 +1932,13 @@ async function processAccOrderCore(token, order) {
       `Berikut akses hadiah kamu:\n` +
       `${linksBlock}\n\n` +
       `<i>Hadiah tersimpan di 🎒 Koleksi Saya & poin masuk ke Leaderboard!</i>`;
+    if (isDupeSaldo) {
+      buyerText =
+        `🎲 <b>MYSTERY BOX TERBUKA! (Pesanan #${order.id})</b> 🎲\n\n` +
+        "Set yang keluar dari box ini sudah pernah kamu miliki, jadi kamu dapat saldo pengganti:\n" +
+        `💰 <b>+${formatRupiah(MYSTERY_DUPE_SALDO)}</b>\n\n` +
+        "<i>Saldo bisa dipakai belanja di bot.</i>";
+    }
   } else {
     deliveredLinks = deliveredLinks.map(normalizeUrl);
     const linksBlock =
@@ -1945,7 +1967,7 @@ async function processAccOrderCore(token, order) {
   const buyerIsReseller = await isReseller(order.buyer_id);
   const omsetTasks = [
     recordPurchaseToLeaderboard(order),
-    addKoleksi(order.buyer_id, deliveredName, deliveredLinks[0] || ""),
+    isDupeSaldo ? Promise.resolve() : addKoleksi(order.buyer_id, deliveredName, deliveredLinks[0] || ""),
     addStoreOmset(order.total_nominal),
   ];
   let resellerResult = null;
@@ -2256,9 +2278,18 @@ async function doSpin(token, chatId, userId) {
       );
     }
 
-    // Hadiah pack: pilih satu item acak dari tier, simpan ke koleksi
-    const items = pool[prize.key];
-    const item = items[Math.floor(Math.random() * items.length)];
+    // Hadiah pack: pilih satu item acak yang BELUM dimiliki member, simpan ke koleksi
+    const ownedSpin = await getOwnedNameSet(userId);
+    const freshItems = (pool[prize.key] || []).filter((x) => !ownedSpin.has(String(x.nama).toLowerCase().trim()));
+    if (freshItems.length === 0) {
+      await addUserSaldo(userId, MYSTERY_DUPE_SALDO);
+      return sendMsg(
+        `💰 <b>Kamu sudah punya semua set di hadiah ini.</b>\n` +
+          `Saldo pengganti <b>${formatRupiah(MYSTERY_DUPE_SALDO)}</b> sudah masuk ke saldo kamu.`,
+        backBtn
+      );
+    }
+    const item = freshItems[Math.floor(Math.random() * freshItems.length)];
     const link = normalizeUrl(
       Array.isArray(item.links) && item.links.length > 0 ? item.links[0] : item.link
     );
@@ -3643,6 +3674,14 @@ async function sendUndianInfo(token, chatId, userId) {
       `🎫 Tiket kamu minggu ini: <b>${mine}</b>`,
     reply_markup: { inline_keyboard: [[{ text: "🔙 Menu Lainnya", callback_data: "menu_lainnya" }]] },
   });
+}
+
+// ---- ANTI DUPE HADIAH (mystery box & spin harian tidak memberi set yang sudah dimiliki) ----
+const MYSTERY_DUPE_SALDO = 3000; // saldo pengganti kalau semua set hadiah sudah dimiliki member
+
+async function getOwnedNameSet(userId) {
+  const list = await getKoleksi(userId);
+  return new Set((Array.isArray(list) ? list : []).map((x) => String((x && x.nama) || "").toLowerCase().trim()));
 }
 
 async function sendKatalogCreatorMenu(token, chatId) {
