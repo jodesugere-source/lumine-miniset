@@ -7572,18 +7572,49 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      // CEK ID CHAT / CHANNEL (ADMIN): /cekid, atau teruskan pesan dari channel/grup ke bot
-      if (isAdmin && (msg.forward_from_chat || /^\/cekid(\s|$)/i.test(rawText))) {
-        const src = msg.forward_from_chat || msg.chat;
-        const tipe = { private: "Chat pribadi", group: "Grup", supergroup: "Supergrup", channel: "Channel" }[src.type] || src.type;
-        const judul = escapeHtml(src.title || src.username || src.first_name || "-");
-        const info =
-          `🆔 <b>Info Chat</b>\n\n` +
-          `📛 Nama : ${judul}\n` +
-          `🏷 Jenis : ${tipe}\n` +
-          `🔢 ID : <code>${src.id}</code>\n\n` +
-          `<i>Salin ID di atas untuk dipakai di /setlogmakro.</i>`;
-        await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: info, reply_to_message_id: msg.message_id });
+      // CEK ID (ADMIN)
+      // /cekid            -> ID chat tempat perintah diketik (pribadi atau grup)
+      // /cekidchannel     -> ID channel, dari pesan yang diteruskan (forward) dari channel itu
+      if (isAdmin && /^\/cekidchannel(\s|$)/i.test(rawText)) {
+        const src = msg.forward_from_chat;
+        if (!src || src.type !== "channel") {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            parse_mode: "HTML",
+            text:
+              "📢 <b>Cek ID Channel</b>\n\n" +
+              "Teruskan (forward) satu pesan dari channel ke bot ini, lalu balas pesan itu dengan <code>/cekidchannel</code>.\n\n" +
+              "<i>Bot harus bisa menerima pesan dari channel tersebut, misalnya sebagai admin channel.</i>",
+            reply_to_message_id: msg.message_id,
+          });
+          return res.status(200).json({ ok: true });
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `📢 <b>Info Channel</b>\n\n` +
+            `📛 Nama : ${escapeHtml(src.title || "-")}\n` +
+            `🔗 Username : ${src.username ? "@" + escapeHtml(src.username) : "tanpa username (privat)"}\n` +
+            `🔢 ID : <code>${src.id}</code>\n\n` +
+            `<i>Salin ID ini untuk dipakai di /setlogmakro.</i>`,
+          reply_to_message_id: msg.message_id,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      if (isAdmin && /^\/cekid(\s|$)/i.test(rawText)) {
+        const tipe = { private: "Chat pribadi", group: "Grup", supergroup: "Supergrup", channel: "Channel" }[msg.chat.type] || msg.chat.type;
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `🆔 <b>Info Chat Ini</b>\n\n` +
+            `📛 Nama : ${escapeHtml(msg.chat.title || msg.chat.first_name || "-")}\n` +
+            `🏷 Jenis : ${tipe}\n` +
+            `🔢 ID : <code>${msg.chat.id}</code>`,
+          reply_to_message_id: msg.message_id,
+        });
         return res.status(200).json({ ok: true });
       }
 
