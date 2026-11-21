@@ -2643,7 +2643,42 @@ async function sendKatalogCreatorMenu(token, chatId) {
   });
 }
 
-async function sendKatalogListByCreator(token, chatId, creatorIdx) {
+const LUMINE_ITEMS_PER_PAGE = 8; // jumlah set per halaman katalog Lumine (sama pola dengan bot reseller)
+
+function buildLuminePageNav(prefix, p, totalPages) {
+  if (totalPages <= 1) return null;
+  const nav = [];
+  if (p > 0) nav.push({ text: "⬅️ Sebelumnya", callback_data: `${prefix}${p - 1}` });
+  nav.push({ text: `${p + 1}/${totalPages}`, callback_data: `${prefix}${p}` });
+  if (p < totalPages - 1) nav.push({ text: "Berikutnya ➡️", callback_data: `${prefix}${p + 1}` });
+  return nav;
+}
+
+function buildLumineItemRows(slice, rankMap, defaultIcon) {
+  return slice.map((item) => {
+    const sold = Number(item.sold) || 0;
+    const rank = rankMap[String(item.id)];
+    let prefix = defaultIcon;
+    let suffix = "";
+    if (rank === 1) {
+      prefix = "🔥";
+      suffix = ` • BESTSELLER (${sold}x)`;
+    } else if (rank === 2 || rank === 3) {
+      prefix = "⭐";
+      suffix = ` • POPULER (${sold}x)`;
+    } else if (sold > 0) {
+      suffix = ` (${sold}x)`;
+    }
+    return [
+      {
+        text: `${prefix} ${item.nama} — ${item.harga}${suffix}`,
+        callback_data: `detail_${item.id}`,
+      },
+    ];
+  });
+}
+
+async function sendKatalogListByCreator(token, chatId, creatorIdx, page = 0) {
   const katalogList = await getKatalog();
   const creatorGroups = getCreatorGroups(katalogList);
   const group = creatorGroups[creatorIdx];
@@ -2660,47 +2695,37 @@ async function sendKatalogListByCreator(token, chatId, creatorIdx) {
   }
 
   const rankMap = getRankedKatalog(katalogList);
-  const rows = group.items.map((item) => {
-    const sold = Number(item.sold) || 0;
-    const rank = rankMap[String(item.id)];
-    const katIcon = item.kategori === "full" ? "📦" : "🧩";
-    let prefix = katIcon;
-    let suffix = "";
-    if (rank === 1) {
-      prefix = "🔥";
-      suffix = ` • BESTSELLER (${sold}x)`;
-    } else if (rank === 2 || rank === 3) {
-      prefix = "⭐";
-      suffix = ` • POPULER (${sold}x)`;
-    } else if (sold > 0) {
-      suffix = ` (${sold}x)`;
-    }
-    return [
-      {
-        text: `${prefix} ${item.nama} — ${item.harga}${suffix}`,
-        callback_data: `detail_${item.id}`,
-      },
-    ];
-  });
+  const totalPages = Math.max(1, Math.ceil(group.items.length / LUMINE_ITEMS_PER_PAGE));
+  const p = Math.min(Math.max(0, parseInt(page, 10) || 0), totalPages - 1);
+  const slice = group.items.slice(p * LUMINE_ITEMS_PER_PAGE, (p + 1) * LUMINE_ITEMS_PER_PAGE);
 
+  const rows = buildLumineItemRows(
+    slice,
+    rankMap,
+    "📸"
+  );
+  const nav = buildLuminePageNav(`kcr_${creatorIdx}_`, p, totalPages);
+  if (nav) rows.push(nav);
   rows.push([
     { text: "👤 Daftar Creator", callback_data: "menu_katalog_creator" },
     { text: "🛍️ Semua Kategori", callback_data: "menu_katalog" },
   ]);
 
+  const hal = totalPages > 1 ? `│ Hal <b>${p + 1}/${totalPages}</b>\n` : "";
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
     text:
       `╭─── 👤 <b>CREATOR: ${escapeHtml(group.name.toUpperCase())}</b> ───\n` +
       `│ Total koleksi: <b>${group.items.length} set</b> (🧩 Mini / 📦 Full)\n` +
       "│ Pilih judul di bawah untuk lihat preview & order 👇\n" +
+      hal +
       "╰────────────────────────",
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: rows },
   });
 }
 
-async function sendKatalogListByCategory(token, chatId, kategori) {
+async function sendKatalogListByCategory(token, chatId, kategori, page = 0) {
   const katalogList = await getKatalog();
   const filtered = katalogList.filter((item) => (item.kategori || "mini") === kategori && isCategoryEnabled(item));
 
@@ -2716,39 +2741,27 @@ async function sendKatalogListByCategory(token, chatId, kategori) {
   }
 
   const rankMap = getRankedKatalog(katalogList);
-  const rows = filtered.map((item) => {
-    const sold = Number(item.sold) || 0;
-    const rank = rankMap[String(item.id)];
-    let prefix = "📸";
-    let suffix = "";
-    if (rank === 1) {
-      prefix = "🔥";
-      suffix = ` • BESTSELLER (${sold}x)`;
-    } else if (rank === 2 || rank === 3) {
-      prefix = "⭐";
-      suffix = ` • POPULER (${sold}x)`;
-    } else if (sold > 0) {
-      suffix = ` (${sold}x)`;
-    }
-    return [
-      {
-        text: `${prefix} ${item.nama} — ${item.harga}${suffix}`,
-        callback_data: `detail_${item.id}`,
-      },
-    ];
-  });
+  const totalPages = Math.max(1, Math.ceil(filtered.length / LUMINE_ITEMS_PER_PAGE));
+  const p = Math.min(Math.max(0, parseInt(page, 10) || 0), totalPages - 1);
+  const slice = filtered.slice(p * LUMINE_ITEMS_PER_PAGE, (p + 1) * LUMINE_ITEMS_PER_PAGE);
+
+  const rows = buildLumineItemRows(slice, rankMap, "📸");
+  const nav = buildLuminePageNav(`kcat_${kategori}_`, p, totalPages);
+  if (nav) rows.push(nav);
   rows.push([
     { text: "🔙 Kembali ke Kategori", callback_data: "menu_katalog" },
     { text: "🏠 Menu Utama", callback_data: "menu_home" },
   ]);
 
   const kategoriLabel = kategori === "full" ? "📦 FULL SET" : "🧩 MINI SET";
+  const hal = totalPages > 1 ? `│ Hal <b>${p + 1}/${totalPages}</b> • total ${filtered.length} set\n` : "";
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
     text:
       `╭─── 🛍️ <b>KATALOG ${kategoriLabel}</b> ───\n` +
       "│ Pilih judul di bawah untuk melihat\n" +
       "│ <b>foto preview</b> & bayar via Saldo / QRIS:\n" +
+      hal +
       "╰─────────────────────\n" +
       "<i>🔥 = Terlaris #1 • ⭐ = Paling Populer</i>",
     parse_mode: "HTML",
@@ -6594,7 +6607,7 @@ module.exports = async function handler(req, res) {
 
       // NAVIGASI: menu yang sedang tampil diganti, bukan ditumpuk chat baru.
       // Hanya tombol navigasi yang di-whitelist. Tombol bayar, WD, ACC admin, dan lainnya TIDAK dihapus.
-      const NAV_PREFIXES = ["menu_", "detail_", "lb_", "rhome", "rkat", "rcreator", "rbest", "rcara", "wlr_"];
+      const NAV_PREFIXES = ["menu_", "detail_", "lb_", "rhome", "rkat", "rcreator", "rbest", "rcara", "wlr_", "kcat_", "kcr_", "creator_list_"];
       if (NAV_PREFIXES.some((p) => data && data.startsWith(p))) {
         try {
           await tgRequest(token, "deleteMessage", { chat_id: chatId, message_id: messageId });
@@ -6633,9 +6646,15 @@ module.exports = async function handler(req, res) {
         await sendKatalogListByCategory(token, chatId, "full");
       } else if (data === "menu_katalog_creator") {
         await sendKatalogCreatorMenu(token, chatId);
+      } else if (data.startsWith("kcat_")) {
+        const [, kat, pg] = data.split("_");
+        await sendKatalogListByCategory(token, chatId, kat, pg);
+      } else if (data.startsWith("kcr_")) {
+        const [, cIdx, pg] = data.split("_");
+        await sendKatalogListByCreator(token, chatId, parseInt(cIdx, 10), pg);
       } else if (data.startsWith("creator_list_")) {
         const cIdx = parseInt(data.replace("creator_list_", ""), 10);
-        await sendKatalogListByCreator(token, chatId, cIdx);
+        await sendKatalogListByCreator(token, chatId, cIdx, 0);
       } else if (data === "menu_bestseller") {
         await sendBestsellerMenu(token, chatId);
       } else if (data === "menu_mystery") {
@@ -8004,7 +8023,7 @@ module.exports = async function handler(req, res) {
       }
 
       // 0C. ADMIN: /setcreator (ATUR / HAPUS CREATOR PADA SET KATALOG)
-      if (rawText.startsWith("/setcreator")) {
+      if (/^\/?set\s*creator(?=\s|$)/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const katalogList = await getKatalog();
         if (katalogList.length === 0) {
@@ -8012,23 +8031,40 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        const arg = rawText.replace(/^\/setcreator\s*/i, "").trim();
+        const arg = rawText.replace(/^\/?set\s*creator\s*/i, "").trim();
         if (!arg) {
-          let listText = "👤 <b>DAFTAR CREATOR SET KATALOG</b>\n\n";
-          katalogList.forEach((item, idx) => {
+          const lines = katalogList.map((item, idx) => {
             const katIcon = item.kategori === "full" ? "📦" : "🧩";
             const crLabel = item.creator
               ? `👤 <b>${escapeHtml(item.creator)}</b>`
               : "<i>(belum diatur)</i>";
-            listText += `${idx + 1}. ${katIcon} <b>${escapeHtml(item.nama)}</b> — ${crLabel}\n`;
+            return `${idx + 1}. ${katIcon} <b>${escapeHtml(item.nama)}</b> — ${crLabel}\n`;
           });
-          listText +=
+          const header = "👤 <b>DAFTAR CREATOR SET KATALOG</b>\n\n";
+          const footer =
             "\n<b>Atur / Ubah Creator:</b>\n" +
             "• Satu set: <code>/setcreator [nomor] [Nama Creator]</code>\n" +
             "• Banyak set sekaligus: <code>/setcreator 1,2,3 [Nama Creator]</code>\n" +
             "• Hapus creator: <code>/setcreator [nomor] -</code>\n" +
             "<i>Contoh: <code>/setcreator 1 Larissa Rochefort</code></i>";
-          await tgRequest(token, "sendMessage", { chat_id: chatId, text: listText, parse_mode: "HTML" });
+          // Pecah per ±3500 karakter supaya tidak melebihi limit 4096 Telegram
+          const chunks = [];
+          let cur = header;
+          for (const ln of lines) {
+            if (cur.length + ln.length > 3500) {
+              chunks.push(cur);
+              cur = "";
+            }
+            cur += ln;
+          }
+          if (cur.length + footer.length > 3500) {
+            chunks.push(cur);
+            cur = "";
+          }
+          chunks.push(cur + footer);
+          for (const part of chunks) {
+            await tgRequest(token, "sendMessage", { chat_id: chatId, text: part, parse_mode: "HTML" });
+          }
           return res.status(200).json({ ok: true });
         }
 
