@@ -431,8 +431,11 @@ async function saveRating(orderId, userId, buyerName, stars, komentar) {
       list = [];
     }
   }
+  const ratedOrder = await getOrder(orderId).catch(() => null);
+  const ratedItemId = ratedOrder && ratedOrder.item_id ? String(ratedOrder.item_id) : "";
   list.unshift({
     order_id: orderId,
+    item_id: ratedItemId,
     buyer_id: userId,
     buyer_name: buyerName,
     stars: Math.min(5, Math.max(1, Number(stars) || 5)),
@@ -6249,6 +6252,43 @@ function isCategoryEnabled(item) {
   return MINI_SET_ENABLED || (item.kategori || "mini") === "full";
 }
 
+// ==========================================
+// RATING PER SET DI HALAMAN DETAIL
+// ==========================================
+const DETAIL_REVIEW_SHOW = 2; // jumlah ulasan terbaru yang ditampilkan di detail
+const DETAIL_REVIEW_MAX_LEN = 80; // potong ulasan panjang supaya caption tidak kepanjangan
+
+// Rata-rata dan ulasan terbaru untuk satu set. Ulasan lama tanpa item_id hanya masuk ke rata-rata toko.
+async function getItemRating(itemId) {
+  const raw = await redisCommand(["GET", REDIS_RATING_KEY]);
+  let list = [];
+  try {
+    list = raw ? JSON.parse(raw) : [];
+  } catch {
+    list = [];
+  }
+  const mine = list.filter((r) => String(r.item_id || "") === String(itemId));
+  if (!mine.length) return { avg: 0, count: 0, comments: [] };
+  const total = mine.reduce((sum, r) => sum + (Number(r.stars) || 0), 0);
+  const comments = mine
+    .filter((r) => r.komentar && String(r.komentar).trim())
+    .slice(0, DETAIL_REVIEW_SHOW)
+    .map((r) => ({
+      komentar: String(r.komentar).slice(0, DETAIL_REVIEW_MAX_LEN),
+      buyer_name: String(r.buyer_name || "Pembeli"),
+    }));
+  return { avg: total / mine.length, count: mine.length, comments };
+}
+
+function buildRatingBlock(rating) {
+  if (!rating.count) return "";
+  const lines = [`⭐ <b>${rating.avg.toFixed(1)}/5</b> dari ${rating.count} ulasan`];
+  for (const c of rating.comments) {
+    lines.push(`   “${escapeHtml(c.komentar)}” — ${escapeHtml(c.buyer_name)}`);
+  }
+  return lines.join("\n") + "\n\n";
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -6643,8 +6683,10 @@ module.exports = async function handler(req, res) {
           ? `\n🎟️ <i>Voucher aktif: <b>${escapeHtml(activeV.code)}</b> (-${formatRupiah(activeV.discount)})</i>`
           : "";
 
+        const itemRatingBlock = buildRatingBlock(await getItemRating(item.id));
         const captionText =
           `✨ <b>${escapeHtml(item.nama)}</b>\n\n` +
+          itemRatingBlock +
           `╭─── 📦 <b>DETAIL PAKET</b> ───\n` +
           popularityLine +
           (item.creator ? `│ • <b>Creator :</b> 👤 ${escapeHtml(item.creator)}\n` : "") +
