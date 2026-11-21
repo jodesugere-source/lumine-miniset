@@ -2619,6 +2619,58 @@ async function sendMainMenuCard(token, chatId) {
   });
 }
 
+async function sendPhotopackTextList(token, chatId) {
+  const katalogList = (await getKatalog()).filter(isCategoryEnabled);
+  if (katalogList.length === 0) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `📂 Katalog Photopack sedang diperbarui. Hubungi @${ADMIN_USERNAME} untuk info stok terbaru.`,
+    });
+    return;
+  }
+
+  const sections = [
+    { label: "🧩 <b>MINI SET</b>", items: katalogList.filter((k) => (k.kategori || "mini") !== "full") },
+    { label: "📦 <b>FULL SET</b>", items: katalogList.filter((k) => k.kategori === "full") },
+  ];
+
+  const lines = [];
+  for (const sec of sections) {
+    if (sec.items.length === 0) continue;
+    lines.push(`\n${sec.label} (${sec.items.length} set)`);
+    sec.items.forEach((item, idx) => {
+      const crPart = item.creator ? ` • 👤 ${escapeHtml(item.creator)}` : "";
+      lines.push(`${idx + 1}. ${escapeHtml(item.nama)} — ${escapeHtml(String(item.harga))}${crPart}`);
+    });
+  }
+
+  const header = `🛍️ <b>DAFTAR PHOTOPACK</b> (total ${katalogList.length} set)\n`;
+  const footer = "\n<i>Mau lihat preview & bayar? Buka 🛍️ Katalog.</i>";
+
+  // Pecah per ±3500 karakter agar tidak melebihi limit 4096 Telegram
+  const chunks = [];
+  let cur = header;
+  for (const ln of lines) {
+    const add = "\n" + ln;
+    if (cur.length + add.length > 3500) {
+      chunks.push(cur);
+      cur = "";
+      cur += ln;
+    } else {
+      cur += add;
+    }
+  }
+  if (cur.length + footer.length > 3500) {
+    chunks.push(cur);
+    cur = "";
+  }
+  chunks.push(cur + footer);
+
+  for (const part of chunks) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: part, parse_mode: "HTML" });
+  }
+}
+
 async function sendKatalogCreatorMenu(token, chatId) {
   const katalogList = await getKatalog();
   const creatorGroups = getCreatorGroups(katalogList);
@@ -9308,6 +9360,14 @@ module.exports = async function handler(req, res) {
         } else if (text === "🤝 Reseller" || text === "/reseller") {
           await sendResellerMenu(token, chatId, msg.from);
         } else {
+          if (
+            /^(list|daftar)(\s+(photopack|photo pack|photopek|set|katalog))?$/.test(lowerText.trim()) ||
+            ["list photopack", "daftar photopack", "lihat photopack", "photopack apa aja", "photopack apa saja"].some((k) => lowerText.includes(k))
+          ) {
+            await sendPhotopackTextList(token, chatId);
+            return res.status(200).json({ ok: true });
+          }
+
           if (["panduan", "bantuan", "help"].some((k) => lowerText.includes(k))) {
             await sendPanduan(token, chatId, "root");
             return res.status(200).json({ ok: true });
