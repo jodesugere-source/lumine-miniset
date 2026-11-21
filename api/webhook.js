@@ -1631,6 +1631,11 @@ async function processAccOrder(token, order) {
     console.error("Mitra reward error:", mitraErr);
   }
   try {
+    await addUndianTickets(order);
+  } catch (utErr) {
+    console.error("Tiket undian error:", utErr);
+  }
+  try {
     await sendTestiReminder(token, order.buyer_id);
   } catch (tiErr) {
     console.error("Pengingat testimoni error:", tiErr);
@@ -3421,6 +3426,158 @@ async function payPickSelection(token, chatId, from) {
   });
 }
 
+// ---- UNDIAN MINGGUAN (1 tiket tiap Rp 5.000 belanja lunas, 3 pemenang saldo, undi tiap Minggu jam 20:00 WIB) ----
+const UNDIAN_ENABLED = true;
+const UNDIAN_TICKET_STEP = 5000; // tiap kelipatan nominal ini = 1 tiket
+const UNDIAN_PRIZES = [5000, 3000, 2000]; // hadiah saldo pemenang 1, 2, 3 (Rp)
+const UNDIAN_DRAW_HOUR = 20; // jam undian (WIB), undian selalu hari Minggu
+const REDIS_UNDIAN_TIX_PREFIX = "lumine_main_undian_tix_"; // hash per tanggal undi: id user -> jumlah tiket
+const REDIS_UNDIAN_DRAW_KEY = "lumine_main_undian_draw"; // hash: tanggal undi -> JSON hasil (atau "running")
+
+function undianWibNow() {
+  const d = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  return { dow: d.getUTCDay(), hour: d.getUTCHours(), d };
+}
+
+function undianYmdAdd(d, days) {
+  return new Date(d.getTime() + days * 86400000).toISOString().slice(0, 10);
+}
+
+// Tanggal undian yang terakhir sudah jatuh tempo (Minggu jam 20:00 WIB terakhir)
+function getUndianLastDueKey() {
+  const { dow, hour, d } = undianWibNow();
+  const back = dow === 0 ? (hour >= UNDIAN_DRAW_HOUR ? 0 : 7) : dow;
+  return undianYmdAdd(d, -back);
+}
+
+// Tanggal undian yang akan datang: tiket yang dibeli sekarang masuk ke sini
+function getUndianNextKey() {
+  const { dow, hour, d } = undianWibNow();
+  let forward = (7 - dow) % 7;
+  if (forward === 0 && hour >= UNDIAN_DRAW_HOUR) forward = 7;
+  return undianYmdAdd(d, forward);
+}
+
+function formatUndianDate(key) {
+  const [y, m, dd] = key.split("-");
+  return `Minggu, ${dd}/${m}/${y} • 20:00 WIB`;
+}
+
+async function addUndianTickets(order) {
+  if (!UNDIAN_ENABLED || !order || !order.buyer_id) return;
+  const n = Math.floor((Number(order.total_nominal) || 0) / UNDIAN_TICKET_STEP);
+  if (n <= 0) return;
+  await redisCommand(["HINCRBY", REDIS_UNDIAN_TIX_PREFIX + getUndianNextKey(), String(order.buyer_id), n]);
+}
+
+function pickUndianWinners(entries, k) {
+  const winners = [];
+  const pool = entries.slice();
+  while (winners.length < k && pool.length > 0) {
+    const total = pool.reduce((s, e) => s + e.n, 0);
+    let r = Math.random() * total;
+    let idx = 0;
+    for (; idx < pool.length - 1; idx++) {
+      r -= pool[idx].n;
+      if (r < 0) break;
+    }
+    winners.push(pool[idx]);
+    pool.splice(idx, 1);
+  }
+  return winners;
+}
+
+// Dipanggil di setiap pesan masuk. Undi otomatis begitu jatuh tempo, sekali saja per periode.
+async function maybeRunUndianDraw(token) {
+  if (!UNDIAN_ENABLED) return;
+  const drawKey = getUndianLastDueKey();
+  if (Number(await redisCommand(["HEXISTS", REDIS_UNDIAN_DRAW_KEY, drawKey])) === 1) return;
+  const claimed = Number(await redisCommand(["HSETNX", REDIS_UNDIAN_DRAW_KEY, drawKey, "running"])) === 1;
+  if (!claimed) return;
+
+  try {
+    const flat = (await redisCommand(["HGETALL", REDIS_UNDIAN_TIX_PREFIX + drawKey])) || [];
+    const entries = [];
+    for (let i = 0; i < flat.length; i += 2) {
+      const n = Number(flat[i + 1]) || 0;
+      if (n > 0) entries.push({ uid: String(flat[i]), n });
+    }
+    const totalTickets = entries.reduce((s, e) => s + e.n, 0);
+    const winners = pickUndianWinners(entries, UNDIAN_PRIZES.length);
+    const fundId = await getReferralFundId();
+    const awarded = [];
+
+    for (let i = 0; i < winners.length; i++) {
+      const w = winners[i];
+      const prize = UNDIAN_PRIZES[i];
+      if (!fundId) break;
+      const d = await deductUserSaldo(fundId, prize);
+      if (!d.ok) {
+        await tgRequest(token, "sendMessage", {
+          chat_id: (await getQris() || {}).admin_chat_id,
+          text: `⚠️ Kas kurang untuk hadiah undian ${formatRupiah(prize)}. Isi dengan /addsaldo ${fundId} NOMINAL, lalu bayar manual ke member.`,
+        });
+        continue;
+      }
+      await addUserSaldo(w.uid, prize);
+      awarded.push({ rank: i + 1, uid: w.uid, prize });
+    }
+
+    const result = { drawKey, participants: entries.length, tickets: totalTickets, winners: awarded };
+    await redisCommand(["HSET", REDIS_UNDIAN_DRAW_KEY, drawKey, JSON.stringify(result)]);
+
+    const lines = awarded.length
+      ? awarded.map((a) => `${["🥇", "🥈", "🥉"][a.rank - 1]} Member ***${escapeHtml(a.uid.slice(-4))} — <b>${formatRupiah(a.prize)}</b>`).join("\n")
+      : "Belum ada peserta minggu ini.";
+    const announce =
+      `🎟 <b>HASIL UNDIAN MINGGUAN</b>\n` +
+      `${formatUndianDate(drawKey)}\n` +
+      `Peserta: <b>${entries.length}</b> • Total tiket: <b>${totalTickets}</b>\n\n` +
+      `${lines}\n\n` +
+      `<i>Hadiah sudah masuk ke saldo pemenang. Undian berikutnya tiap Minggu jam 20:00 WIB.</i>`;
+
+    const testi = await getTestiConfig();
+    const annTarget = testi && testi.channel_id ? testi.channel_id : (await getQris() || {}).admin_chat_id;
+    if (annTarget && entries.length > 0) {
+      await tgRequest(token, "sendMessage", { chat_id: annTarget, text: announce, parse_mode: "HTML" });
+    }
+    for (const a of awarded) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: a.uid,
+        parse_mode: "HTML",
+        text: `🎉 <b>Kamu menang undian mingguan!</b>\nPeringkat ${a.rank}, saldo masuk: <b>+${formatRupiah(a.prize)}</b>`,
+      });
+    }
+  } catch (err) {
+    // lock tetap tertahan supaya hadiah tidak terbayar dobel; admin perlu cek manual
+    console.error("Undian gagal:", err);
+    const qris = await getQris();
+    if (qris && qris.admin_chat_id) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: qris.admin_chat_id,
+        text: `⚠️ Undian ${drawKey} gagal diproses otomatis. Cek log Vercel sebelum mengulang.`,
+      });
+    }
+  }
+}
+
+async function sendUndianInfo(token, chatId, userId) {
+  const key = getUndianNextKey();
+  const mine = Number(await redisCommand(["HGET", REDIS_UNDIAN_TIX_PREFIX + key, String(userId)])) || 0;
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      "🎟 <b>UNDIAN MINGGUAN</b>\n\n" +
+      `Setiap belanja lunas <b>${formatRupiah(UNDIAN_TICKET_STEP)}</b> dapat <b>1 tiket</b>.\n` +
+      `Pemenang diundi acak, dan hadiahnya saldo:\n` +
+      UNDIAN_PRIZES.map((p, i) => `${["🥇", "🥈", "🥉"][i]} ${formatRupiah(p)}`).join("\n") +
+      `\n\n📅 Undian berikutnya: <b>${formatUndianDate(key)}</b>\n` +
+      `🎫 Tiket kamu minggu ini: <b>${mine}</b>`,
+    reply_markup: { inline_keyboard: [[{ text: "🔙 Menu Lainnya", callback_data: "menu_lainnya" }]] },
+  });
+}
+
 async function sendKatalogCreatorMenu(token, chatId) {
   const katalogList = await getKatalog();
   const creatorGroups = getCreatorGroups(katalogList);
@@ -3901,6 +4058,7 @@ async function sendMoreMenu(token, chatId) {
           { text: "📋 Cara Order", callback_data: "menu_cara" },
         ],
         [{ text: "📱 Referral Aplikasi", callback_data: "menu_appref" }],
+        [{ text: "🎟 Undian Mingguan", callback_data: "menu_undian" }],
         [
           { text: "🔗 Channel Resmi", callback_data: "menu_channel" },
           { text: `💬 Admin`, url: `https://t.me/${ADMIN_USERNAME}` },
@@ -8079,6 +8237,8 @@ module.exports = async function handler(req, res) {
             parse_mode: "HTML",
           });
         }
+      } else if (data === "menu_undian") {
+        await sendUndianInfo(token, chatId, callerId);
       } else if (data === "menu_appref") {
         await sendApprefInfo(token, chatId, callerId);
       } else if (data === "appref_start") {
@@ -8253,6 +8413,13 @@ module.exports = async function handler(req, res) {
 
       const rawText = (msg.text || msg.caption || "").trim();
       const lowerText = rawText.toLowerCase();
+
+      // UNDIAN: undi otomatis kalau sudah jatuh tempo
+      try {
+        await maybeRunUndianDraw(token);
+      } catch (udErr) {
+        console.error("Cek undian error:", udErr);
+      }
 
       // REFERRAL APLIKASI: input ID / nama dari member (perintah / selain /batal diabaikan)
       if (rawText && (!rawText.startsWith("/") || /^\/batal$/i.test(rawText))) {
@@ -8990,6 +9157,40 @@ module.exports = async function handler(req, res) {
           chat_id: chatId,
           text: `✅ Jumlah terjual <b>${escapeHtml(katalogList[idx].nama)}</b> diatur ke <b>${newSold}x</b>!`,
           parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0E. ADMIN: /undian (status undian minggu ini & hasil terakhir)
+      if (/^\/undian$/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const nextKey = getUndianNextKey();
+        const lastKey = getUndianLastDueKey();
+        const flat = (await redisCommand(["HGETALL", REDIS_UNDIAN_TIX_PREFIX + nextKey])) || [];
+        let tix = 0;
+        let peserta = 0;
+        for (let i = 1; i < flat.length; i += 2) {
+          const n = Number(flat[i]) || 0;
+          if (n > 0) {
+            tix += n;
+            peserta++;
+          }
+        }
+        const last = parseJsonSafe(await redisCommand(["HGET", REDIS_UNDIAN_DRAW_KEY, lastKey]));
+        let lastText = "Belum ada hasil.";
+        if (last && last.winners) {
+          lastText = last.winners.length
+            ? last.winners.map((w) => `${w.rank}. ***${escapeHtml(String(w.uid).slice(-4))} • ${formatRupiah(w.prize)}`).join("\n")
+            : "Tidak ada peserta.";
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `🎟 <b>UNDIAN MINGGUAN (ADMIN)</b>\n` +
+            `📅 Undian berikutnya: <b>${formatUndianDate(nextKey)}</b>\n` +
+            `👥 Peserta: <b>${peserta}</b> • 🎫 Tiket: <b>${tix}</b>\n\n` +
+            `<b>Hasil terakhir (${formatUndianDate(lastKey)}):</b>\n${lastText}`,
         });
         return res.status(200).json({ ok: true });
       }
