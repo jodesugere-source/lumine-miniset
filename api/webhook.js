@@ -107,6 +107,10 @@ const UPSELL_ENABLED = true; // false = matikan fitur upsell
 const UPSELL_DISCOUNT_PERCENT = 10; // diskon untuk set tawaran
 const UPSELL_WINDOW_MINUTES = 10; // lama penawaran berlaku
 
+// ---- FLASH SALE (promo kilat per-set, otomatis berakhir sendiri) ----
+const FLASHSALE_DEFAULT_MINUTES = 60; // durasi default 1 jam kalau admin tidak menentukan durasi
+const REDIS_FLASHSALE_KEY = "lumine_main_flashsale"; // JSON: { item_id, item_nama, original_harga, original_nominal, flash_price, start_ts, end_ts }
+
 // ---- HADIAH LEADERBOARD BULANAN (saldo otomatis untuk Top 3 pembeli bulan lalu) ----
 const LB_REWARD_ENABLED = true; // false = matikan hadiah
 const LB_REWARD_SALDO = [10000, 5000, 3000]; // hadiah saldo untuk peringkat 1, 2, 3
@@ -536,6 +540,39 @@ async function getRecentRatings(limit = 10) {
   } catch {
     return [];
   }
+}
+
+// ---- FLASH SALE ----
+async function getFlashSale() {
+  const raw = await redisCommand(["GET", REDIS_FLASHSALE_KEY]);
+  if (!raw) return null;
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!data || !data.end_ts) return null;
+  if (Date.now() >= data.end_ts) return null; // sudah lewat waktu, dianggap tidak aktif
+  return data;
+}
+
+async function saveFlashSale(data) {
+  await redisCommand(["SET", REDIS_FLASHSALE_KEY, JSON.stringify(data)]);
+}
+
+async function clearFlashSale() {
+  await redisCommand(["DEL", REDIS_FLASHSALE_KEY]);
+}
+
+function getFlashSaleRemainingText(fs) {
+  const ms = Math.max(0, fs.end_ts - Date.now());
+  const totalMin = Math.floor(ms / 60000);
+  const jam = Math.floor(totalMin / 60);
+  const menit = totalMin % 60;
+  if (jam > 0) return `${jam}j ${menit}m lagi`;
+  if (menit > 0) return `${menit} menit lagi`;
+  return "segera berakhir";
 }
 
 async function getKatalog() {
@@ -2681,15 +2718,26 @@ async function createAndSendDepositInvoice(token, chatId, user, amount) {
 async function sendMainMenuCard(token, chatId) {
   const banner = await getBanner();
   const mysteryCfg = await getMysteryConfig();
+  const flashSale = await getFlashSale();
+  const flashBannerLine = flashSale
+    ? `\n⚡⚡⚡ <b>FLASH SALE AKTIF!</b> ⚡⚡⚡\n` +
+      `📦 ${escapeHtml(flashSale.item_nama)} — <s>${formatRupiah(flashSale.original_nominal)}</s> ➜ <b>${formatRupiah(flashSale.flash_price)}</b>\n` +
+      `⏱️ ${getFlashSaleRemainingText(flashSale)}!\n`
+    : "";
   const cardText =
     "✨ <b>LUMINE PHOTOPACK</b> ✨\n" +
-    "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n\n" +
+    "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n" +
+    flashBannerLine +
+    "\n" +
     `• <b>Standar:</b> <code>${formatRupiah(RETAIL_PRICE_LITE)}</code> | <b>Premium:</b> <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
     `• <b>Mystery Box:</b> <code>${formatRupiah(mysteryCfg.price || 3000)}</code>\n\n` +
     "Pilih menu di bawah 👇";
 
   const inlineMarkup = {
     inline_keyboard: [
+      ...(flashSale
+        ? [[{ text: `⚡ FLASH SALE: ${flashSale.item_nama}`.slice(0, 60), callback_data: `detail_${flashSale.item_id}` }]]
+        : []),
       [
         { text: "🛍️ Katalog", callback_data: "menu_katalog" },
         { text: "🔥 Bestseller", callback_data: "menu_bestseller" },
@@ -2742,8 +2790,12 @@ async function sendMainMenuCard(token, chatId) {
   const miniCount = katalogList.filter((k) => (k.kategori || "mini") !== "full").length;
   const fullCount = katalogList.filter((k) => k.kategori === "full").length;
   const creatorGroups = getCreatorGroups(katalogList.filter(isCategoryEnabled));
+  const flashSale = await getFlashSale();
 
   const keyboard = [
+    ...(flashSale
+      ? [[{ text: `⚡ FLASH SALE: ${flashSale.item_nama}`.slice(0, 60), callback_data: `detail_${flashSale.item_id}` }]]
+      : []),
     ...(MINI_SET_ENABLED ? [[{ text: `🧩 Mini Set (${miniCount})`, callback_data: "menu_katalog_mini" }]] : []),
     [{ text: `📦 Full Set (${fullCount})`, callback_data: "menu_katalog_full" }],
   ];
@@ -3740,6 +3792,27 @@ const NEW_USER_PRICE_MAP = { 5000: 3000, 10000: 7000 }; // harga normal -> harga
 const REDIS_PHONE_KEY = "lumine_main_phone"; // hash: id user -> nomor HP terverifikasi
 const REDIS_PHONE_OWNER_KEY = "lumine_main_phone_owner"; // hash: nomor HP -> id user pemiliknya
 
+// ---- TIER HARGA MEMBER AKTIF (diskon otomatis berdasarkan jumlah pembelian) ----
+const TIER_LEVELS = [
+  { min: 15, name: "🥇 Emas", pct: 10 },
+  { min: 5, name: "🥈 Perak", pct: 5 },
+  { min: 0, name: "🥉 Perunggu", pct: 0 },
+];
+
+function tierFromCount(cnt) {
+  return TIER_LEVELS.find((t) => cnt >= t.min) || TIER_LEVELS[TIER_LEVELS.length - 1];
+}
+
+async function getMemberTier(userId) {
+  const cnt = Number(await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(userId)])) || 0;
+  return tierFromCount(cnt);
+}
+
+function applyTierPrice(retail, tier) {
+  if (!tier || !(tier.pct > 0)) return retail;
+  return Math.max(500, Math.floor((retail * (1 - tier.pct / 100)) / 100) * 100);
+}
+
 function getNewUserPrice(retail) {
   const sp = NEW_USER_PRICE_MAP[Number(retail)];
   return sp && sp < Number(retail) ? sp : null;
@@ -4441,21 +4514,35 @@ async function sendMoreMenu(token, chatId) {
       : [];
   const itemFiles = Array.isArray(item.files) ? item.files : [];
   let baseNominal = parseNominal(item.harga);
-  if (userId) {
+  let tierLabel = "";
+  const flashSale = await getFlashSale();
+  const flashActive = flashSale && String(flashSale.item_id) === String(item.id);
+  if (flashActive) {
+    baseNominal = flashSale.flash_price;
+    tierLabel = `⚡ FLASH SALE`;
+  } else if (userId) {
     const sp = getNewUserPrice(baseNominal);
     if (sp && (await isNewBuyer(userId)) && (await isPhoneVerified(userId))) {
       baseNominal = sp;
+    } else {
+      const tier = await getMemberTier(userId);
+      if (tier.pct > 0) {
+        baseNominal = applyTierPrice(baseNominal, tier);
+        tierLabel = `${tier.name} -${tier.pct}%`;
+      }
     }
   }
   return {
     ok: true,
     itemId: String(item.id),
     itemNama: item.nama,
+    tierLabel,
     baseNominal,
     targetLink: itemLinks[0] || "",
     targetLinks: itemLinks,
     targetFiles: itemFiles,
     isMystery: false,
+    isFlashSale: Boolean(flashActive),
   };
 }
 
@@ -8211,14 +8298,23 @@ module.exports = async function handler(req, res) {
           : "";
 
         const itemRatingBlock = buildRatingBlock(await getItemRating(item.id));
+        const flashSaleNow = await getFlashSale();
+        const itemFlashActive = Boolean(flashSaleNow && String(flashSaleNow.item_id) === String(item.id));
+        const flashLine = itemFlashActive
+          ? `│ • ⚡ <b>FLASH SALE :</b> <s>${escapeHtml(item.harga)}</s> ➜ <code>${formatRupiah(flashSaleNow.flash_price)}</code>\n` +
+            `│ • ⏱️ <b>Berakhir :</b> ${getFlashSaleRemainingText(flashSaleNow)} (${formatWibClock(flashSaleNow.end_ts)})\n`
+          : "";
         const captionText =
+          (itemFlashActive ? `⚡⚡⚡ <b>FLASH SALE AKTIF!</b> ⚡⚡⚡\n\n` : "") +
           `✨ <b>${escapeHtml(item.nama)}</b>\n\n` +
           itemRatingBlock +
           `╭─── 📦 <b>DETAIL PAKET</b> ───\n` +
           popularityLine +
           (item.creator ? `│ • <b>Creator :</b> 👤 ${escapeHtml(item.creator)}\n` : "") +
           `│ • <b>Isi :</b> ${escapeHtml(item.isi)}\n` +
-          `│ • <b>Harga :</b> <code>${escapeHtml(item.harga)}</code>\n` +
+          (itemFlashActive
+            ? flashLine
+            : `│ • <b>Harga :</b> <code>${escapeHtml(item.harga)}</code>\n`) +
           `│ • <b>Saldo Kamu :</b> <code>${formatRupiah(saldo)}</code>\n` +
           `╰────────────────────${voucherNote}\n\n` +
           `💳 Klik tombol di bawah untuk checkout via <b>Saldo</b> atau <b>QRIS</b>!`;
@@ -8255,6 +8351,24 @@ module.exports = async function handler(req, res) {
             inlineMarkup.inline_keyboard.unshift([
               { text: "📱 Verifikasi Nomor untuk Harga Khusus", callback_data: "verify_phone" },
             ]);
+          }
+        }
+        const tierNow = await getMemberTier(callerId);
+        if (tierNow.pct > 0 && !newUserSpecial) {
+          const curBtn = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
+          if (curBtn && String(curBtn.callback_data || "").startsWith("buy_")) {
+            const tierPrice = applyTierPrice(parseNominal(item.harga), tierNow);
+            inlineMarkup.inline_keyboard[0] = [
+              { text: `💳 Beli Set Ini (${formatRupiah(tierPrice)} • ${tierNow.name} -${tierNow.pct}%)`, callback_data: `buy_${item.id}` },
+            ];
+          }
+        }
+        if (itemFlashActive) {
+          const curBtnFlash = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
+          if (curBtnFlash && String(curBtnFlash.callback_data || "").startsWith("buy_")) {
+            inlineMarkup.inline_keyboard[0] = [
+              { text: `⚡ Beli Flash Sale (${formatRupiah(flashSaleNow.flash_price)})`, callback_data: `buy_${item.id}` },
+            ];
           }
         }
         const botUname = await getBotUsername(token);
@@ -10809,6 +10923,135 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 10A2. ADMIN: /flashsale — mulai promo kilat (default 1 jam) untuk satu set
+      if (rawText.startsWith("/flashsale")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const katalogList = await getKatalog();
+        const content = rawText.replace(/^\/flashsale\s*/i, "").trim();
+        const parts = content.split("|").map((p) => p.trim());
+        const idx = parseInt(parts[0], 10) - 1;
+
+        if (!content) {
+          const activeFs = await getFlashSale();
+          let helpText =
+            "⚡ <b>FLASH SALE</b>\n\n" +
+            "Gunakan: <code>/flashsale [nomor_set] | [harga_flash] | [durasi_menit]</code>\n" +
+            "<i>Durasi opsional, default 60 menit (1 jam). Lihat nomor set lewat /edit.\n" +
+            "Contoh: <code>/flashsale 2 | 1500 | 30</code></i>\n\n" +
+            "Hentikan promo yang sedang jalan: <code>/stopflashsale</code>";
+          if (activeFs) {
+            helpText +=
+              `\n\n🔥 <b>Sedang aktif:</b> ${escapeHtml(activeFs.item_nama)}\n` +
+              `${formatRupiah(activeFs.original_nominal)} ➜ ${formatRupiah(activeFs.flash_price)} (${getFlashSaleRemainingText(activeFs)})`;
+          }
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: helpText, parse_mode: "HTML" });
+          return res.status(200).json({ ok: true });
+        }
+
+        if (isNaN(idx) || idx < 0 || idx >= katalogList.length || !parts[1]) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              "⚠️ Format: <code>/flashsale [nomor_set] | [harga_flash] | [durasi_menit]</code>\n" +
+              "<i>Lihat nomor set lewat /edit.</i>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const item = katalogList[idx];
+        const originalNominal = parseNominal(item.harga);
+        const flashPrice = Math.round(Number(parts[1].replace(/[^\d]/g, "")) || 0);
+
+        if (flashPrice <= 0 || flashPrice >= originalNominal) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `⚠️ Harga flash sale harus lebih murah dari harga asli (${formatRupiah(originalNominal)}).`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const durasiMenit = parts[2] ? Math.max(1, parseInt(parts[2], 10) || FLASHSALE_DEFAULT_MINUTES) : FLASHSALE_DEFAULT_MINUTES;
+        const startTs = Date.now();
+        const endTs = startTs + durasiMenit * 60 * 1000;
+
+        await saveFlashSale({
+          item_id: String(item.id),
+          item_nama: item.nama,
+          original_harga: item.harga,
+          original_nominal: originalNominal,
+          flash_price: flashPrice,
+          start_ts: startTs,
+          end_ts: endTs,
+        });
+
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text:
+            `⚡ <b>FLASH SALE DIMULAI!</b>\n` +
+            `━━━━━━━━━━━━━━━━━━━━\n` +
+            `📦 <b>${escapeHtml(item.nama)}</b>\n` +
+            `💰 ${formatRupiah(originalNominal)} ➜ <b>${formatRupiah(flashPrice)}</b>\n` +
+            `⏱️ Durasi: <b>${durasiMenit} menit</b> (berakhir ${formatWibClock(endTs)})\n\n` +
+            `Mengirim pengumuman ke semua user...`,
+          parse_mode: "HTML",
+        });
+
+        // Umumkan ke semua user secara otomatis (pakai pola yang sama dengan /broadcast)
+        const allUserIds = (await redisCommand(["SMEMBERS", REDIS_USERS_KEY])) || [];
+        const bannedIds = new Set(((await redisCommand(["HKEYS", REDIS_BLACKLIST_KEY])) || []).map(String));
+        const userIds = allUserIds.filter((uid) => !bannedIds.has(String(uid)));
+        const announceText =
+          `⚡⚡⚡ <b>FLASH SALE ${durasiMenit} MENIT!</b> ⚡⚡⚡\n\n` +
+          `📦 <b>${escapeHtml(item.nama)}</b>\n` +
+          `💰 <s>${formatRupiah(originalNominal)}</s> ➜ <b>${formatRupiah(flashPrice)}</b>\n` +
+          `⏱️ Buruan sebelum ${formatWibClock(endTs)}, stok harga promo terbatas waktu!`;
+
+        let sentCount = 0;
+        const batchSize = 20;
+        for (let i = 0; i < userIds.length; i += batchSize) {
+          const batch = userIds.slice(i, i + batchSize);
+          const results = await Promise.all(
+            batch.map((uid) =>
+              tgRequest(token, "sendMessage", {
+                chat_id: uid,
+                text: announceText,
+                parse_mode: "HTML",
+                reply_markup: {
+                  inline_keyboard: [[{ text: "⚡ Serbu Sekarang!", callback_data: `detail_${item.id}` }]],
+                },
+              })
+            )
+          );
+          results.forEach((r) => {
+            if (r && r.ok) sentCount++;
+          });
+        }
+
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ <b>Pengumuman flash sale terkirim!</b>\nTerkirim ke <b>${sentCount}</b> dari <b>${userIds.length}</b> user.`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 10A3. ADMIN: /stopflashsale — hentikan promo kilat yang sedang berjalan
+      if (rawText.startsWith("/stopflashsale")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const activeFs = await getFlashSale();
+        await clearFlashSale();
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: activeFs
+            ? `🛑 Flash sale <b>${escapeHtml(activeFs.item_nama)}</b> dihentikan.`
+            : "ℹ️ Tidak ada flash sale yang sedang aktif.",
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 10B. ADMIN: /tambahfile — lampirkan file upload langsung (foto/dokumen) ke sebuah set
       if (rawText.startsWith("/tambahfile")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -11053,6 +11296,7 @@ module.exports = async function handler(req, res) {
               "• <code>/setmystery HARGA</code> | <code>/setsold</code> | <code>/setcreator</code> | <code>/resetlb</code> | <code>/hadiahlb</code>\n" +
               "• <code>/tambah</code> (1 baris = 1 set, bisa banyak sekaligus) | <code>/edit</code> | <code>/hapus</code>\n" +
               "• <code>/tambahfile NO</code> | <code>/hapusfile NO NO</code> | <code>/listfile NO</code> — lampirkan banyak file/link\n" +
+              "• <code>/flashsale NO | HARGA | MENIT</code> | <code>/stopflashsale</code> — promo kilat + auto broadcast\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
               "• <code>/error</code> — lihat error terakhir | <code>/error clear</code>\n" +
