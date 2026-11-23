@@ -2877,7 +2877,12 @@ async function sendPhotopackTextList(token, chatId) {
 
 // ---- VIP SEMUA SET (sekali bayar via saldo, semua set bisa diambil gratis) ----
 const VIP_ENABLED = true;
-const VIP_PRICE = 500000; // harga VIP (Rp)
+const REDIS_VIP_PRICE_KEY = "lumine_main_vip_price"; // harga VIP yang diatur admin lewat /setvip
+const VIP_PRICE_DEFAULT = 500000; // harga awal kalau belum pernah diatur
+async function getVipPrice() {
+  const v = parseInt(await redisCommand(["GET", REDIS_VIP_PRICE_KEY]), 10);
+  return v >= 1000 ? v : VIP_PRICE_DEFAULT;
+}
 const REDIS_VIP_KEY = "lumine_main_vip"; // hash: id user -> tanggal beli VIP
 
 async function isVipUser(userId) {
@@ -2886,6 +2891,7 @@ async function isVipUser(userId) {
 }
 
 async function sendVipMenu(token, chatId, userId) {
+  const VIP_PRICE = await getVipPrice();
   const katalog = await getKatalog();
   const saldo = await getUserSaldo(userId);
   if (await isVipUser(userId)) {
@@ -2919,6 +2925,7 @@ async function sendVipMenu(token, chatId, userId) {
 }
 
 async function buyVipViaSaldo(token, chatId, from) {
+  const VIP_PRICE = await getVipPrice();
   const userId = String(from.id);
   if (await isVipUser(userId)) {
     await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Kamu sudah VIP." });
@@ -10367,6 +10374,28 @@ module.exports = async function handler(req, res) {
         await replySub(
           `✅ Klaim subscribe diperbarui:\n📺 <b>${escapeHtml(subCfg.name)}</b>\n🔗 ${escapeHtml(subCfg.link)}`
         );
+        return res.status(200).json({ ok: true });
+      }
+
+      // ADMIN: /setvip NOMINAL (ubah harga VIP Semua Set)
+      if (rawText.startsWith("/setvip")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/setvip\s*/i, "").trim();
+        const newPrice = parseInt(arg.replace(/\D/g, ""), 10);
+        if (!newPrice || newPrice < 1000) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Masukkan nominal minimal 1000 (contoh: <code>/setvip 200000</code>).",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        await redisCommand(["SET", REDIS_VIP_PRICE_KEY, String(newPrice)]);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ <b>Harga VIP Semua Set sekarang ${formatRupiah(newPrice)}!</b>`,
+          parse_mode: "HTML",
+        });
         return res.status(200).json({ ok: true });
       }
 
