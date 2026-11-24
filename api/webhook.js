@@ -10875,6 +10875,64 @@ module.exports = async function handler(req, res) {
         }
 
         const parts = arg.split("|").map((p) => p.trim());
+
+        // Edit banyak set sekaligus: /edit 37,39 | | | Rp 15.000 | |   atau   /edit 37-40 | | | Rp 15.000 | |
+        // Untuk banyak set hanya Harga, Kategori, dan Creator yang bisa diubah.
+        if (/[,\-]/.test(parts[0])) {
+          const nums = new Set();
+          let bad = false;
+          for (const seg of parts[0].split(",")) {
+            const t = seg.trim();
+            const m = t.match(/^(\d+)\s*-\s*(\d+)$/);
+            if (m) {
+              const a = parseInt(m[1], 10);
+              const b = parseInt(m[2], 10);
+              for (let n = Math.min(a, b); n <= Math.max(a, b) && nums.size <= katalogList.length; n++) nums.add(n);
+            } else if (/^\d+$/.test(t)) {
+              nums.add(parseInt(t, 10));
+            } else {
+              bad = true;
+            }
+          }
+          const list = [...nums];
+          if (bad || list.length === 0 || list.some((n) => n < 1 || n > katalogList.length)) {
+            await tgRequest(token, "sendMessage", {
+              chat_id: chatId,
+              text: "⚠️ Nomor set tidak valid. Contoh: <code>/edit 37,39 | | | Rp 15.000 | |</code> atau <code>/edit 37-40 | | | Rp 15.000 | |</code>",
+              parse_mode: "HTML",
+            });
+            return res.status(200).json({ ok: true });
+          }
+          if (parts[1] || parts[2] || parts[4]) {
+            await tgRequest(token, "sendMessage", {
+              chat_id: chatId,
+              text: "⚠️ Kalau edit banyak set sekaligus, hanya <b>Harga</b>, <b>Kategori</b>, dan <b>Creator</b> yang bisa diubah. Nama, Isi, dan Link kosongkan (edit satu per satu).",
+              parse_mode: "HTML",
+            });
+            return res.status(200).json({ ok: true });
+          }
+          for (const n of list) {
+            const it = katalogList[n - 1];
+            if (parts[3]) it.harga = parts[3];
+            if (parts.length >= 6 && parts[5]) it.kategori = parts[5].toLowerCase().includes("full") ? "full" : "mini";
+            if (parts.length >= 7 && parts[6]) {
+              it.creator =
+                parts[6] === "-" || parts[6].toLowerCase() === "hapus" ? "" : parts[6].replace(/\s+/g, " ").slice(0, 60);
+            }
+          }
+          await saveKatalog(katalogList);
+          const namaList = list
+            .slice(0, 15)
+            .map((n) => `• #${n} ${escapeHtml(katalogList[n - 1].nama)}`)
+            .join("\n");
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `✅ <b>${list.length} set diperbarui!</b>\n${namaList}${list.length > 15 ? "\n…" : ""}`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
         const idx = parseInt(parts[0], 10) - 1;
         if (isNaN(idx) || idx < 0 || idx >= katalogList.length) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Nomor set tidak valid." });
