@@ -69,8 +69,8 @@ const LINK_CH_CADANGAN = "https://t.me/+OGXaaPyrnd5kMmY1";
 const LINK_CH_FREE = "https://t.me/+jf3tLqLIG444MjBI";
 
 // ---- PENGATURAN MENU RESELLER (UBAH SESUAI KEBUTUHAN) ----
-const RETAIL_PRICE_LITE = 5000; // harga retail Paket Standar (nama tampilan; variabel LITE = paket Rp 5.000)
-const RETAIL_PRICE_STANDAR = 10000; // harga retail Paket Premium (variabel STANDAR = paket Rp 10.000)
+const RETAIL_PRICE_LITE = 5000; // TIDAK DIPAKAI LAGI untuk jualan (paket 5k dihapus). Dibiarkan agar hitungan modal reseller tetap aman.
+const RETAIL_PRICE_STANDAR = 10000; // harga retail semua set (satu harga: Rp 10.000)
 const RESELLER_PRICE_LITE = 3500; // harga modal reseller Paket Standar (retail Rp 5.000)
 const RESELLER_PRICE_STANDAR = 7000; // harga modal reseller Paket Premium (retail Rp 10.000)
 const RESELLER_MIN_ORDER = 10; // minimal ambil set per order
@@ -190,8 +190,7 @@ const SPIN_SALDO_AMOUNT = 500; // nominal hadiah saldo (dipotong dari kas admin)
 const SPIN_PRIZES = [
   { key: "zonk", chance: 8 },
   { key: "saldo", chance: 30 },
-  { key: "pack5", chance: 40, price: 5000 },
-  { key: "pack10", chance: 20, price: 10000 },
+  { key: "pack10", chance: 60, price: 10000 },
   { key: "all50", chance: 2, price: 50000 },
 ]; // file restore yg nunggu /restore konfirmasi (TTL 5 menit)
 
@@ -385,7 +384,7 @@ function buildTierSummaryLines(info) {
   const t = info.tier;
   let out =
     `🏅 <b>Tier:</b> ${t.name}\n` +
-    `💲 <b>Harga Tier:</b> Standar <code>${formatRupiah(t.price_lite)}</code> • Premium <code>${formatRupiah(t.price_standar)}</code>\n`;
+    `💲 <b>Harga Tier:</b> <code>${formatRupiah(t.price_standar)}</code> per set\n`;
   out += info.next
     ? `🎯 <b>Naik ke ${info.next.name}:</b> kurang <code>${formatRupiah(info.remaining)}</code> lagi`
     : "🏆 <b>Kamu sudah di tier tertinggi!</b>";
@@ -398,7 +397,7 @@ function buildTierLadderBlock() {
     const syarat = t.min_omset > 0 ? `omset ≥ ${formatRupiah(t.min_omset)}` : "tier awal";
     out +=
       `│ ${t.name} <i>(${syarat})</i>\n` +
-      `│    Standar <code>${formatRupiah(t.price_lite)}</code> • Premium <code>${formatRupiah(t.price_standar)}</code>\n`;
+      `│    <code>${formatRupiah(t.price_standar)}</code> per set\n`;
   }
   out += `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n`;
   out += "╰────────────────────\n\n";
@@ -411,12 +410,11 @@ function buildMyTierBlock(omset, info) {
     "╭─── 🏅 <b>TIER KAMU</b> ───\n" +
     `│ • Tier : <b>${t.name}</b>\n` +
     `│ • Omset : <code>${formatRupiah(omset.rupiah)}</code>\n` +
-    `│ • <b>Paket Standar</b> : <code>${formatRupiah(t.price_lite)}</code>\n` +
-    `│ • <b>Paket Premium</b> : <code>${formatRupiah(t.price_standar)}</code>\n` +
+    `│ • <b>Harga per set</b> : <code>${formatRupiah(t.price_standar)}</code>\n` +
     `│ • Minimal ambil : <b>${RESELLER_MIN_ORDER} set</b> per order\n`;
   out += info.next
     ? `│ 🎯 Naik ke <b>${info.next.name}</b> kurang <code>${formatRupiah(info.remaining)}</code> lagi ` +
-      `(Standar ${formatRupiah(info.next.price_lite)} • Premium ${formatRupiah(info.next.price_standar)})\n`
+      `(harga ${formatRupiah(info.next.price_standar)} per set)\n`
     : "│ 🏆 Kamu sudah di tier tertinggi!\n";
   out += "╰────────────────────\n\n";
   return out;
@@ -432,7 +430,7 @@ async function notifyResellerTierUp(token, order, result) {
     text:
       `🎉 <b>SELAMAT, KAMU NAIK TIER!</b>\n\n` +
       `${before.tier.name} ➜ <b>${after.tier.name}</b>\n\n` +
-      `💲 <b>Harga baru:</b> Standar <code>${formatRupiah(after.tier.price_lite)}</code> • Premium <code>${formatRupiah(after.tier.price_standar)}</code>\n\n` +
+      `💲 <b>Harga baru:</b> <code>${formatRupiah(after.tier.price_standar)}</code> per set\n\n` +
       `<i>Hubungi admin saat order grosir biar harga tier barumu dipakai ya!</i>`,
     parse_mode: "HTML",
     reply_markup: {
@@ -1095,7 +1093,7 @@ async function findPendingOrderByNominals(nominalList) {
 
 function parseNominal(hargaStr) {
   const angka = parseInt(String(hargaStr || "").replace(/\D/g, ""), 10);
-  return angka && angka >= 100 ? angka : RETAIL_PRICE_LITE;
+  return angka && angka >= 100 ? angka : RETAIL_PRICE_STANDAR;
 }
 
 function formatRupiah(angka) {
@@ -2215,7 +2213,7 @@ async function claimDailyCheckin(token, chatId, userId) {
 }
 
 // ---- SPIN GRATIS HARIAN ----
-// Ambil katalog yang punya link, dikelompokkan per harga (5k, 10k, 50k)
+// Ambil katalog yang punya link, dikelompokkan per harga (10k, 50k)
 async function getSpinPool() {
   const katalog = await getKatalog();
   const ok = katalog.filter(
@@ -2223,7 +2221,6 @@ async function getSpinPool() {
   );
   const byPrice = (price) => ok.filter((k) => parseNominal(k.harga) === price);
   return {
-    pack5: byPrice(5000),
     pack10: byPrice(10000),
     all50: byPrice(50000),
   };
@@ -2254,7 +2251,6 @@ function pickFromOdds(odds) {
 function spinPrizeLabel(key) {
   if (key === "zonk") return "Zonk, coba lagi besok";
   if (key === "saldo") return `Saldo ${formatRupiah(SPIN_SALDO_AMOUNT)}`;
-  if (key === "pack5") return "Photopack 5k";
   if (key === "pack10") return "Photopack 10k";
   return "All Pack 50k";
 }
@@ -2729,7 +2725,7 @@ async function sendMainMenuCard(token, chatId) {
     "<i>Koleksi HD Eksklusif • Tanpa Watermark</i>\n" +
     flashBannerLine +
     "\n" +
-    `• <b>Standar:</b> <code>${formatRupiah(RETAIL_PRICE_LITE)}</code> | <b>Premium:</b> <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
+    `• <b>Harga set:</b> <code>${formatRupiah(RETAIL_PRICE_STANDAR)}</code>\n` +
     `• <b>Mystery Box:</b> <code>${formatRupiah(mysteryCfg.price || 3000)}</code>\n\n` +
     "Pilih menu di bawah 👇";
 
@@ -2877,12 +2873,7 @@ async function sendPhotopackTextList(token, chatId) {
 
 // ---- VIP SEMUA SET (sekali bayar via saldo, semua set bisa diambil gratis) ----
 const VIP_ENABLED = true;
-const REDIS_VIP_PRICE_KEY = "lumine_main_vip_price"; // harga VIP yang diatur admin lewat /setvip
-const VIP_PRICE_DEFAULT = 500000; // harga awal kalau belum pernah diatur
-async function getVipPrice() {
-  const v = parseInt(await redisCommand(["GET", REDIS_VIP_PRICE_KEY]), 10);
-  return v >= 1000 ? v : VIP_PRICE_DEFAULT;
-}
+const VIP_PRICE = 500000; // harga VIP (Rp)
 const REDIS_VIP_KEY = "lumine_main_vip"; // hash: id user -> tanggal beli VIP
 
 async function isVipUser(userId) {
@@ -2891,7 +2882,6 @@ async function isVipUser(userId) {
 }
 
 async function sendVipMenu(token, chatId, userId) {
-  const VIP_PRICE = await getVipPrice();
   const katalog = await getKatalog();
   const saldo = await getUserSaldo(userId);
   if (await isVipUser(userId)) {
@@ -2925,7 +2915,6 @@ async function sendVipMenu(token, chatId, userId) {
 }
 
 async function buyVipViaSaldo(token, chatId, from) {
-  const VIP_PRICE = await getVipPrice();
   const userId = String(from.id);
   if (await isVipUser(userId)) {
     await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Kamu sudah VIP." });
@@ -3795,7 +3784,7 @@ async function getOwnedNameSet(userId) {
 }
 
 // ---- HARGA KHUSUS PEMBELI BARU (wajib verifikasi nomor HP, satu nomor = satu akun) ----
-const NEW_USER_PRICE_MAP = { 5000: 3000, 10000: 7000 }; // harga normal -> harga khusus; lainnya tetap
+const NEW_USER_PRICE_MAP = { 10000: 7000 }; // harga normal -> harga khusus; lainnya tetap
 const REDIS_PHONE_KEY = "lumine_main_phone"; // hash: id user -> nomor HP terverifikasi
 const REDIS_PHONE_OWNER_KEY = "lumine_main_phone_owner"; // hash: nomor HP -> id user pemiliknya
 
@@ -10377,28 +10366,6 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
-      // ADMIN: /setvip NOMINAL (ubah harga VIP Semua Set)
-      if (rawText.startsWith("/setvip")) {
-        if (!isAdmin) return res.status(200).json({ ok: true });
-        const arg = rawText.replace(/^\/setvip\s*/i, "").trim();
-        const newPrice = parseInt(arg.replace(/\D/g, ""), 10);
-        if (!newPrice || newPrice < 1000) {
-          await tgRequest(token, "sendMessage", {
-            chat_id: chatId,
-            text: "⚠️ Masukkan nominal minimal 1000 (contoh: <code>/setvip 200000</code>).",
-            parse_mode: "HTML",
-          });
-          return res.status(200).json({ ok: true });
-        }
-        await redisCommand(["SET", REDIS_VIP_PRICE_KEY, String(newPrice)]);
-        await tgRequest(token, "sendMessage", {
-          chat_id: chatId,
-          text: `✅ <b>Harga VIP Semua Set sekarang ${formatRupiah(newPrice)}!</b>`,
-          parse_mode: "HTML",
-        });
-        return res.status(200).json({ ok: true });
-      }
-
       // 5. ADMIN: /setmystery
       if (rawText.startsWith("/setmystery")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -10744,7 +10711,7 @@ module.exports = async function handler(req, res) {
               "⚠️ Format kurang lengkap! Kirim foto preview dengan caption:\n" +
               "<code>/tambah Nama Set | Isi | Harga | Link1, Link2 | kategori</code>\n\n" +
               "<b>Mau tambah banyak set sekaligus?</b> 1 baris = 1 set:\n" +
-              "<code>/tambah\nNama A | 29 | Rp 5.000 | https://t.me/+abc | Full\nNama B | 20 | Rp 5.000 | https://t.me/+def | Full</code>\n\n" +
+              "<code>/tambah\nNama A | 29 | Rp 10.000 | https://t.me/+abc | Full\nNama B | 20 | Rp 10.000 | https://t.me/+def | Full</code>\n\n" +
               "<i>• Link bisa lebih dari satu, pisahkan dengan koma.\n" +
               "• Kategori opsional: <code>mini</code> atau <code>full</code> (default: mini).\n" +
               "• Foto preview hanya dipakai kalau tambah 1 set. Untuk banyak set, pasang fotonya nanti lewat <code>/edit [nomor]</code>.\n" +
@@ -10807,7 +10774,7 @@ module.exports = async function handler(req, res) {
               "⚠️ Format kurang lengkap! Kirim foto preview dengan caption:\n" +
               "<code>/tambah Nama Set | Isi | Harga | Link1, Link2 | kategori</code>\n\n" +
               "<b>Mau tambah banyak set sekaligus?</b> 1 baris = 1 set:\n" +
-              "<code>/tambah\nNama A | 29 | Rp 5.000 | https://t.me/+abc | Full\nNama B | 20 | Rp 5.000 | https://t.me/+def | Full</code>\n\n" +
+              "<code>/tambah\nNama A | 29 | Rp 10.000 | https://t.me/+abc | Full\nNama B | 20 | Rp 10.000 | https://t.me/+def | Full</code>\n\n" +
               "<i>• Link bisa lebih dari satu, pisahkan dengan koma.\n" +
               "• Kategori opsional: <code>mini</code> atau <code>full</code> (default: mini).\n" +
               "• Foto preview hanya dipakai kalau tambah 1 set. Untuk banyak set, pasang fotonya nanti lewat <code>/edit [nomor]</code>.</i>",
@@ -11439,8 +11406,7 @@ module.exports = async function handler(req, res) {
             const mysteryCfgInfo = await getMysteryConfig();
             replyText =
               "💰 <b>Info Harga Lumine Photopack:</b>\n" +
-              `• Paket Standar : <b>${formatRupiah(RETAIL_PRICE_LITE)}</b>\n` +
-              `• Paket Premium : <b>${formatRupiah(RETAIL_PRICE_STANDAR)}</b>\n` +
+              `• Harga per set : <b>${formatRupiah(RETAIL_PRICE_STANDAR)}</b>\n` +
               `• 🎲 <b>Mystery Box Gacha : ${formatRupiah(mysteryCfgInfo.price || 3000)}</b>`;
           }
 
