@@ -8580,7 +8580,8 @@ async function savePostAllState(st) {
 }
 
 // Kirim satu set ke channel: foto preview (kalau ada) + tombol ke bot. Link file asli tidak ikut.
-async function postOneSetToChannel(token, item, channel, botUname) {
+async function postOneSetToChannel(token, item, channel, botUname, requirePhoto = false) {
+  if (requirePhoto && !item.photo_id) return false; // /postset: jangan posting kalau preview belum ada
   const deepLink = `https://t.me/${botUname}?start=buy_${item.id}`;
   const katIcon = item.kategori === "full" ? "📦" : "🧩";
   const caption =
@@ -8834,7 +8835,7 @@ async function runPostSetBatch(token) {
         skipped++;
         continue;
       }
-      const ok = await postOneSetToChannel(token, item, channel, botUname);
+      const ok = await postOneSetToChannel(token, item, channel, botUname, true);
       if (ok) {
         await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, String(id), "1"]);
         await redisCommand(["INCR", dayKeyCnt]);
@@ -12198,7 +12199,9 @@ module.exports = async function handler(req, res) {
       if (/^\/postset(\s|$)/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const replyS = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
-        const argS = rawText.replace(/^\/postset\s*/i, "").trim();
+        let argS = rawText.replace(/^\/postset\s*/i, "").trim();
+        const ulangS = /(^|\s)ulang(\s|$)/i.test(argS);
+        argS = argS.replace(/(^|\s)ulang(?=\s|$)/gi, " ").trim();
         const katalogS = await getKatalog();
         const usageS =
           "⚠️ Format: <code>/postset 5</code>, <code>/postset 5 9 12</code>, atau <code>/postset 5-20</code>\n" +
@@ -12240,8 +12243,11 @@ module.exports = async function handler(req, res) {
         for (const n of validS) {
           const id = String(katalogS[n - 1].id);
           if (doneS.has(id)) {
-            sudahS++;
-            continue;
+            if (!ulangS) {
+              sudahS++;
+              continue;
+            }
+            await redisCommand(["HDEL", REDIS_POSTALL_DONE_KEY, id]); // posting ulang: hapus tanda "sudah diposting"
           }
           await redisCommand(["RPUSH", REDIS_POSTSET_QUEUE_KEY, id]);
           antreS++;
@@ -12249,7 +12255,7 @@ module.exports = async function handler(req, res) {
 
         await replyS(
           `📮 Antre <b>${antreS}</b> set` +
-            (sudahS ? ` • sudah pernah diposting <b>${sudahS}</b> (dilewati)` : "") +
+            (sudahS ? ` • sudah pernah diposting <b>${sudahS}</b> (dilewati, pakai <code>/postset NOMOR ulang</code> untuk posting ulang)` : "") +
             (salahS.length ? ` • nomor tidak valid: ${escapeHtml(salahS.join(", "))}` : "") +
             `.\nJatah posting ${POSTALL_PER_DAY} set per hari.`
         );
@@ -12257,7 +12263,9 @@ module.exports = async function handler(req, res) {
         const runS = await runPostSetBatch(token);
         if (runS.ran) {
           await replyS(
-            `✅ Diposting: <b>${runS.posted}</b> • gagal: ${runS.failed}\n` +
+            `✅ Diposting: <b>${runS.posted}</b> • gagal: ${runS.failed}` +
+              (runS.failed > 0 ? " (set belum punya preview/foto atau gagal kirim, tidak ditandai terposting)" : "") +
+              "\n" +
               (runS.sisa > 0 ? `⏳ Sisa antrean: <b>${runS.sisa}</b> set, lanjut besok otomatis.` : "🎉 Antrean kosong.")
           );
         } else if (runS.reason === "quota") {
