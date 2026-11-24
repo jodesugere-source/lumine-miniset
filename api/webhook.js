@@ -8619,6 +8619,196 @@ async function getMacroLogChatId() {
   return raw ? String(raw) : null;
 }
 
+// ==========================================
+// AUTO-POST SET BARU KE CHANNEL (pakai link bot, BUKAN link file asli -> anti bocor)
+// ==========================================
+const REDIS_POST_CHANNEL_KEY = "lumine_main_post_channel"; // chat_id (-100...) atau @username channel tujuan auto-post set baru
+
+async function getPostChannel() {
+  const raw = await redisCommand(["GET", REDIS_POST_CHANNEL_KEY]);
+  return raw ? String(raw) : "";
+}
+
+async function setPostChannel(val) {
+  await redisCommand(["SET", REDIS_POST_CHANNEL_KEY, String(val)]);
+}
+
+// Dipanggil setiap ada set baru tersimpan lewat /tambah. Postingan ke channel HANYA berisi
+// preview + tombol yang mengarah ke bot (deep-link /start buy_ID), bukan link Drive/file aslinya.
+async function postNewSetToChannel(token, item) {
+  try {
+    const targetChannel = await getPostChannel();
+    if (!targetChannel) return; // belum diset admin lewat /setpostchannel
+
+    const botUname = await getBotUsername(token);
+    if (!botUname) return;
+
+    const deepLink = `https://t.me/${botUname}?start=buy_${item.id}`;
+    const katIcon = item.kategori === "full" ? "📦" : "🧩";
+    const caption =
+      `🆕 <b>SET BARU RILIS!</b>\n\n` +
+      `${katIcon} <b>${escapeHtml(item.nama)}</b>\n` +
+      (item.creator ? `👤 Creator: ${escapeHtml(item.creator)}\n` : "") +
+      `📂 Isi: ${escapeHtml(item.isi)}\n` +
+      `💰 Harga: <b>${escapeHtml(item.harga)}</b>\n\n` +
+      `Klik tombol di bawah buat lihat & beli langsung lewat bot 👇`;
+
+    const replyMarkup = { inline_keyboard: [[{ text: "🛒 Lihat & Beli", url: deepLink }]] };
+
+    if (item.photo_id) {
+      await tgRequest(token, "sendPhoto", {
+        chat_id: targetChannel,
+        photo: item.photo_id,
+        caption,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup,
+      });
+    } else {
+      await tgRequest(token, "sendMessage", {
+        chat_id: targetChannel,
+        text: caption,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup,
+      });
+    }
+  } catch (e) {
+    console.error("Auto-post set ke channel gagal:", e && e.message);
+  }
+}
+
+// Tampilkan detail 1 set. Dipakai oleh callback "detail_ID" (tombol di dalam bot) DAN oleh
+// deep-link /start buy_ID (dari tombol channel), supaya tampilannya konsisten di kedua jalur.
+async function sendItemDetailView(token, chatId, callerId, itemId) {
+  const katalogList = await getKatalog();
+  const item = katalogList.find((k) => String(k.id) === String(itemId));
+
+  if (!item) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: "⚠️ Maaf, set ini sudah dihapus atau diperbarui oleh admin.",
+    });
+    return;
+  }
+
+  const rankMap = getRankedKatalog(katalogList);
+  const rank = rankMap[String(item.id)];
+  const sold = Number(item.sold) || 0;
+  let popularityLine = "";
+  if (rank === 1) {
+    popularityLine = `│ • <b>Status :</b> 🔥 <b>#1 BESTSELLER</b> (${sold}x terjual)\n`;
+  } else if (rank === 2 || rank === 3) {
+    popularityLine = `│ • <b>Status :</b> ⭐ <b>#${rank} POPULER</b> (${sold}x terjual)\n`;
+  } else if (sold > 0) {
+    popularityLine = `│ • <b>Terjual :</b> ${sold}x pembelian\n`;
+  }
+
+  const [activeV, saldo] = await Promise.all([
+    getActiveUserVoucher(callerId),
+    getUserSaldo(callerId),
+  ]);
+  const voucherNote = activeV
+    ? `\n🎟️ <i>Voucher aktif: <b>${escapeHtml(activeV.code)}</b> (-${formatRupiah(activeV.discount)})</i>`
+    : "";
+
+  const itemRatingBlock = buildRatingBlock(await getItemRating(item.id));
+  const flashSaleNow = await getFlashSale();
+  const itemFlashActive = Boolean(flashSaleNow && String(flashSaleNow.item_id) === String(item.id));
+  const flashLine = itemFlashActive
+    ? `│ • ⚡ <b>FLASH SALE :</b> <s>${escapeHtml(item.harga)}</s> ➜ <code>${formatRupiah(flashSaleNow.flash_price)}</code>\n` +
+      `│ • ⏱️ <b>Berakhir :</b> ${getFlashSaleRemainingText(flashSaleNow)} (${formatWibClock(flashSaleNow.end_ts)})\n`
+    : "";
+  const captionText =
+    (itemFlashActive ? `⚡⚡⚡ <b>FLASH SALE AKTIF!</b> ⚡⚡⚡\n\n` : "") +
+    `✨ <b>${escapeHtml(item.nama)}</b>\n\n` +
+    itemRatingBlock +
+    `╭─── 📦 <b>DETAIL PAKET</b> ───\n` +
+    popularityLine +
+    (item.creator ? `│ • <b>Creator :</b> 👤 ${escapeHtml(item.creator)}\n` : "") +
+    `│ • <b>Isi :</b> ${escapeHtml(item.isi)}\n` +
+    (itemFlashActive
+      ? flashLine
+      : `│ • <b>Harga :</b> <code>${escapeHtml(item.harga)}</code>\n`) +
+    `│ • <b>Saldo Kamu :</b> <code>${formatRupiah(saldo)}</code>\n` +
+    `╰────────────────────${voucherNote}\n\n` +
+    `💳 Klik tombol di bawah untuk checkout via <b>Saldo</b> atau <b>QRIS</b>!`;
+
+  const wlRowMarkup = [buildWishlistButton(await isInWishlist(callerId, item.id), item.id)];
+  const inlineMarkup = {
+    inline_keyboard: [
+      [
+        {
+          text: `💳 Beli Set Ini (${item.harga})`,
+          callback_data: `buy_${item.id}`,
+        },
+      ],
+      [
+        {
+          text: "🔙 Kembali ke Katalog",
+          callback_data: "menu_katalog",
+        },
+      ],
+    ],
+  };
+
+  inlineMarkup.inline_keyboard.splice(1, 0, wlRowMarkup);
+  if (VIP_ENABLED && (await isVipUser(callerId))) {
+    inlineMarkup.inline_keyboard[0] = [{ text: "🎁 Ambil Gratis (VIP)", callback_data: `vipget_${item.id}` }];
+  }
+  const newUserSpecial = getNewUserPrice(parseNominal(item.harga));
+  if (newUserSpecial && (await isNewBuyer(callerId)) && (await isNewUserPromoActive(callerId))) {
+    if (await isPhoneVerified(callerId)) {
+      inlineMarkup.inline_keyboard[0] = [
+        { text: `💳 Beli Set Ini (${formatRupiah(newUserSpecial)} • harga khusus)`, callback_data: `buyconf_${item.id}` },
+      ];
+    } else {
+      inlineMarkup.inline_keyboard.unshift([
+        { text: "📱 Verifikasi Nomor untuk Harga Khusus", callback_data: "verify_phone" },
+      ]);
+    }
+  }
+  const tierNow = await getMemberTier(callerId);
+  if (tierNow.pct > 0 && !newUserSpecial) {
+    const curBtn = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
+    if (curBtn && String(curBtn.callback_data || "").startsWith("buy_")) {
+      const tierPrice = applyTierPrice(parseNominal(item.harga), tierNow);
+      inlineMarkup.inline_keyboard[0] = [
+        { text: `💳 Beli Set Ini (${formatRupiah(tierPrice)} • ${tierNow.name} -${tierNow.pct}%)`, callback_data: `buy_${item.id}` },
+      ];
+    }
+  }
+  if (itemFlashActive) {
+    const curBtnFlash = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
+    if (curBtnFlash && String(curBtnFlash.callback_data || "").startsWith("buy_")) {
+      inlineMarkup.inline_keyboard[0] = [
+        { text: `⚡ Beli Flash Sale (${formatRupiah(flashSaleNow.flash_price)})`, callback_data: `buy_${item.id}` },
+      ];
+    }
+  }
+  const botUname = await getBotUsername(token);
+  if (botUname && /^[A-Za-z0-9_-]{1,30}$/.test(String(item.id))) {
+    inlineMarkup.inline_keyboard.splice(2, 0, [
+      { text: "📤 Bagikan Set", url: buildShareUrl(botUname, callerId, item.id, item.nama) },
+    ]);
+  }
+
+  if (item.photo_id) {
+    await tgRequest(token, "sendPhoto", {
+      chat_id: chatId,
+      photo: item.photo_id,
+      caption: captionText,
+      parse_mode: "HTML",
+      reply_markup: inlineMarkup,
+    });
+  } else {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: captionText,
+      parse_mode: "HTML",
+      reply_markup: inlineMarkup,
+    });
+  }
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -11724,6 +11914,7 @@ module.exports = async function handler(req, res) {
               `\n<i>Mau lampirkan file upload langsung? Kirim foto/dokumen dengan caption <code>/tambahfile ${added[0].no}</code></i>`,
             parse_mode: "HTML",
           });
+          await postNewSetToChannel(token, newItem);
           return res.status(200).json({ ok: true });
         }
 
@@ -11766,6 +11957,9 @@ module.exports = async function handler(req, res) {
             text,
             parse_mode: "HTML",
           });
+        }
+        for (const { item } of added) {
+          await postNewSetToChannel(token, item);
         }
         return res.status(200).json({ ok: true });
       }
@@ -12133,6 +12327,42 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 10A4. ADMIN: /setpostchannel — set/lihat channel tujuan auto-post set baru
+      if (rawText.startsWith("/setpostchannel")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/setpostchannel\s*/i, "").trim();
+
+        if (!arg) {
+          const current = await getPostChannel();
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text:
+              `📢 <b>Channel Auto-Post Set Baru</b>\n\n` +
+              `Saat ini: ${current ? `<code>${escapeHtml(current)}</code>` : "<i>belum diset</i>"}\n\n` +
+              `Gunakan: <code>/setpostchannel ID_atau_@username</code>\n` +
+              `<i>• Bot harus jadi admin di channel tersebut.\n` +
+              `• Set baru lewat /tambah akan otomatis diposting ke sana, isinya cuma preview + tombol ke bot (bukan link file asli).\n` +
+              `• Kosongkan lagi dengan <code>/setpostchannel off</code>.</i>`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        if (arg.toLowerCase() === "off") {
+          await setPostChannel("");
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Auto-post ke channel dimatikan." });
+          return res.status(200).json({ ok: true });
+        }
+
+        await setPostChannel(arg);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ Channel auto-post diset ke: <code>${escapeHtml(arg)}</code>\n<i>Pastikan bot sudah jadi admin di channel itu ya.</i>`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 10B. ADMIN: /tambahfile — lampirkan file upload langsung (foto/dokumen) ke sebuah set
       if (rawText.startsWith("/tambahfile")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -12360,6 +12590,13 @@ module.exports = async function handler(req, res) {
           } catch (mitraRecErr) {
             console.error("Mitra record error:", mitraRecErr);
           }
+        }
+
+        // Deep-link dari tombol auto-post channel: /start buy_ID -> langsung buka detail set itu
+        const startBuyMatch = /^\/start\s+buy_([A-Za-z0-9_-]{1,30})$/i.exec(text);
+        if (startBuyMatch) {
+          await sendItemDetailView(token, chatId, senderId, startBuyMatch[1]);
+          return res.status(200).json({ ok: true });
         }
 
         if (text === "/start" || startRefMatch || startMitraMatch || startShareMatch) {
