@@ -8691,11 +8691,13 @@ async function savePreviewMassal(st) {
 }
 
 // Dipanggil untuk tiap foto admin tanpa caption. Return true kalau foto ini dipakai untuk sesi massal.
-async function handlePreviewMassalPhoto(token, msg) {
+const REDIS_PREVIEWMASSAL_LOCK_KEY = "lumine_main_previewmassal_lock";
+const REDIS_PREVIEWMASSAL_PENDING_KEY = "lumine_main_previewmassal_pending"; // antrean foto (file_id) yang belum dipasang
+
+// Pasang satu foto ke set berikutnya yang belum punya preview. Dipanggil hanya saat memegang kunci.
+async function placeOnePreviewMassal(fileId) {
   const st = await getPreviewMassal();
-  if (!st || !st.active) return false;
-  const chatId = msg.chat.id;
-  const reply = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+  if (!st || !st.active) return null;
 
   const katalog = await getKatalog();
   let idx = -1;
@@ -8707,18 +8709,16 @@ async function handlePreviewMassalPhoto(token, msg) {
   if (idx === -1) {
     st.active = false;
     await savePreviewMassal(st);
-    await reply("🎉 Semua set sudah punya preview. Sesi massal selesai.");
-    return true;
+    return null;
   }
 
-  katalog[idx].photo_id = msg.photo[msg.photo.length - 1].file_id;
+  katalog[idx].photo_id = fileId;
   await saveKatalog(katalog);
-  // Checklist: catat yang sudah dipasang di sesi ini
+
   st.done = Array.isArray(st.done) ? st.done : [];
   st.done.push(`${idx + 1}. ${katalog[idx].nama}`);
   if (st.done.length > 50) st.done = st.done.slice(-50);
 
-  // Set berikutnya yang belum punya preview
   let nextIdx = -1;
   for (const id of st.queue) {
     const i = katalog.findIndex((k) => String(k.id) === String(id));
@@ -8728,23 +8728,71 @@ async function handlePreviewMassalPhoto(token, msg) {
     }
   }
   if (nextIdx === -1) st.active = false;
+  const sisa = katalog.filter((k) => st.queue.map(String).includes(String(k.id)) && !k.photo_id).length;
   await savePreviewMassal(st);
 
-  const checklist = st.done
-    .slice(-5)
-    .map((d) => `✅ ${escapeHtml(d)}`)
-    .join("\n");
-  const bawah =
-    nextIdx !== -1
-      ? `⏭ Berikutnya: <b>${nextIdx + 1}. ${escapeHtml(katalog[nextIdx].nama)}</b>\n` +
-        `Sisa antrean: <b>${st.queue.length}</b> set. Kirim foto berikutnya.`
-      : "🎉 Semua set sudah dipasangi preview. Sesi massal selesai.";
-  await reply(
-    `📋 <b>Checklist sesi ini</b> (${st.done.length} terpasang)\n` +
-      checklist +
-      `\n\n` +
-      bawah
-  );
+  return {
+    no: idx + 1,
+    nama: katalog[idx].nama,
+    nextNo: nextIdx !== -1 ? nextIdx + 1 : 0,
+    nextNama: nextIdx !== -1 ? katalog[nextIdx].nama : "",
+    sisa,
+    selesai: !st.active,
+    done: st.done,
+  };
+}
+
+// Foto masuk ke antrean dulu (berurutan sesuai kedatangan). Satu proses memegang kunci dan
+// memasang semua foto yang antre; proses lain cukup menambahkan fotonya ke antrean.
+async function handlePreviewMassalPhoto(token, msg) {
+  const st0 = await getPreviewMassal();
+  if (!st0 || !st0.active) return false;
+
+  const fileId = msg.photo[msg.photo.length - 1].file_id;
+  await redisCommand(["RPUSH", REDIS_PREVIEWMASSAL_PENDING_KEY, fileId]);
+
+  const chatId = msg.chat.id;
+  let placed = [];
+  for (let round = 0; round < 100; round++) {
+    const got = await redisCommand(["SET", REDIS_PREVIEWMASSAL_LOCK_KEY, "1", "NX", "EX", "60"]);
+    if (got !== "OK") break; // proses lain sedang memasang dan akan mengambil foto ini
+
+    try {
+      while (true) {
+        const next = await redisCommand(["LPOP", REDIS_PREVIEWMASSAL_PENDING_KEY]);
+        if (!next) break;
+        const r = await placeOnePreviewMassal(String(next));
+        if (r) placed.push(r);
+        else {
+          await redisCommand(["DEL", REDIS_PREVIEWMASSAL_PENDING_KEY]); // sesi habis: sisa foto dibuang
+          break;
+        }
+      }
+    } finally {
+      await redisCommand(["DEL", REDIS_PREVIEWMASSAL_LOCK_KEY]);
+    }
+
+    // Cek lagi: ada foto yang masuk saat kunci dipegang?
+    const sisaAntrean = Number(await redisCommand(["LLEN", REDIS_PREVIEWMASSAL_PENDING_KEY])) || 0;
+    const stNow = await getPreviewMassal();
+    if (sisaAntrean === 0 || !stNow || !stNow.active) break;
+  }
+
+  if (placed.length > 0) {
+    const last = placed[placed.length - 1];
+    const daftar = placed.map((p) => `✅ ${p.no}. ${escapeHtml(p.nama)}`).join("\n");
+    const cek = (last.done || []).slice(-5).map((d) => `✅ ${escapeHtml(d)}`).join("\n");
+    const bawah = last.selesai
+      ? "🎉 Semua set sudah dipasangi preview. Sesi massal selesai."
+      : `⏭ Berikutnya: <b>${last.nextNo}. ${escapeHtml(last.nextNama)}</b>\nSisa antrean: <b>${last.sisa}</b> set.`;
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text:
+        `📋 <b>Dipasang ${placed.length} foto</b>\n${daftar}\n\n` +
+        `<b>Checklist sesi</b> (${(last.done || []).length} terpasang)\n${cek}\n\n${bawah}`,
+      parse_mode: "HTML",
+    });
+  }
   return true;
 }
 
@@ -12111,12 +12159,23 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
+        // Sesi sudah berjalan: jangan ditimpa, supaya checklist dan antrean tidak hilang
+        const sesiAktif = await getPreviewMassal();
+        if (sesiAktif && sesiAktif.active) {
+          await replyM(
+            `ℹ️ Sesi preview massal sudah berjalan (sisa <b>${sesiAktif.queue.length}</b> set, ` +
+              `terpasang <b>${(sesiAktif.done || []).length}</b>). Lanjutkan dengan kirim foto. ` +
+              `Hentikan dengan <code>/previewmassal stop</code>.`
+          );
+          return res.status(200).json({ ok: true });
+        }
+
         const queueM = katalogM.filter((k) => k && k.id && !k.photo_id).map((k) => String(k.id));
         if (queueM.length === 0) {
           await replyM("✅ Semua set sudah punya preview.");
           return res.status(200).json({ ok: true });
         }
-        await savePreviewMassal({ active: true, queue: queueM });
+        await savePreviewMassal({ active: true, queue: queueM, done: (sesiAktif && sesiAktif.done) || [] });
         const pertama = katalogM.findIndex((k) => String(k.id) === queueM[0]);
         await replyM(
           `🖼 <b>Mode preview massal aktif.</b>\n` +
