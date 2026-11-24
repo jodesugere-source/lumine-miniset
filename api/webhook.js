@@ -111,6 +111,11 @@ const UPSELL_WINDOW_MINUTES = 10; // lama penawaran berlaku
 const FLASHSALE_DEFAULT_MINUTES = 60; // durasi default 1 jam kalau admin tidak menentukan durasi
 const REDIS_FLASHSALE_KEY = "lumine_main_flashsale"; // JSON: { item_id, item_nama, original_harga, original_nominal, flash_price, start_ts, end_ts }
 
+// ---- PRE ORDER (pembeli bayar dulu, file dikirim otomatis saat admin /rilispo) ----
+// Flag per set ada di katalog: item.preorder = true, item.po_eta = teks perkiraan rilis (opsional)
+// Order PO per set disimpan di hash: REDIS_PO_PREFIX + itemId -> { orderId: buyerId }
+const REDIS_PO_PREFIX = "lumine_main_po_";
+
 // ---- HADIAH LEADERBOARD BULANAN (saldo otomatis untuk Top 3 pembeli bulan lalu) ----
 const LB_REWARD_ENABLED = true; // false = matikan hadiah
 const LB_REWARD_SALDO = [10000, 5000, 3000]; // hadiah saldo untuk peringkat 1, 2, 3
@@ -1879,6 +1884,130 @@ async function processResellerPremOrder(token, order) {
   return { deliveredName: `Reseller Prem (bonus saldo ${formatRupiah(bonusGiven)})`, deliveredLink: "" };
 }
 
+// ==========================================
+// 4C. PRE ORDER: bayar dulu, file dikirim otomatis saat admin /rilispo
+// ==========================================
+async function processPreorderPaid(token, order) {
+  order.status = "preorder";
+  order.po_paid_ms = Date.now();
+  await saveOrder(order.id, order);
+
+  const itemId = String(order.item_id || "");
+  await redisCommand(["HSET", REDIS_PO_PREFIX + itemId, String(order.id), String(order.buyer_id)]);
+
+  const katalogList = await getKatalog();
+  const idx = katalogList.findIndex((k) => String(k.id) === itemId);
+  const item = idx !== -1 ? katalogList[idx] : null;
+
+  // Omset, leaderboard & hitungan terjual dihitung saat pembayaran lunas
+  await recordPurchaseToLeaderboard(order);
+  await addStoreOmset(order.total_nominal);
+  if (await isReseller(order.buyer_id)) {
+    await addResellerOmset(order.buyer_id, order.total_nominal);
+  }
+  if (item) {
+    item.sold = (Number(item.sold) || 0) + 1;
+    await saveKatalog(katalogList);
+  }
+
+  const etaLine = item && item.po_eta ? `📅 Perkiraan rilis: <b>${escapeHtml(item.po_eta)}</b>\n` : "";
+  await tgRequest(token, "sendMessage", {
+    chat_id: order.buyer_id,
+    parse_mode: "HTML",
+    text:
+      `🕒 <b>PRE ORDER DITERIMA! (Pesanan #${order.id})</b>\n\n` +
+      `📦 <b>${escapeHtml(order.item_nama)}</b>\n` +
+      `Pembayaranmu sudah kami terima. Set ini belum rilis, jadi file akan otomatis dikirim ke chat ini begitu sudah siap.\n` +
+      etaLine +
+      `\n<i>Kamu tidak perlu order ulang. Harga sudah terkunci.</i>`,
+    reply_markup: { inline_keyboard: [[{ text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" }]] },
+  });
+
+  try {
+    const qris = await getQris();
+    const adminChat = qris && qris.admin_chat_id;
+    if (adminChat) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: adminChat,
+        text:
+          `🕒 PO baru #${order.id}\n👤 ${order.buyer_name}\n📦 ${order.item_nama}\n\n` +
+          `Saat set siap, kirim file ke semua pembeli PO dengan: /rilispo ${idx !== -1 ? idx + 1 : "NO"}`,
+      });
+    }
+  } catch (poNotifErr) {
+    console.error("Notif PO admin error:", poNotifErr);
+  }
+
+  return { deliveredName: order.item_nama, deliveredLink: "", preorder: true };
+}
+
+async function releasePreorders(token, katalogList, idx) {
+  const item = katalogList[idx];
+  const itemId = String(item.id);
+  // Pakai link & file TERBARU dari katalog (admin biasanya mengisinya setelah pesanan masuk)
+  const links =
+    Array.isArray(item.links) && item.links.length > 0
+      ? item.links.map(normalizeUrl)
+      : item.link
+      ? [normalizeUrl(item.link)]
+      : [];
+  const files = Array.isArray(item.files) ? item.files : [];
+
+  const flat = (await redisCommand(["HGETALL", REDIS_PO_PREFIX + itemId])) || [];
+  let sent = 0;
+  let failed = 0;
+  for (let i = 0; i < flat.length; i += 2) {
+    const orderId = String(flat[i]);
+    const order = await getOrder(orderId);
+    if (!order || order.status !== "preorder") {
+      await redisCommand(["HDEL", REDIS_PO_PREFIX + itemId, orderId]);
+      continue;
+    }
+    try {
+      const linksBlock =
+        links.length > 0
+          ? links.map((l) => `🔗 ${escapeHtml(l)}`).join("\n")
+          : "<i>(File dikirim langsung di pesan berikutnya)</i>";
+      await tgRequest(token, "sendMessage", {
+        chat_id: order.buyer_id,
+        parse_mode: "HTML",
+        text:
+          `🎉 <b>PRE ORDER SUDAH RILIS! (Pesanan #${order.id})</b>\n\n` +
+          `Set <b>${escapeHtml(item.nama)}</b> yang kamu pesan sudah siap.\n` +
+          `Berikut akses file kamu:\n${linksBlock}\n\n` +
+          `<i>Link tersimpan otomatis di 🎒 Koleksi Saya.</i>`,
+        reply_markup: {
+          inline_keyboard: [
+            ...links.slice(0, 8).map((link, n) => [
+              { text: links.length > 1 ? `📂 Buka File ${n + 1}` : "📂 Buka Link File Sekarang", url: link },
+            ]),
+            [{ text: "⭐ Beri Rating & Ulasan", callback_data: `rate_init_${order.id}` }],
+          ],
+        },
+      });
+      for (const f of files) {
+        if (!f || !f.file_id) continue;
+        if (f.type === "document") {
+          await tgRequest(token, "sendDocument", { chat_id: order.buyer_id, document: f.file_id });
+        } else {
+          await tgRequest(token, "sendPhoto", { chat_id: order.buyer_id, photo: f.file_id });
+        }
+      }
+      await addKoleksi(order.buyer_id, item.nama, links[0] || "");
+      order.status = "acc";
+      order.po_released_ms = Date.now();
+      order.target_links = links;
+      await saveOrder(order.id, order);
+      await redisCommand(["HDEL", REDIS_PO_PREFIX + itemId, orderId]);
+      sent++;
+    } catch (releaseErr) {
+      failed++;
+      console.error(`Rilis PO #${orderId} gagal:`, releaseErr);
+    }
+  }
+  return { sent, failed };
+}
+
 async function processAccOrderCore(token, order) {
   order.status = "acc";
   await saveOrder(order.id, order);
@@ -1931,6 +2060,11 @@ async function processAccOrderCore(token, order) {
       vouchers[order.voucher_code] = v;
       await saveVouchers(vouchers);
     }
+  }
+
+  // KHUSUS ORDER PRE ORDER: pembayaran diterima sekarang, file dikirim saat admin pakai /rilispo
+  if (order.is_preorder) {
+    return await processPreorderPaid(token, order);
   }
 
   const katalogList = await getKatalog();
@@ -4058,6 +4192,10 @@ function buildLumineItemRows(slice, rankMap, defaultIcon) {
     } else if (sold > 0) {
       suffix = ` (${sold}x)`;
     }
+    if (item.preorder) {
+      prefix = "🕒";
+      suffix = " • PRE ORDER";
+    }
     return [
       {
         text: `${prefix} ${item.nama} — ${item.harga}${suffix}`,
@@ -4557,7 +4695,7 @@ async function sendMoreMenu(token, chatId) {
   return {
     ok: true,
     itemId: String(item.id),
-    itemNama: item.nama,
+    itemNama: item.preorder ? `${item.nama} (PRE ORDER)` : item.nama,
     tierLabel,
     baseNominal,
     targetLink: itemLinks[0] || "",
@@ -4565,6 +4703,7 @@ async function sendMoreMenu(token, chatId) {
     targetFiles: itemFiles,
     isMystery: false,
     isFlashSale: Boolean(flashActive),
+    extra: item.preorder ? { is_preorder: true } : {},
   };
 }
 
@@ -8198,6 +8337,7 @@ async function sendItemDetailView(token, chatId, callerId, itemId) {
     (itemFlashActive ? `⚡⚡⚡ <b>FLASH SALE AKTIF!</b> ⚡⚡⚡\n\n` : "") +
     `✨ <b>${escapeHtml(item.nama)}</b>\n\n` +
     itemRatingBlock +
+    (item.preorder ? "🕒 <b>PRE ORDER</b>" + (item.po_eta ? " • rilis: " + escapeHtml(item.po_eta) : "") + "\n\n" : "") +
     `╭─── 📦 <b>DETAIL PAKET</b> ───\n` +
     popularityLine +
     (item.creator ? `│ • <b>Creator :</b> 👤 ${escapeHtml(item.creator)}\n` : "") +
@@ -8214,7 +8354,7 @@ async function sendItemDetailView(token, chatId, callerId, itemId) {
     inline_keyboard: [
       [
         {
-          text: `💳 Beli Set Ini (${item.harga})`,
+          text: item.preorder ? `🕒 Pre Order Set Ini (${item.harga})` : `💳 Beli Set Ini (${item.harga})`,
           callback_data: `buy_${item.id}`,
         },
       ],
@@ -8697,6 +8837,13 @@ module.exports = async function handler(req, res) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: target.error });
           return res.status(200).json({ ok: true });
         }
+        if (target.extra && target.extra.is_preorder) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Set pre order hanya bisa dibayar lewat QRIS.",
+          });
+          return res.status(200).json({ ok: true });
+        }
 
         const bestDiscount = await resolveBestDiscount(callerId, target.itemId, target.baseNominal);
         const discount = bestDiscount.discount;
@@ -8809,7 +8956,8 @@ module.exports = async function handler(req, res) {
         const discount = bestDiscount.discount;
         const effectivePrice = Math.max(500, target.baseNominal - discount);
 
-        if (saldo >= effectivePrice) {
+        const isPreorderTarget = Boolean(target.extra && target.extra.is_preorder);
+        if (!isPreorderTarget && saldo >= effectivePrice) {
           const sisaSaldo = saldo - effectivePrice;
           const voucherLine = buildDiscountLine(bestDiscount.source, bestDiscount.code, discount);
 
@@ -11447,6 +11595,86 @@ module.exports = async function handler(req, res) {
       }
 
       // 10A2. ADMIN: /flashsale — mulai promo kilat (default 1 jam) untuk satu set
+      if (rawText.startsWith("/preorder") || rawText.startsWith("/rilispo")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const isRilis = rawText.startsWith("/rilispo");
+        const katalogList = await getKatalog();
+        const arg = rawText.replace(/^\/(preorder|rilispo)\s*/i, "").trim();
+        const sayAdmin = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+
+        if (!arg) {
+          const poLines = [];
+          for (let i = 0; i < katalogList.length; i++) {
+            const it = katalogList[i];
+            if (!it.preorder) continue;
+            const pending = Number(await redisCommand(["HLEN", REDIS_PO_PREFIX + String(it.id)])) || 0;
+            poLines.push(`${i + 1}. <b>${escapeHtml(it.nama)}</b> — ETA: ${escapeHtml(it.po_eta || "-")} — pending: ${pending}`);
+          }
+          await sayAdmin(
+            (poLines.length > 0 ? "🕒 <b>SET PRE ORDER AKTIF</b>\n\n" + poLines.join("\n") : "🕒 Belum ada set pre order aktif.") +
+              "\n\n<b>Perintah:</b>\n" +
+              "<code>/preorder NO ETA</code> — aktifkan PO (ETA opsional)\n" +
+              "<code>/preorder NO off</code> — matikan PO\n" +
+              "<code>/rilispo NO</code> — kirim file ke semua pembeli PO"
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        const parts = arg.split(/\s+/);
+        const idx = parseInt(parts[0], 10) - 1;
+        if (isNaN(idx) || idx < 0 || idx >= katalogList.length) {
+          await sayAdmin("⚠️ Nomor set tidak valid.");
+          return res.status(200).json({ ok: true });
+        }
+        const item = katalogList[idx];
+        const itemId = String(item.id);
+        const restArg = arg.slice(parts[0].length).trim();
+
+        if (isRilis) {
+          if (!item.preorder) {
+            await sayAdmin(`ℹ️ <b>${escapeHtml(item.nama)}</b> tidak sedang mode pre order.`);
+            return res.status(200).json({ ok: true });
+          }
+          const { sent, failed } = await releasePreorders(token, katalogList, idx);
+          const left = Number(await redisCommand(["HLEN", REDIS_PO_PREFIX + itemId])) || 0;
+          if (left === 0) {
+            item.preorder = false;
+            delete item.po_eta;
+            await saveKatalog(katalogList);
+          }
+          await sayAdmin(
+            `✅ Rilis PO <b>${escapeHtml(item.nama)}</b>: terkirim ${sent}, gagal ${failed}.` +
+              (left > 0
+                ? `\n⚠️ ${left} pesanan belum terkirim. Jalankan <code>/rilispo ${idx + 1}</code> lagi.`
+                : "\n🎉 Set ini sudah tidak mode pre order.")
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        if (restArg.toLowerCase() === "off") {
+          item.preorder = false;
+          delete item.po_eta;
+          await saveKatalog(katalogList);
+          const left = Number(await redisCommand(["HLEN", REDIS_PO_PREFIX + itemId])) || 0;
+          await sayAdmin(
+            `✅ PO <b>${escapeHtml(item.nama)}</b> dimatikan.` +
+              (left > 0 ? `\n⚠️ Masih ada ${left} pesanan PO. Jalankan <code>/rilispo ${idx + 1}</code> untuk mengirim filenya.` : "")
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        item.preorder = true;
+        if (restArg) item.po_eta = restArg;
+        else delete item.po_eta;
+        await saveKatalog(katalogList);
+        await sayAdmin(
+          `🕒 <b>${escapeHtml(item.nama)}</b> sekarang PRE ORDER.` +
+            (restArg ? `\nPerkiraan rilis: <b>${escapeHtml(restArg)}</b>` : "") +
+            `\n\nKirim file ke pembeli saat siap: <code>/rilispo ${idx + 1}</code>`
+        );
+        return res.status(200).json({ ok: true });
+      }
+
       if (rawText.startsWith("/flashsale")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const katalogList = await getKatalog();
@@ -11863,6 +12091,7 @@ module.exports = async function handler(req, res) {
               "• <code>/tambah</code> (1 baris = 1 set, bisa banyak sekaligus) | <code>/edit</code> | <code>/hapus</code>\n" +
               "• <code>/tambahfile NO</code> | <code>/hapusfile NO NO</code> | <code>/listfile NO</code> — lampirkan banyak file/link\n" +
               "• <code>/flashsale NO | HARGA | MENIT</code> | <code>/stopflashsale</code> — promo kilat + auto broadcast\n" +
+              "• <code>/preorder NO ETA</code> | <code>/preorder NO off</code> | <code>/rilispo NO</code> — pre order\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
               "• <code>/fiturbot</code> — daftar fitur penting bot\n" +
