@@ -8559,7 +8559,9 @@ async function setPostChannel(val) {
 // Dipanggil setiap ada set baru tersimpan lewat /tambah. Postingan ke channel HANYA berisi
 // preview + tombol yang mengarah ke bot (deep-link /start buy_ID), bukan link Drive/file aslinya.
 // ---- POSTING MASSAL SET LAMA KE CHANNEL (bertahap, POSTALL_PER_DAY set per hari WIB) ----
-const POSTALL_PER_DAY = 10; // jatah posting per hari (WIB)
+const POSTALL_PER_DAY = 0; // jatah posting per hari (WIB). 0 = TANPA BATAS harian. Isi angka (mis. 10) untuk membatasi lagi.
+const POSTALL_MAX_PER_RUN = 15; // maksimal posting per satu proses (anti timeout Vercel & anti flood Telegram). Sisa antrean lanjut otomatis di proses berikutnya.
+const POSTALL_QUOTA_LABEL = POSTALL_PER_DAY > 0 ? `${POSTALL_PER_DAY} set per hari` : "tanpa batas harian";
 const POSTALL_DELAY_MS = 1000; // jeda antar posting supaya tidak kena limit Telegram
 const REDIS_POSTALL_STATE_KEY = "lumine_main_postall_state"; // JSON: { active, queue, day, count }
 const REDIS_POSTALL_DONE_KEY = "lumine_main_postall_done"; // hash: id set -> 1 (sudah diposting)
@@ -8627,7 +8629,7 @@ async function runPostAllBatch(token) {
       st.day = dayKey;
       st.count = 0;
     }
-    if (st.count >= POSTALL_PER_DAY) return { ran: false, reason: "quota" };
+    if (POSTALL_PER_DAY > 0 && st.count >= POSTALL_PER_DAY) return { ran: false, reason: "quota" };
 
     const channel = await getPostChannel();
     if (!channel) return { ran: false, reason: "nochannel" };
@@ -8637,7 +8639,7 @@ async function runPostAllBatch(token) {
     const byId = new Map((await getKatalog()).map((k) => [String(k.id), k]));
     let posted = 0;
     let failed = 0;
-    while (st.count < POSTALL_PER_DAY && st.queue.length > 0) {
+    while ((POSTALL_PER_DAY <= 0 || st.count < POSTALL_PER_DAY) && st.queue.length > 0 && posted + failed < POSTALL_MAX_PER_RUN) {
       const id = String(st.queue.shift());
       const item = byId.get(id);
       if (!item) continue; // set sudah dihapus dari katalog
@@ -8664,7 +8666,7 @@ async function runPostAllBatch(token) {
         text:
           `📢 <b>Posting massal ke channel</b>\n` +
           `✅ Terkirim: ${posted} • ❌ Gagal: ${failed}\n` +
-          (st.active ? `⏳ Sisa antrean: ${st.queue.length} set (lanjut besok, ${POSTALL_PER_DAY}/hari)` : "🎉 Antrean selesai."),
+          (st.active ? `⏳ Sisa antrean: ${st.queue.length} set (lanjut otomatis, ${POSTALL_QUOTA_LABEL})` : "🎉 Antrean selesai."),
         parse_mode: "HTML",
       });
     }
@@ -8809,7 +8811,7 @@ async function runPostSetBatch(token) {
 
   const { dayKey } = getWibPeriods();
   const dayKeyCnt = REDIS_POSTSET_DAY_PREFIX + dayKey;
-  if ((Number(await redisCommand(["GET", dayKeyCnt])) || 0) >= POSTALL_PER_DAY) {
+  if (POSTALL_PER_DAY > 0 && (Number(await redisCommand(["GET", dayKeyCnt])) || 0) >= POSTALL_PER_DAY) {
     return { ran: false, reason: "quota" };
   }
   const channel = await getPostChannel();
@@ -8827,7 +8829,8 @@ async function runPostSetBatch(token) {
     const byId = new Map((await getKatalog()).map((k) => [String(k.id), k]));
     while (true) {
       const used = Number(await redisCommand(["GET", dayKeyCnt])) || 0;
-      if (used >= POSTALL_PER_DAY) break;
+      if (POSTALL_PER_DAY > 0 && used >= POSTALL_PER_DAY) break;
+      if (posted + failed >= POSTALL_MAX_PER_RUN) break; // sisa dilanjutkan otomatis di proses berikutnya
       const id = await redisCommand(["LPOP", REDIS_POSTSET_QUEUE_KEY]);
       if (!id) break;
       const item = byId.get(String(id));
@@ -8874,22 +8877,22 @@ async function postNewSetToChannel(token, item) {
 
     const replyMarkup = { inline_keyboard: [[{ text: "🛒 Lihat & Beli", url: deepLink }]] };
 
-    if (item.photo_id) {
-      await tgRequest(token, "sendPhoto", {
-        chat_id: targetChannel,
-        photo: item.photo_id,
-        caption,
-        parse_mode: "HTML",
-        reply_markup: replyMarkup,
-      });
-    } else {
-      await tgRequest(token, "sendMessage", {
-        chat_id: targetChannel,
-        text: caption,
-        parse_mode: "HTML",
-        reply_markup: replyMarkup,
-      });
-    }
+    const rNew = item.photo_id
+      ? await tgRequest(token, "sendPhoto", {
+          chat_id: targetChannel,
+          photo: item.photo_id,
+          caption,
+          parse_mode: "HTML",
+          reply_markup: replyMarkup,
+        })
+      : await tgRequest(token, "sendMessage", {
+          chat_id: targetChannel,
+          text: caption,
+          parse_mode: "HTML",
+          reply_markup: replyMarkup,
+        });
+    // set yang sudah diposting otomatis ikut ditandai, supaya /postsemua & /postset tidak memposting dobel
+    if (rNew && rNew.ok) await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, String(item.id), "1"]);
   } catch (e) {
     console.error("Auto-post set ke channel gagal:", e && e.message);
   }
@@ -12257,7 +12260,7 @@ module.exports = async function handler(req, res) {
           `📮 Antre <b>${antreS}</b> set` +
             (sudahS ? ` • sudah pernah diposting <b>${sudahS}</b> (dilewati, pakai <code>/postset NOMOR ulang</code> untuk posting ulang)` : "") +
             (salahS.length ? ` • nomor tidak valid: ${escapeHtml(salahS.join(", "))}` : "") +
-            `.\nJatah posting ${POSTALL_PER_DAY} set per hari.`
+            `.\nJatah posting: ${POSTALL_QUOTA_LABEL}.`
         );
 
         const runS = await runPostSetBatch(token);
@@ -12266,11 +12269,59 @@ module.exports = async function handler(req, res) {
             `✅ Diposting: <b>${runS.posted}</b> • gagal: ${runS.failed}` +
               (runS.failed > 0 ? " (set belum punya preview/foto atau gagal kirim, tidak ditandai terposting)" : "") +
               "\n" +
-              (runS.sisa > 0 ? `⏳ Sisa antrean: <b>${runS.sisa}</b> set, lanjut besok otomatis.` : "🎉 Antrean kosong.")
+              (runS.sisa > 0 ? `⏳ Sisa antrean: <b>${runS.sisa}</b> set, lanjut otomatis di batch berikutnya.` : "🎉 Antrean kosong.")
           );
         } else if (runS.reason === "quota") {
           await replyS(`⏳ Jatah hari ini sudah habis. Antrean dilanjutkan besok otomatis.`);
         }
+        return res.status(200).json({ ok: true });
+      }
+
+      // TANDAI SET YANG SUDAH ADA DI CHANNEL: /tandaipost 1-120 | /tandaipost 5 9 12 | /tandaipost hapus 5-9 | /tandaipost cek
+      if (/^\/tandaipost(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const replyT = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+        let argT = rawText.replace(/^\/tandaipost\s*/i, "").trim();
+        const katalogT = await getKatalog();
+        const doneT = new Set((await redisCommand(["HKEYS", REDIS_POSTALL_DONE_KEY])) || []);
+        if (/^cek$/i.test(argT)) {
+          const belum = katalogT.map((k, i) => ({ k, no: i + 1 })).filter((x) => !doneT.has(String(x.k.id)));
+          await replyT(
+            `📊 Total set: <b>${katalogT.length}</b>\n✅ Ditandai sudah di channel: <b>${katalogT.length - belum.length}</b>\n` +
+              `⏳ Belum diposting: <b>${belum.length}</b>` +
+              (belum.length && belum.length <= 40 ? `\nNomor: ${belum.map((x) => x.no).join(", ")}` : "")
+          );
+          return res.status(200).json({ ok: true });
+        }
+        const hapusT = /^hapus(\s|$)/i.test(argT);
+        if (hapusT) argT = argT.replace(/^hapus\s*/i, "").trim();
+        const nosT = new Set();
+        for (const tok of argT.split(/[\s,]+/).filter(Boolean)) {
+          const rg = /^(\d+)-(\d+)$/.exec(tok);
+          if (rg) {
+            let a = parseInt(rg[1], 10);
+            let b = parseInt(rg[2], 10);
+            if (a > b) [a, b] = [b, a];
+            for (let n = a; n <= b && n - a <= 1000; n++) nosT.add(n);
+          } else if (/^\d+$/.test(tok)) nosT.add(parseInt(tok, 10));
+        }
+        const validT = [...nosT].filter((n) => n >= 1 && n <= katalogT.length);
+        if (validT.length === 0) {
+          await replyT(
+            "⚠️ Format: <code>/tandaipost 1-120</code> (tandai sudah ada di channel), <code>/tandaipost hapus 5-9</code> (batalkan tanda), <code>/tandaipost cek</code>."
+          );
+          return res.status(200).json({ ok: true });
+        }
+        for (const n of validT) {
+          const id = String(katalogT[n - 1].id);
+          if (hapusT) await redisCommand(["HDEL", REDIS_POSTALL_DONE_KEY, id]);
+          else await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, id, "1"]);
+        }
+        await replyT(
+          hapusT
+            ? `↩️ Tanda dihapus untuk <b>${validT.length}</b> set (akan ikut diposting lagi).`
+            : `✅ <b>${validT.length}</b> set ditandai sudah ada di channel, akan dilewati oleh /postsemua dan /postset.`
+        );
         return res.status(200).json({ ok: true });
       }
 
@@ -12780,7 +12831,7 @@ module.exports = async function handler(req, res) {
           if (!st || !st.active) {
             await reply("ℹ️ Tidak ada posting massal yang berjalan.");
           } else {
-            await reply(`ℹ️ Posting massal aktif. Sisa antrean: <b>${st.queue.length}</b> set (${POSTALL_PER_DAY}/hari).`);
+            await reply(`ℹ️ Posting massal aktif. Sisa antrean: <b>${st.queue.length}</b> set (${POSTALL_QUOTA_LABEL}).`);
           }
           return res.status(200).json({ ok: true });
         }
@@ -12807,7 +12858,7 @@ module.exports = async function handler(req, res) {
         await savePostAllState({ active: true, queue, day: "", count: 0 });
         await reply(
           `🚀 Posting massal dimulai.\n` +
-            `Antrean: <b>${queue.length}</b> set • jatah <b>${POSTALL_PER_DAY}</b> set per hari.\n` +
+            `Antrean: <b>${queue.length}</b> set • jatah <b>${POSTALL_QUOTA_LABEL}</b>.\n` +
             `Cek sisa dengan <code>/postsemua status</code>, hentikan dengan <code>/postsemua stop</code>.`
         );
         const first = await runPostAllBatch(token);
