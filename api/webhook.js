@@ -170,7 +170,11 @@ const REDIS_VOUCHERS_KEY = "lumine_main_vouchers";
 const REDIS_USER_VOUCHER_PREFIX = "lumine_main_uv_";
 const REDIS_KOLEKSI_PREFIX = "lumine_main_koleksi_";
 const REDIS_MYSTERY_KEY = "lumine_main_mystery";
-const REDIS_SALDO_KEY = "lumine_main_saldo";
+const REDIS_SALDO_KEY = "lumine_main_saldo"; // legacy: saldo lama sebelum pemisahan (dipindah otomatis per member)
+const REDIS_SALDO_DEP_KEY = "lumine_main_saldo_dep"; // hash: id user -> saldo DEPOSIT (uang asli)
+const REDIS_SALDO_FREE_KEY = "lumine_main_saldo_free"; // hash: id user -> saldo GRATISAN (bonus)
+const REDIS_SALDO_MIG_KEY = "lumine_main_saldo_mig"; // hash: id user -> 1 (saldo lama sudah dipindah)
+const SALDO_GRATIS_MAX_PERCENT = 30; // saldo gratisan hanya boleh menutup maks 30% harga per transaksi
 const REDIS_RESELLER_KEY = "lumine_main_reseller";
 const REDIS_RESELLER_OMSET_KEY = "lumine_main_reseller_omset";
 const REDIS_RESELLER_OMSET_CNT_KEY = "lumine_main_reseller_omset_cnt";
@@ -211,19 +215,6 @@ const REDIS_SUB_PENDING_KEY = "lumine_main_sub_pending"; // hash: id user -> "wa
 const REDIS_SUB_CLAIMED_KEY = "lumine_main_sub_claimed"; // hash: id user -> id klaim (sudah pernah klaim, hanya sekali)
 const REDIS_SUB_REQ_KEY = "lumine_main_sub_req"; // hash: id klaim -> JSON data klaim
 const REDIS_SUB_SEQ_KEY = "lumine_main_sub_seq"; // counter id klaim
-
-// ---- SPIN GRATIS HARIAN (wajib sudah check-in hari itu) ----
-const SPIN_ENABLED = true; // false = matikan spin wheel
-const REDIS_SPIN_PREFIX = "lumine_main_spin_"; // hash per hari (WIB): id user -> 1
-const SPIN_SALDO_AMOUNT = 500; // nominal hadiah saldo (dipotong dari kas admin)
-// Peluang dasar. Hadiah yang stoknya kosong (mis. tidak ada katalog Rp50.000) otomatis dikeluarkan
-// dan peluangnya dibagi ulang ke hadiah yang tersedia. Peluang yang tampil selalu sesuai hasil itu.
-const SPIN_PRIZES = [
-  { key: "zonk", chance: 8 },
-  { key: "saldo", chance: 30 },
-  { key: "pack10", chance: 60, price: 10000 },
-  { key: "all50", chance: 2, price: 50000 },
-]; // file restore yg nunggu /restore konfirmasi (TTL 5 menit)
 
 // ---- PENGATURAN WD (TARIK MARGIN) RESELLER ----
 const WD_ENABLED = true; // false = matikan fitur WD
@@ -310,33 +301,139 @@ async function redisCommand(commandArray) {
   return data.result;
 }
 
-async function getUserSaldo(userId) {
-  const raw = await redisCommand(["HGET", REDIS_SALDO_KEY, String(userId)]);
-  return parseInt(raw, 10) || 0;
+// ---- SALDO DUA JENIS: DEPOSIT (uang asli) & GRATISAN (bonus) ----
+// Saldo lama dipindah otomatis saat member pertama kali disentuh:
+// member yang pernah deposit -> saldo lamanya dianggap deposit; selain itu -> gratisan.
+async function isFundAccount(userId) {
+  const uid = String(userId);
+  if (ADMIN_IDS.includes(uid)) return true;
+  const pinned = await redisCommand(["GET", REDIS_ADMIN_ID_KEY]);
+  if (pinned && String(pinned) === uid) return true;
+  const fund = await getReferralFundId();
+  return Boolean(fund) && String(fund) === uid;
 }
 
-async function addUserSaldo(userId, amount) {
-  const addVal = Math.round(Number(amount) || 0);
-  const res = await redisCommand(["HINCRBY", REDIS_SALDO_KEY, String(userId), addVal]);
-  return parseInt(res, 10) || 0;
+async function isDepositAccount(userId) {
+  if (await isFundAccount(userId)) return true;
+  return Number(await redisCommand(["SISMEMBER", REDIS_DEPOSIT_USER_KEY, String(userId)])) === 1;
 }
 
-async function deductUserSaldo(userId, amount) {
-  const cost = Math.round(Number(amount) || 0);
-  if (cost <= 0) return { ok: true, balance: await getUserSaldo(userId) };
-  const current = await getUserSaldo(userId);
-  if (current < cost) return { ok: false, balance: current };
-
-  const after = parseInt(
-    await redisCommand(["HINCRBY", REDIS_SALDO_KEY, String(userId), -cost]),
-    10
-  );
-  if (isNaN(after) || after < 0) {
-    await redisCommand(["HINCRBY", REDIS_SALDO_KEY, String(userId), cost]);
-    return { ok: false, balance: current };
-  }
-  return { ok: true, balance: after };
+async function ensureSaldoMigrated(userId) {
+  const uid = String(userId);
+  const claimed = Number(await redisCommand(["HSETNX", REDIS_SALDO_MIG_KEY, uid, "1"]));
+  if (claimed !== 1) return;
+  try {
+    const old = parseInt(await redisCommand(["HGET", REDIS_SALDO_KEY, uid]), 10) || 0;
+    if (old !== 0) {
+      const key = (await isDepositAccount(uid)) ? REDIS_SALDO_DEP_KEY : REDIS_SALDO_FREE_KEY;
+      await redisCommand(["HINCRBY", key, uid, old]);
+      await redisCommand(["HDEL", REDIS_SALDO_KEY, uid]);
     }
+  } catch (e) {
+    await redisCommand(["HDEL", REDIS_SALDO_MIG_KEY, uid]); // gagal: boleh dicoba lagi
+    throw e;
+  }
+}
+
+async function getSaldoSplit(userId) {
+  const uid = String(userId);
+  await ensureSaldoMigrated(uid);
+  const [d, f] = await Promise.all([
+    redisCommand(["HGET", REDIS_SALDO_DEP_KEY, uid]),
+    redisCommand(["HGET", REDIS_SALDO_FREE_KEY, uid]),
+  ]);
+  const dep = parseInt(d, 10) || 0;
+  const free = parseInt(f, 10) || 0;
+  return { dep, free, total: dep + free };
+}
+
+// Total saldo (deposit + gratisan), dipakai untuk tampilan.
+async function getUserSaldo(userId) {
+  return (await getSaldoSplit(userId)).total;
+}
+
+// kind: "deposit" | "gratis". Tanpa kind: akun kas admin -> deposit, member -> gratisan.
+async function addUserSaldo(userId, amount, kind) {
+  const uid = String(userId);
+  const addVal = Math.round(Number(amount) || 0);
+  await ensureSaldoMigrated(uid);
+  const k = kind || ((await isFundAccount(uid)) ? "deposit" : "gratis");
+  const key = k === "deposit" ? REDIS_SALDO_DEP_KEY : REDIS_SALDO_FREE_KEY;
+  await redisCommand(["HINCRBY", key, uid, addVal]);
+  return (await getSaldoSplit(uid)).total;
+}
+
+// Ubah saldo deposit langsung (dipakai untuk potong kas admin). Mengembalikan saldo deposit setelahnya.
+async function adjustDepositRaw(userId, delta) {
+  const uid = String(userId);
+  await ensureSaldoMigrated(uid);
+  return parseInt(await redisCommand(["HINCRBY", REDIS_SALDO_DEP_KEY, uid, Math.round(delta)]), 10);
+}
+
+// Pembayaran khusus saldo deposit (VIP, Mystery Box, Pilih Beberapa Set, kas admin).
+async function deductUserSaldo(userId, amount) {
+  const uid = String(userId);
+  const cost = Math.round(Number(amount) || 0);
+  const cur = await getSaldoSplit(uid);
+  if (cost <= 0) return { ok: true, balance: cur.total };
+  if (cur.dep < cost) return { ok: false, balance: cur.total };
+  const after = parseInt(await redisCommand(["HINCRBY", REDIS_SALDO_DEP_KEY, uid, -cost]), 10);
+  if (isNaN(after) || after < 0) {
+    await redisCommand(["HINCRBY", REDIS_SALDO_DEP_KEY, uid, cost]);
+    return { ok: false, balance: cur.total };
+  }
+  return { ok: true, balance: after + cur.free };
+}
+
+// Pembelian pakai saldo: saldo gratisan hanya menutup sebagian kecil (SALDO_GRATIS_MAX_PERCENT)
+// sebagai diskon, sisanya wajib dari saldo deposit.
+async function payPurchaseWithSaldo(userId, amount) {
+  const uid = String(userId);
+  const cost = Math.round(Number(amount) || 0);
+  const cur = await getSaldoSplit(uid);
+  if (cost <= 0) return { ok: true, balance: cur.total, freeUsed: 0, depUsed: 0 };
+  const freeUse = Math.min(cur.free, Math.floor((cost * SALDO_GRATIS_MAX_PERCENT) / 100));
+  const depUse = cost - freeUse;
+  if (cur.dep < depUse) return { ok: false, balance: cur.total, freeUsed: 0, depUsed: 0 };
+
+  const depAfter = parseInt(await redisCommand(["HINCRBY", REDIS_SALDO_DEP_KEY, uid, -depUse]), 10);
+  if (isNaN(depAfter) || depAfter < 0) {
+    await redisCommand(["HINCRBY", REDIS_SALDO_DEP_KEY, uid, depUse]);
+    return { ok: false, balance: cur.total, freeUsed: 0, depUsed: 0 };
+  }
+  if (freeUse > 0) {
+    const freeAfter = parseInt(await redisCommand(["HINCRBY", REDIS_SALDO_FREE_KEY, uid, -freeUse]), 10);
+    if (isNaN(freeAfter) || freeAfter < 0) {
+      await redisCommand(["HINCRBY", REDIS_SALDO_FREE_KEY, uid, freeUse]);
+      await redisCommand(["HINCRBY", REDIS_SALDO_DEP_KEY, uid, depUse]);
+      return { ok: false, balance: cur.total, freeUsed: 0, depUsed: 0 };
+    }
+  }
+  return { ok: true, balance: depAfter + (cur.free - freeUse), freeUsed: freeUse, depUsed: depUse };
+}
+
+// Kembalikan saldo ke jenis asalnya saat pembayaran gagal di tengah jalan.
+async function refundPurchaseSaldo(userId, freeUsed, depUsed) {
+  if (freeUsed > 0) await addUserSaldo(userId, freeUsed, "gratis");
+  if (depUsed > 0) await addUserSaldo(userId, depUsed, "deposit");
+}
+
+// Semua saldo member (lama + baru) untuk statistik admin.
+async function getAllSaldoTotals() {
+  const [oldRaw, depRaw, freeRaw] = await Promise.all([
+    redisCommand(["HGETALL", REDIS_SALDO_KEY]),
+    redisCommand(["HGETALL", REDIS_SALDO_DEP_KEY]),
+    redisCommand(["HGETALL", REDIS_SALDO_FREE_KEY]),
+  ]);
+  const totals = {};
+  for (const raw of [oldRaw, depRaw, freeRaw]) {
+    if (!Array.isArray(raw)) continue;
+    for (let i = 0; i < raw.length; i += 2) {
+      totals[raw[i]] = (totals[raw[i]] || 0) + (parseInt(raw[i + 1], 10) || 0);
+    }
+  }
+  return Object.values(totals);
+}
 
 // ---- MANAJEMEN RESELLER (ADD / DELETE / LIST / OMSET) ----
 async function getResellerMap() {
@@ -799,7 +896,7 @@ async function chargeFundForMargin(token, margin, ownerName) {
   const fundId = await getReferralFundId();
   if (!fundId) return;
 
-  const after = parseInt(await redisCommand(["HINCRBY", REDIS_SALDO_KEY, String(fundId), -Math.round(margin)]), 10);
+  const after = await adjustDepositRaw(fundId, -Math.round(margin));
   if (isNaN(after)) return;
   const before = after + Math.round(margin);
 
@@ -1676,7 +1773,7 @@ async function handleTapCallback(token, call, isCallerAdmin) {
         return answer(`✅ Batas ${TAP_TIKET_MAX_PER_HARI} sesi tambahan hari ini sudah tercapai.`, true);
       }
 
-      const bayar = await deductUserSaldo(uid, TAP_TIKET_HARGA);
+      const bayar = await payPurchaseWithSaldo(uid, TAP_TIKET_HARGA);
       if (!bayar.ok) {
         await redisCommand(["HINCRBY", paidHash, uid, "-1"]);
         return answer(`💰 Saldo kurang. Butuh ${formatRupiah(TAP_TIKET_HARGA)}.`, true);
@@ -1692,7 +1789,7 @@ async function handleTapCallback(token, call, isCallerAdmin) {
         await redisCommand(["HSET", REDIS_TAP_NAMES_KEY, uid, nama]);
       } catch (e) {
         // Gagal mulai: kembalikan saldo dan slot
-        await addUserSaldo(uid, TAP_TIKET_HARGA);
+        await refundPurchaseSaldo(uid, bayar.freeUsed, bayar.depUsed);
         await redisCommand(["HINCRBY", paidHash, uid, "-1"]);
         throw e;
       }
@@ -2164,10 +2261,7 @@ async function chargeFundForResellerPrem(token, buyerName) {
   const fundId = await getReferralFundId();
   if (!fundId) return null;
 
-  const after = parseInt(
-    await redisCommand(["HINCRBY", REDIS_SALDO_KEY, String(fundId), -Math.round(RESELLER_PREM_BONUS_SALDO)]),
-    10
-  );
+  const after = await adjustDepositRaw(fundId, -Math.round(RESELLER_PREM_BONUS_SALDO));
   if (isNaN(after)) return null;
   const before = after + Math.round(RESELLER_PREM_BONUS_SALDO);
 
@@ -2398,7 +2492,7 @@ async function processAccOrderCore(token, order) {
   // KHUSUS ORDER DEPOSIT SALDO (AUTO-ACC)
   if (order.is_deposit) {
     const depositAmount = Number(order.base_nominal) || 0;
-    const newSaldo = await addUserSaldo(order.buyer_id, depositAmount);
+    const newSaldo = await addUserSaldo(order.buyer_id, depositAmount, "deposit");
     await redisCommand(["SADD", REDIS_DEPOSIT_USER_KEY, String(order.buyer_id)]);
 
     await tgRequest(token, "sendMessage", {
@@ -2733,178 +2827,8 @@ async function claimDailyCheckin(token, chatId, userId) {
   await sendMsg(
     `🎉 <b>Check-in berhasil!</b>\n` +
       `💰 Saldo masuk: <b>+${formatRupiah(CHECKIN_REWARD_SALDO)}</b>\n` +
-      `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>`,
-    { inline_keyboard: [[{ text: "🎡 Spin Gratis Sekarang", callback_data: "spin_info" }]] }
+      `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>`
   );
-}
-
-// ---- SPIN GRATIS HARIAN ----
-// Ambil katalog yang punya link, dikelompokkan per harga (10k, 50k)
-async function getSpinPool() {
-  const katalog = await getKatalog();
-  const ok = katalog.filter(
-    (k) => (Array.isArray(k.links) && k.links.length > 0) || (typeof k.link === "string" && k.link)
-  );
-  const byPrice = (price) => ok.filter((k) => parseNominal(k.harga) === price);
-  return {
-    pack10: byPrice(10000),
-    all50: byPrice(50000),
-  };
-}
-
-// Peluang nyata setiap hadiah setelah hadiah kosong dikeluarkan
-async function getSpinOdds(fundId, pool) {
-  const fundBal = await getUserSaldo(fundId);
-  const available = SPIN_PRIZES.filter((p) => {
-    if (p.key === "zonk") return true;
-    if (p.key === "saldo") return fundBal >= SPIN_SALDO_AMOUNT;
-    return pool[p.key] && pool[p.key].length > 0;
-  });
-  const total = available.reduce((a, p) => a + p.chance, 0) || 1;
-  return available.map((p) => ({ ...p, real: (p.chance / total) * 100 }));
-}
-
-function pickFromOdds(odds) {
-  const total = odds.reduce((a, p) => a + p.chance, 0);
-  let r = Math.random() * total;
-  for (const p of odds) {
-    if (r < p.chance) return p;
-    r -= p.chance;
-  }
-  return odds[odds.length - 1];
-}
-
-function spinPrizeLabel(key) {
-  if (key === "zonk") return "Zonk, coba lagi besok";
-  if (key === "saldo") return `Saldo ${formatRupiah(SPIN_SALDO_AMOUNT)}`;
-  if (key === "pack10") return "Photopack 10k";
-  return "All Pack 50k";
-}
-
-async function sendSpinInfo(token, chatId, userId) {
-  const sendMsg = (text, markup) =>
-    tgRequest(token, "sendMessage", {
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      ...(markup ? { reply_markup: markup } : {}),
-    });
-  const backBtn = [[{ text: "🔙 Menu Utama", callback_data: "menu_home" }]];
-
-  if (!SPIN_ENABLED) return sendMsg("⚠️ Spin gratis sedang tidak aktif.", { inline_keyboard: backBtn });
-
-  const { dayKey } = getWibPeriods();
-  const checkedIn = Number(await redisCommand(["HEXISTS", `${REDIS_CHECKIN_PREFIX}${dayKey}`, String(userId)])) === 1;
-  if (!checkedIn) {
-    return sendMsg(
-      "🔒 <b>Spin gratis terbuka setelah check-in.</b>\nCheck-in dulu di menu 💰 Saldo & Depo, lalu spin di sini.",
-      { inline_keyboard: backBtn }
-    );
-  }
-  const spun = Number(await redisCommand(["HEXISTS", `${REDIS_SPIN_PREFIX}${dayKey}`, String(userId)])) === 1;
-  if (spun) {
-    return sendMsg("✅ Kamu sudah spin hari ini. Balik lagi besok ya!", { inline_keyboard: backBtn });
-  }
-
-  const fundId = await getReferralFundId();
-  const pool = await getSpinPool();
-  const odds = fundId ? await getSpinOdds(fundId, pool) : [];
-  const lines = odds.map((p) => `• ${spinPrizeLabel(p.key)} — peluang <b>${p.real.toFixed(1)}%</b>\n`).join("");
-
-  return sendMsg(
-    "🎡 <b>SPIN GRATIS HARIAN</b>\n\n" +
-      "Peluang setiap hadiah:\n" +
-      lines +
-      "\n<i>Gratis 1 spin per hari, setelah check-in. Hadiah pack langsung masuk ke 🎒 Koleksi Saya.</i>",
-    { inline_keyboard: [[{ text: "🎡 Putar Sekarang", callback_data: "spin_go" }], ...backBtn] }
-  );
-}
-
-async function doSpin(token, chatId, userId) {
-  const sendMsg = (text, markup) =>
-    tgRequest(token, "sendMessage", {
-      chat_id: chatId,
-      text,
-      parse_mode: "HTML",
-      ...(markup ? { reply_markup: markup } : {}),
-    });
-  const backBtn = { inline_keyboard: [[{ text: "🔙 Menu Utama", callback_data: "menu_home" }]] };
-
-  if (!SPIN_ENABLED) return sendMsg("⚠️ Spin gratis sedang tidak aktif.", backBtn);
-
-  const { dayKey } = getWibPeriods();
-  const checkedIn = Number(await redisCommand(["HEXISTS", `${REDIS_CHECKIN_PREFIX}${dayKey}`, String(userId)])) === 1;
-  if (!checkedIn) return sendMsg("🔒 Check-in dulu ya sebelum spin.", backBtn);
-
-  // Klaim 1 spin per hari (HSETNX anti klik ganda)
-  const spinKey = `${REDIS_SPIN_PREFIX}${dayKey}`;
-  const claimed = await redisCommand(["HSETNX", spinKey, String(userId), "1"]);
-  await redisCommand(["EXPIRE", spinKey, String(60 * 60 * 24 * 3)]);
-  if (Number(claimed) !== 1) {
-    return sendMsg("✅ Kamu sudah spin hari ini. Balik lagi besok ya!", backBtn);
-  }
-
-  const fundId = await getReferralFundId();
-  if (!fundId) {
-    await redisCommand(["HDEL", spinKey, String(userId)]);
-    return sendMsg("⚠️ Spin belum bisa diproses. Coba lagi nanti ya.", backBtn);
-  }
-
-  const pool = await getSpinPool();
-  const odds = await getSpinOdds(fundId, pool);
-  const prize = pickFromOdds(odds);
-
-  try {
-    if (prize.key === "zonk") {
-      return sendMsg("😅 <b>Zonk!</b> Belum beruntung hari ini. Coba lagi besok ya!", backBtn);
-    }
-
-    if (prize.key === "saldo") {
-      const d = await deductUserSaldo(fundId, SPIN_SALDO_AMOUNT);
-      if (!d.ok) {
-        // kas berubah sejak peluang dihitung: anggap zonk, jangan minus
-        return sendMsg("😅 <b>Zonk!</b> Belum beruntung hari ini. Coba lagi besok ya!", backBtn);
-      }
-      let newSaldo;
-      try {
-        newSaldo = await addUserSaldo(userId, SPIN_SALDO_AMOUNT);
-      } catch (addErr) {
-        await addUserSaldo(fundId, SPIN_SALDO_AMOUNT);
-        throw addErr;
-      }
-      return sendMsg(
-        `🎉 <b>Kamu dapat saldo ${formatRupiah(SPIN_SALDO_AMOUNT)}!</b>\n` +
-          `💳 Saldo kamu sekarang: <b>${formatRupiah(newSaldo)}</b>`,
-        backBtn
-      );
-    }
-
-    // Hadiah pack: pilih satu item acak yang BELUM dimiliki member, simpan ke koleksi
-    const ownedSpin = await getOwnedNameSet(userId);
-    const freshItems = (pool[prize.key] || []).filter((x) => !ownedSpin.has(String(x.nama).toLowerCase().trim()));
-    if (freshItems.length === 0) {
-      await addUserSaldo(userId, MYSTERY_DUPE_SALDO);
-      return sendMsg(
-        `💰 <b>Kamu sudah punya semua set di hadiah ini.</b>\n` +
-          `Saldo pengganti <b>${formatRupiah(MYSTERY_DUPE_SALDO)}</b> sudah masuk ke saldo kamu.`,
-        backBtn
-      );
-    }
-    const item = freshItems[Math.floor(Math.random() * freshItems.length)];
-    const link = normalizeUrl(
-      Array.isArray(item.links) && item.links.length > 0 ? item.links[0] : item.link
-    );
-    await addKoleksi(userId, item.nama, link);
-    return sendMsg(
-      `🎁 <b>Kamu dapat ${escapeHtml(item.nama)}!</b>\n\n` +
-        `🔗 ${escapeHtml(link)}\n\n` +
-        `<i>Tersimpan juga di 🎒 Koleksi Saya.</i>`,
-      backBtn
-    );
-  } catch (err) {
-    await redisCommand(["HDEL", spinKey, String(userId)]);
-    throw err;
-  }
 }
 
 // ---- KLAIM SALDO SUBSCRIBE ----
@@ -3129,7 +3053,7 @@ async function processSubReview(token, chatId, messageId, reqId, isAcc) {
 
 async function sendSaldoMenu(token, chatId, userId) {
   const [saldo, allCnt] = await Promise.all([
-    getUserSaldo(userId),
+    getSaldoSplit(userId),
     redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, String(userId)]),
   ]);
   const tier = getTierBadge(allCnt || 0);
@@ -3139,7 +3063,9 @@ async function sendSaldoMenu(token, chatId, userId) {
     text:
       `💳 <b>DOMPET SALDO LUMINE</b> [${tier}]\n\n` +
       `╭─── 💰 <b>INFO AKUN KAMU</b> ───\n` +
-      `│ • <b>Saldo Aktif :</b> <code>${formatRupiah(saldo)}</code>\n` +
+      `│ • <b>Saldo Deposit :</b> <code>${formatRupiah(saldo.dep)}</code>\n` +
+      `│ • <b>Saldo Gratisan :</b> <code>${formatRupiah(saldo.free)}</code> <i>(diskon max ${SALDO_GRATIS_MAX_PERCENT}%)</i>\n` +
+      `│ • <b>Total Saldo :</b> <code>${formatRupiah(saldo.total)}</code>\n` +
       `│ • <b>Status Depo :</b> ⚡ <b>Auto-ACC QRIS Statis</b>\n` +
       `╰─────────────────────\n\n` +
       `<b>Pilih nominal deposit cepat di bawah ini</b> atau ketik <code>/depo [nominal]</code> (min. Rp 2.000):\n` +
@@ -3157,9 +3083,6 @@ async function sendSaldoMenu(token, chatId, userId) {
         ],
         [
           { text: "✅ Check-in Harian (+Rp100)", callback_data: "checkin" },
-        ],
-        [
-          { text: "🎡 Spin Gratis Harian", callback_data: "spin_info" },
         ],
         [
           { text: "🎁 Klaim Saldo Subscribe", callback_data: "sub_info" },
@@ -3461,7 +3384,7 @@ async function buyVipViaSaldo(token, chatId, from) {
   const set = Number(await redisCommand(["HSETNX", REDIS_VIP_KEY, userId, new Date().toISOString()]));
   if (set !== 1) {
     // sudah VIP (klik ganda): kembalikan saldo
-    await addUserSaldo(userId, VIP_PRICE);
+    await addUserSaldo(userId, VIP_PRICE, "deposit");
     await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Kamu sudah VIP. Saldo dikembalikan." });
     return;
   }
@@ -3897,7 +3820,7 @@ async function payMysteryMulti(token, chatId, from) {
   } catch (err) {
     // kembalikan saldo untuk box yang belum sempat dibuka
     const refund = perBox * (MYSTERY_MULTI_COUNT - done);
-    if (refund > 0) await addUserSaldo(userId, refund);
+    if (refund > 0) await addUserSaldo(userId, refund, "deposit");
     console.error("Spin x5 gagal di tengah jalan, saldo dikembalikan:", err);
     await tgRequest(token, "sendMessage", {
       chat_id: chatId,
@@ -4112,7 +4035,7 @@ async function payPickSelection(token, chatId, from) {
     }
   } catch (err) {
     refund = r.targets.slice(done).reduce((s, t) => s + (Number(t.baseNominal) || 0), 0);
-    if (refund > 0) await addUserSaldo(userId, refund);
+    if (refund > 0) await addUserSaldo(userId, refund, "deposit");
     console.error("Pilih beberapa set gagal di tengah jalan, sisa saldo dikembalikan:", err);
     await tgRequest(token, "sendMessage", {
       chat_id: chatId,
@@ -7496,7 +7419,7 @@ const PANDUAN_TREE = {
     text:
       "💰 <b>Saldo & Deposit</b>\n\n" +
       "• Isi saldo lewat menu 💰 Saldo & Depo.\n" +
-      "• Check-in harian bisa menambah saldo, dan spin harian dibuka setelah check-in.",
+      "• Check-in harian bisa menambah saldo.",
     buttons: [],
   },
   belum: {
@@ -9097,10 +9020,6 @@ module.exports = async function handler(req, res) {
         await sendSubInfo(token, chatId, callerId);
       } else if (data === "sub_start") {
         await startSubProof(token, chatId, callerId);
-      } else if (data === "spin_info") {
-        await sendSpinInfo(token, chatId, callerId);
-      } else if (data === "spin_go") {
-        await doSpin(token, chatId, callerId);
       } else if (data.startsWith("depo_")) {
         const nominal = parseInt(data.replace("depo_", ""), 10) || 0;
         await createAndSendDepositInvoice(token, chatId, call.from, nominal);
@@ -9367,7 +9286,10 @@ module.exports = async function handler(req, res) {
         const voucherCode = bestDiscount.code;
 
         const finalPrice = Math.max(500, target.baseNominal - discount);
-        const deduction = await deductUserSaldo(callerId, finalPrice);
+        const depositOnly = Boolean(target.isMystery) || String(target.itemId) === String(RESELLER_PREM_TARGET);
+        const deduction = depositOnly
+          ? await deductUserSaldo(callerId, finalPrice) // Mystery Box & Reseller Prem wajib saldo deposit
+          : await payPurchaseWithSaldo(callerId, finalPrice);
 
         if (!deduction.ok) {
           await tgRequest(token, "sendMessage", {
@@ -10399,7 +10321,7 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        const updatedSaldo = await addUserSaldo(targetUid, delta);
+        const updatedSaldo = await addUserSaldo(targetUid, delta, "deposit");
         await tgRequest(token, "sendMessage", {
           chat_id: chatId,
           text:
@@ -10793,7 +10715,7 @@ module.exports = async function handler(req, res) {
           redisCommand(["HLEN", REDIS_LB_ALLCNT_KEY]),
           redisCommand(["HLEN", REDIS_VIP_KEY]),
           redisCommand(["HLEN", REDIS_RESELLER_KEY]),
-          redisCommand(["HVALS", REDIS_SALDO_KEY]),
+          getAllSaldoTotals(),
           Promise.resolve(getUndianNextKey()),
         ]);
         const totalSaldo = (Array.isArray(saldoVals) ? saldoVals : []).reduce((s, v) => s + (parseInt(v, 10) || 0), 0);
