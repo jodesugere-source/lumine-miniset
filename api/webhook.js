@@ -135,6 +135,13 @@ const REDIS_LB_PREFIX = "lumine_main_lb_";
 const REDIS_LB_NAMES_KEY = "lumine_main_lb_names";
 const REDIS_LB_ALLCNT_KEY = "lumine_main_lb_allcnt";
 const REDIS_USERS_KEY = "lumine_main_users";
+// ---- HARGA KHUSUS USER BARU BERBATAS WAKTU + PESAN SAMBUTAN ----
+const REDIS_JOIN_TS_KEY = "lumine_main_join_ts"; // hash: id user -> waktu pertama masuk bot (ms)
+const REDIS_WELCOMED_KEY = "lumine_main_welcomed"; // hash: id user -> 1 (panduan sambutan sudah dikirim)
+const NEW_USER_PROMO_DAYS = 3; // harga khusus user baru berlaku N hari sejak pertama masuk bot
+const REDIS_NUDGE_DAY_KEY = "lumine_main_newuser_nudge_day"; // tanggal (WIB) terakhir pengingat promo dijalankan
+const REDIS_NUDGE_SENT_KEY = "lumine_main_newuser_nudge_sent"; // hash: id user -> 1 (sudah diingatkan)
+const NEW_USER_NUDGE_PER_RUN = 100; // batas pesan pengingat per hari
 const REDIS_VOUCHERS_KEY = "lumine_main_vouchers";
 const REDIS_USER_VOUCHER_PREFIX = "lumine_main_uv_";
 const REDIS_KOLEKSI_PREFIX = "lumine_main_koleksi_";
@@ -2130,6 +2137,7 @@ function getCompactReplyKeyboard() {
       [{ text: "🛍️ Katalog" }, { text: "💰 Saldo & Depo" }],
       [{ text: "🎒 Koleksi Saya" }, { text: "🎲 Mystery Box" }],
       [{ text: "☰ Lainnya" }, { text: "📖 Panduan" }],
+      [{ text: "🎁 Promo Saya" }, { text: "⏳ Cek Jeda" }],
     ],
     resize_keyboard: true,
   };
@@ -3809,6 +3817,21 @@ function applyTierPrice(retail, tier) {
   return Math.max(500, Math.floor((retail * (1 - tier.pct / 100)) / 100) * 100);
 }
 
+async function getNewUserPromoEndTs(userId) {
+  const uid = String(userId);
+  let joinTs = Number(await redisCommand(["HGET", REDIS_JOIN_TS_KEY, uid])) || 0;
+  if (!joinTs) {
+    // User lama (masuk sebelum fitur ini): hitung 3 hari dari pertama kali dicek setelah update
+    await redisCommand(["HSETNX", REDIS_JOIN_TS_KEY, uid, String(Date.now())]);
+    joinTs = Number(await redisCommand(["HGET", REDIS_JOIN_TS_KEY, uid])) || Date.now();
+  }
+  return joinTs + NEW_USER_PROMO_DAYS * 24 * 60 * 60 * 1000;
+}
+
+async function isNewUserPromoActive(userId) {
+  return (await getNewUserPromoEndTs(userId)) > Date.now();
+}
+
 function getNewUserPrice(retail) {
   const sp = NEW_USER_PRICE_MAP[Number(retail)];
   return sp && sp < Number(retail) ? sp : null;
@@ -3867,7 +3890,10 @@ async function handleContactShare(token, msg) {
   }
   await redisCommand(["HSET", REDIS_PHONE_KEY, senderId, phone]);
   await redisCommand(["HSET", REDIS_PHONE_OWNER_KEY, phone, senderId]);
-  await sendMsg("✅ <b>Nomor terverifikasi!</b>\nHarga khusus pembeli baru sudah aktif untuk akunmu.", {
+  const promoEnd = await getNewUserPromoEndTs(senderId);
+  const promoInfo =
+    promoEnd > Date.now() && (await isNewBuyer(senderId)) ? `\n⏰ Berlaku sampai <b>${formatWibClock(promoEnd)}</b>.` : "";
+  await sendMsg("✅ <b>Nomor terverifikasi!</b>\nHarga khusus pembeli baru sudah aktif untuk akunmu." + promoInfo, {
     remove_keyboard: true,
   });
   await sendMsg("Silakan buka katalog dan pilih set yang kamu mau 👇", {
@@ -4518,7 +4544,7 @@ async function sendMoreMenu(token, chatId) {
     tierLabel = `⚡ FLASH SALE`;
   } else if (userId) {
     const sp = getNewUserPrice(baseNominal);
-    if (sp && (await isNewBuyer(userId)) && (await isPhoneVerified(userId))) {
+    if (sp && (await isNewBuyer(userId)) && (await isPhoneVerified(userId)) && (await isNewUserPromoActive(userId))) {
       baseNominal = sp;
     } else {
       const tier = await getMemberTier(userId);
@@ -5817,7 +5843,7 @@ async function handleRbMessage(ctx, msg) {
     if (rl === "limit") {
       await tgRequest(ctx.token, "sendMessage", {
         chat_id: chatId,
-        text: "⏳ Kamu terlalu sering mengirim pesan. Tunggu sebentar ya.",
+        text: "⏳ Kamu terlalu sering mengirim pesan. Kamu di-jeda " + formatDurasiBan() + ". Tunggu sebentar ya.",
       });
       return;
     }
@@ -6481,6 +6507,103 @@ const REDIS_BLACKLIST_KEY = "lumine_main_blacklist"; // hash: id user -> JSON {a
 const REDIS_TIKET_SEQ_KEY = "lumine_main_tiket_seq";
 const REDIS_TIKET_PREFIX = "lumine_main_tiket_"; // key per tiket: JSON
 const REDIS_TIKET_USER_KEY = "lumine_main_tiket_user"; // hash: id user -> id tiket yang masih terbuka
+const SPAM_BAN_SEC_PERTAMA = 60; // pelanggaran pertama: ban 1 menit
+const SPAM_BAN_SEC_BERULANG = 300; // pelanggaran berulang: ban 5 menit
+const SPAM_STRIKE_WINDOW_SEC = 3600; // pelanggaran dihitung "berulang" kalau terjadi dalam 1 jam
+const REDIS_TEMPBAN_PREFIX = "lumine_main_tempban_"; // key per user: ada = sedang di-ban sementara
+const REDIS_STRIKE_PREFIX = "lumine_main_strike_"; // key per user: jumlah pelanggaran spam
+
+// ---- PENGINGAT PESANAN BELUM DIBAYAR (harga khusus) ----
+const REDIS_CART_CHECK_KEY = "lumine_main_cart_check_ts"; // kapan terakhir pengecekan dijalankan
+const REDIS_CART_REMIND_PREFIX = "lumine_main_cart_remind_"; // key per pesanan: sudah diingatkan
+const CART_REMIND_MIN_MS = 30 * 60 * 1000; // ingatkan setelah 30 menit belum bayar
+const CART_REMIND_MAX_MS = 50 * 60 * 1000; // jangan ingatkan kalau sudah mendekati kedaluwarsa (60 menit)
+async function maybeCartReminder(token) {
+  const now = Date.now();
+  const last = Number(await redisCommand(["GET", REDIS_CART_CHECK_KEY])) || 0;
+  if (now - last < 10 * 60 * 1000) return;
+  await redisCommand(["SET", REDIS_CART_CHECK_KEY, String(now)]);
+
+  const ids = (await redisCommand(["HKEYS", REDIS_PENDING_MAP_KEY])) || [];
+  const promoPrices = Object.values(NEW_USER_PRICE_MAP).map(Number);
+  for (const orderId of (Array.isArray(ids) ? ids : []).slice(0, 100)) {
+    const oRaw = await redisCommand(["GET", REDIS_ORDER_PREFIX + String(orderId)]);
+    if (!oRaw) continue;
+    let o;
+    try {
+      o = JSON.parse(oRaw);
+    } catch {
+      continue;
+    }
+    if (o.status !== "pending" || o.is_deposit || o.is_mystery || !o.created_ms || !o.buyer_id) continue;
+    const umurMs = now - Number(o.created_ms);
+    if (umurMs < CART_REMIND_MIN_MS || umurMs >= CART_REMIND_MAX_MS) continue;
+    if (!promoPrices.includes(Number(o.base_nominal))) continue; // hanya pesanan harga khusus
+    if (!(await isNewUserPromoActive(o.buyer_id))) continue;
+
+    const ok = await redisCommand(["SET", REDIS_CART_REMIND_PREFIX + String(orderId), "1", "NX", "EX", "7200"]);
+    if (ok !== "OK") continue;
+    const sisaMenit = Math.max(1, Math.ceil((CART_REMIND_MAX_MS + 10 * 60 * 1000 - umurMs) / 60000));
+    await tgRequest(token, "sendMessage", {
+      chat_id: o.buyer_id,
+      parse_mode: "HTML",
+      text:
+        `⏰ <b>Pesananmu belum dibayar</b>\n\n` +
+        `📦 ${escapeHtml(o.item_nama || "Set")}\n` +
+        `💰 Harga khusus <b>${formatRupiah(o.base_nominal)}</b> masih berlaku.\n` +
+        `⌛ Pesanan akan kedaluwarsa sekitar ${sisaMenit} menit lagi. Selesaikan pembayaranmu sekarang.`,
+    });
+  }
+}
+
+// ---- CEK JEDA (sisa waktu ban spam) ----
+const REDIS_BANNOTICE_PREFIX = "lumine_main_bannotice_"; // key per user: pesan "sedang di-jeda" sudah dikirim
+async function sendCekJeda(token, chatId, uid) {
+  const sisa = Number(await redisCommand(["TTL", REDIS_TEMPBAN_PREFIX + String(uid)])) || 0;
+  const teks =
+    sisa > 0
+      ? `⏳ Kamu sedang di-jeda. Sisa waktu: <b>${sisa >= 60 ? Math.ceil(sisa / 60) + " menit" : sisa + " detik"}</b>.`
+      : "✅ Kamu tidak sedang di-jeda. Silakan lanjut.";
+  await tgRequest(token, "sendMessage", { chat_id: chatId, text: teks, parse_mode: "HTML" });
+}
+
+// ---- LOG AKTIVITAS ADMIN ----
+const REDIS_ADMINLOG_KEY = "lumine_main_adminlog"; // list: JSON {t, msg}, 200 terakhir
+async function logAdminAction(raw) {
+  const cmd = String(raw).split(/\s+/)[0].toLowerCase();
+  const sensitif = ["/setmacro", "/restore", "/backup", "/setqris"];
+  const isi = sensitif.includes(cmd) ? cmd + " (isi disembunyikan)" : String(raw).slice(0, 150);
+  await redisCommand(["LPUSH", REDIS_ADMINLOG_KEY, JSON.stringify({ t: getWibTimestamp(), msg: isi })]);
+  await redisCommand(["LTRIM", REDIS_ADMINLOG_KEY, "0", "199"]);
+}
+
+// ---- NOTIFIKASI SPAM KE ADMIN ----
+const REDIS_SPAM_ALERT_PREFIX = "lumine_main_spamalert_"; // key per user: cooldown notif 10 menit
+const REDIS_SPAM_ALERT_MINUTE_KEY = "lumine_main_spamalert_menit"; // hitungan notif per menit (maks 10)
+let lastSpamBanSec = 0; // durasi ban terakhir, dipakai untuk teks peringatan ke user
+function formatDurasiBan() {
+  return lastSpamBanSec >= 60 ? `${Math.round(lastSpamBanSec / 60)} menit` : `${lastSpamBanSec} detik`;
+}
+async function notifySpamBan(uid, strikes, banSec) {
+  try {
+    const token = process.env.BOT_TOKEN;
+    const qris = await getQris();
+    if (!token || !qris || !qris.admin_chat_id) return;
+    const perMenit = parseInt(await redisCommand(["INCR", REDIS_SPAM_ALERT_MINUTE_KEY]), 10) || 0;
+    if (perMenit === 1) await redisCommand(["EXPIRE", REDIS_SPAM_ALERT_MINUTE_KEY, "60"]);
+    if (perMenit > 10) return;
+    const ok = await redisCommand(["SET", REDIS_SPAM_ALERT_PREFIX + uid, "1", "NX", "EX", "600"]);
+    if (ok !== "OK") return;
+    const durasi = banSec >= 60 ? `${Math.round(banSec / 60)} menit` : `${banSec} detik`;
+    await tgRequest(token, "sendMessage", {
+      chat_id: qris.admin_chat_id,
+      text: `🚫 <b>Spam terdeteksi</b>\nUser: <code>${uid}</code>\nPelanggaran ke-${strikes}, di-jeda <b>${durasi}</b>.`,
+      parse_mode: "HTML",
+    });
+  } catch (e) {
+    console.error("Notif spam error:", e && e.message);
+  }
+}
 
 // ---- RATE LIMIT ----
 // Hitung aksi per user dalam jendela waktu pendek.
@@ -6489,10 +6612,24 @@ const REDIS_TIKET_USER_KEY = "lumine_main_tiket_user"; // hash: id user -> id ti
 async function checkRateLimit(userId) {
   if (!RATE_LIMIT_ENABLED || !userId) return "ok";
   try {
-    const key = REDIS_RATE_PREFIX + String(userId);
+    const uid = String(userId);
+    // Sedang di-ban sementara: abaikan diam-diam, tanpa menambah hitungan
+    if (await redisCommand(["GET", REDIS_TEMPBAN_PREFIX + uid])) return "blocked";
+
+    const key = REDIS_RATE_PREFIX + uid;
     const count = parseInt(await redisCommand(["INCR", key]), 10) || 0;
     if (count === 1) await redisCommand(["EXPIRE", key, RATE_LIMIT_WINDOW_SEC]);
-    if (count === RATE_LIMIT_MAX + 1) return "limit";
+    if (count === RATE_LIMIT_MAX + 1) {
+      // Melewati batas: catat pelanggaran, lalu ban 1 menit (pertama) atau 5 menit (berulang)
+      const strikeKey = REDIS_STRIKE_PREFIX + uid;
+      const strikes = parseInt(await redisCommand(["INCR", strikeKey]), 10) || 1;
+      await redisCommand(["EXPIRE", strikeKey, SPAM_STRIKE_WINDOW_SEC]);
+      const banSec = strikes <= 1 ? SPAM_BAN_SEC_PERTAMA : SPAM_BAN_SEC_BERULANG;
+      await redisCommand(["SET", REDIS_TEMPBAN_PREFIX + uid, "1", "EX", String(banSec)]);
+      lastSpamBanSec = banSec;
+      await notifySpamBan(uid, strikes, banSec);
+      return "limit";
+    }
     if (count > RATE_LIMIT_MAX + 1) return "blocked";
     return "ok";
   } catch (e) {
@@ -6866,6 +7003,51 @@ function buildPanduanMarkup(nodeKey) {
 }
 
 // Tampilkan node panduan. Kalau messageId ada (dari tombol), pesan diedit; kalau tidak, kirim baru.
+async function sendPromoStatus(token, chatId, userId) {
+  const endTs = await getNewUserPromoEndTs(userId);
+  const sisaMs = endTs - Date.now();
+  let text;
+  if (endTs > 0 && sisaMs > 0 && (await isNewBuyer(userId))) {
+    const totalMenit = Math.floor(sisaMs / 60000);
+    const hari = Math.floor(totalMenit / 1440);
+    const jam = Math.floor((totalMenit % 1440) / 60);
+    const menit = totalMenit % 60;
+    const sisaTeks = hari > 0 ? `${hari} hari ${jam} jam` : jam > 0 ? `${jam} jam ${menit} menit` : `${menit} menit`;
+    text =
+      "🎁 <b>Harga khusus user baru masih aktif!</b>\n\n" +
+      `⏱️ Sisa waktu: <b>${sisaTeks}</b>\n` +
+      `📅 Berakhir: <b>${formatWibClock(endTs)}</b>\n\n` +
+      "Buruan pilih set di 🛍️ Katalog sebelum promo habis.";
+  } else {
+    text =
+      "ℹ️ Saat ini kamu tidak punya harga khusus user baru yang aktif.\n\n" +
+      "Cek set terbaru dan harganya di 🛍️ Katalog.";
+  }
+  await tgRequest(token, "sendMessage", { chat_id: chatId, text, parse_mode: "HTML" });
+}
+
+async function sendWelcomeGuide(token, chatId, userId) {
+  const endTs = await getNewUserPromoEndTs(userId);
+  const promoLine =
+    endTs > Date.now()
+      ? `🎁 <b>Harga khusus user baru</b> berlaku sampai <b>${formatWibClock(endTs)}</b> (${NEW_USER_PROMO_DAYS} hari sejak kamu masuk).\n\n`
+      : "";
+  const text =
+    "📖 <b>Panduan Singkat</b>\n\n" +
+    promoLine +
+    "1️⃣ Pilih set di 🛍️ Katalog\n" +
+    "2️⃣ Tekan Beli, lalu bayar lewat QRIS\n" +
+    "3️⃣ Setelah pembayaran di-ACC, set langsung dikirim\n" +
+    "4️⃣ Lihat set yang sudah kamu beli di 🎒 Koleksi Saya\n\n" +
+    `Ada kendala? Hubungi @${ADMIN_USERNAME} 🙏`;
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [[{ text: "📋 Panduan Lengkap", callback_data: "guide:root" }]] },
+  });
+}
+
 async function sendPanduan(token, chatId, nodeKey, messageId) {
   const key = PANDUAN_TREE[nodeKey] ? nodeKey : "root";
   const payload = {
@@ -7454,6 +7636,53 @@ const REDIS_WINBACK_DAY_KEY = "lumine_main_winback_day";
 // Dipanggil saat order berhasil di-ACC (bukan deposit)
 async function recordLastBuy(buyerId) {
   await redisCommand(["HSET", REDIS_LASTBUY_KEY, String(buyerId), String(Date.now())]);
+}
+
+// Pengingat harga khusus user baru: jalan sekali sehari setelah jam 10 WIB,
+// kirim ke user yang sisa promonya kurang dari 24 jam, belum belanja, dan sudah verifikasi HP.
+async function maybeNewUserNudge(token) {
+  const now = Date.now();
+  const wib = new Date(now + 7 * 3600 * 1000);
+  if (wib.getUTCHours() < 10) return;
+
+  const todayKey = wibDayKey(now);
+  if ((await redisCommand(["GET", REDIS_NUDGE_DAY_KEY])) === todayKey) return;
+  await redisCommand(["SET", REDIS_NUDGE_DAY_KEY, todayKey]);
+
+  const [joinRaw, sentRaw, bannedRaw] = await Promise.all([
+    redisCommand(["HGETALL", REDIS_JOIN_TS_KEY]),
+    redisCommand(["HKEYS", REDIS_NUDGE_SENT_KEY]),
+    redisCommand(["HKEYS", REDIS_BLACKLIST_KEY]),
+  ]);
+  const joinMap = {};
+  if (Array.isArray(joinRaw)) for (let i = 0; i < joinRaw.length; i += 2) joinMap[String(joinRaw[i])] = Number(joinRaw[i + 1]) || 0;
+  const sent = new Set((Array.isArray(sentRaw) ? sentRaw : []).map(String));
+  const banned = new Set((Array.isArray(bannedRaw) ? bannedRaw : []).map(String));
+
+  let count = 0;
+  for (const uid of Object.keys(joinMap)) {
+    if (count >= NEW_USER_NUDGE_PER_RUN) break;
+    if (banned.has(uid) || sent.has(uid)) continue;
+    const endTs = joinMap[uid] + NEW_USER_PROMO_DAYS * 24 * 60 * 60 * 1000;
+    const sisaMs = endTs - now;
+    if (sisaMs <= 0 || sisaMs > 24 * 60 * 60 * 1000) continue;
+    if (!(await isPhoneVerified(uid))) continue;
+    if (!(await isNewBuyer(uid))) continue;
+
+    const r = await tgRequest(token, "sendMessage", {
+      chat_id: uid,
+      parse_mode: "HTML",
+      text:
+        `⏰ <b>Harga khusus kamu hampir habis!</b>\n\n` +
+        `Sisa kurang dari 24 jam sampai ${formatWibClock(endTs)}. ` +
+        `Set harga normal Rp10.000 masih bisa kamu dapat seharga Rp7.000 untuk pembelian pertama.`,
+      reply_markup: { inline_keyboard: [[{ text: "🛍️ Buka Katalog", callback_data: "menu_katalog" }]] },
+    });
+    if (r && r.ok) {
+      count++;
+      await redisCommand(["HSET", REDIS_NUDGE_SENT_KEY, uid, "1"]);
+    }
+  }
 }
 
 // Jalan sekali sehari, setelah jam 10 WIB
@@ -8338,10 +8567,10 @@ module.exports = async function handler(req, res) {
           inlineMarkup.inline_keyboard[0] = [{ text: "🎁 Ambil Gratis (VIP)", callback_data: `vipget_${item.id}` }];
         }
         const newUserSpecial = getNewUserPrice(parseNominal(item.harga));
-        if (newUserSpecial && (await isNewBuyer(callerId))) {
+        if (newUserSpecial && (await isNewBuyer(callerId)) && (await isNewUserPromoActive(callerId))) {
           if (await isPhoneVerified(callerId)) {
             inlineMarkup.inline_keyboard[0] = [
-              { text: `💳 Beli Set Ini (${formatRupiah(newUserSpecial)} • harga khusus)`, callback_data: `buy_${item.id}` },
+              { text: `💳 Beli Set Ini (${formatRupiah(newUserSpecial)} • harga khusus)`, callback_data: `buyconf_${item.id}` },
             ];
           } else {
             inlineMarkup.inline_keyboard.unshift([
@@ -8474,6 +8703,34 @@ module.exports = async function handler(req, res) {
             parse_mode: "HTML",
           });
         }
+      } else if (data.startsWith("buyconf_")) {
+        const confId = data.replace("buyconf_", "");
+        const katalogConf = await getKatalog();
+        const confItem = katalogConf.find((x) => String(x.id) === confId);
+        if (!confItem) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Set ini sudah tidak tersedia." });
+          return res.status(200).json({ ok: true });
+        }
+        const normal = parseNominal(confItem.harga);
+        const khusus = getNewUserPrice(normal) || normal;
+        const endTs = await getNewUserPromoEndTs(callerId);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `🎁 <b>Konfirmasi Harga Khusus</b>\n\n` +
+            `📦 <b>${escapeHtml(confItem.nama)}</b>\n` +
+            `💰 Normal <s>${formatRupiah(normal)}</s> ➜ <b>${formatRupiah(khusus)}</b>\n` +
+            `⚠️ Harga khusus hanya berlaku <b>sekali</b>, untuk pembelian pertama kamu.\n` +
+            `⏰ Berlaku sampai <b>${formatWibClock(endTs)}</b>.\n\nLanjut bayar?`,
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "✅ Ya, lanjut bayar", callback_data: `buy_${confId}` }],
+              [{ text: "❌ Batal", callback_data: "menu_katalog" }],
+            ],
+          },
+        });
+        return res.status(200).json({ ok: true });
       } else if (data.startsWith("buy_")) {
         const targetKey = data.replace("buy_", "");
         const target = await resolvePurchaseTarget(targetKey, callerId);
@@ -8845,17 +9102,35 @@ module.exports = async function handler(req, res) {
         if (rl === "limit") {
           await tgRequest(token, "sendMessage", {
             chat_id: chatId,
-            text: "⏳ Kamu terlalu sering mengirim pesan. Tunggu sebentar ya.",
+            text: "⏳ Kamu terlalu sering mengirim pesan. Kamu di-jeda " + formatDurasiBan() + ". Tunggu sebentar ya.",
           });
           return res.status(200).json({ ok: true });
         }
-        if (rl === "blocked") return res.status(200).json({ ok: true });
+        if (rl === "blocked") {
+          if (["/cekban", "⏳ Cek Jeda"].includes(String(msg.text || "").trim())) {
+            await sendCekJeda(token, chatId, senderId);
+          } else {
+            // Diabaikan saat di-jeda: beri tahu sekali saja per jeda, supaya tidak ikut memicu spam
+            const sisaBan = Number(await redisCommand(["TTL", REDIS_TEMPBAN_PREFIX + String(senderId)])) || 0;
+            if (sisaBan > 0) {
+              const baru = await redisCommand(["SET", REDIS_BANNOTICE_PREFIX + String(senderId), "1", "NX", "EX", String(sisaBan)]);
+              if (baru === "OK") {
+                await tgRequest(token, "sendMessage", {
+                  chat_id: chatId,
+                  text: "⏳ Kamu sedang di-jeda karena terlalu sering mengirim pesan. Pesanmu diabaikan sampai jeda selesai. Tekan ⏳ Cek Jeda untuk melihat sisa waktunya.",
+                });
+              }
+            }
+          }
+          return res.status(200).json({ ok: true });
+        }
       }
 
       let isNewUser = false;
       if (msg.chat && msg.chat.type === "private") {
         const addedRes = await redisCommand(["SADD", REDIS_USERS_KEY, String(chatId)]);
         isNewUser = Number(addedRes) === 1;
+        if (isNewUser) await redisCommand(["HSETNX", REDIS_JOIN_TS_KEY, String(chatId), String(Date.now())]);
       }
 
       // Hadiah mitra terbaik bulan lalu (sekali per bulan)
@@ -8870,6 +9145,20 @@ module.exports = async function handler(req, res) {
         await maybeWinBack(token);
       } catch (wbErr) {
         console.error("Win-back error:", wbErr);
+      }
+
+      // Pengingat pesanan harga khusus yang belum dibayar (dicek tiap 10 menit)
+      try {
+        await maybeCartReminder(token);
+      } catch (cartErr) {
+        console.error("Pengingat pesanan error:", cartErr);
+      }
+
+      // Pengingat harga khusus user baru (sekali sehari)
+      try {
+        await maybeNewUserNudge(token);
+      } catch (nudgeErr) {
+        console.error("Pengingat user baru error:", nudgeErr);
       }
 
       // Backup penuh otomatis (sekali sehari)
@@ -8895,6 +9184,92 @@ module.exports = async function handler(req, res) {
 
       const rawText = (msg.text || msg.caption || "").trim();
       const lowerText = rawText.toLowerCase();
+
+      // Catat setiap perintah admin, lalu tampilkan log bila diminta
+      if (isAdmin && rawText.startsWith("/")) {
+        try {
+          await logAdminAction(rawText);
+        } catch (logErr) {
+          console.error("Log admin error:", logErr && logErr.message);
+        }
+      }
+      if (isAdmin && rawText.startsWith("/promoadmin")) {
+        const joinRaw = await redisCommand(["HGETALL", REDIS_JOIN_TS_KEY]);
+        const now = Date.now();
+        const kandidat = [];
+        if (Array.isArray(joinRaw)) {
+          for (let i = 0; i < joinRaw.length; i += 2) {
+            const endTs = Number(joinRaw[i + 1]) + NEW_USER_PROMO_DAYS * 24 * 60 * 60 * 1000;
+            if (endTs > now) kandidat.push({ uid: String(joinRaw[i]), endTs });
+          }
+        }
+        kandidat.sort((a, b) => a.endTs - b.endTs);
+        const lines = [];
+        let total = 0;
+        for (const k of kandidat) {
+          if (!(await isNewBuyer(k.uid))) continue;
+          if (!(await isPhoneVerified(k.uid))) continue;
+          total++;
+          if (lines.length < 20) lines.push(`• <code>${k.uid}</code> — s/d ${formatWibClock(k.endTs)}`);
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `🎁 <b>Ringkasan Harga Khusus</b>\n` +
+            `User yang masih punya harga khusus: <b>${total}</b>\n\n` +
+            (lines.length ? lines.join("\n") : "Tidak ada.") +
+            (total > lines.length ? `\n…dan ${total - lines.length} lainnya` : ""),
+        });
+        return res.status(200).json({ ok: true });
+      }
+      if (isAdmin && rawText.startsWith("/fiturbot")) {
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            "🧭 <b>Fitur Penting Bot (Admin)</b>\n\n" +
+            "<b>🎁 Harga khusus user baru</b>\n" +
+            "• Berlaku 3 hari sejak masuk bot, sekali pakai, Rp7.000 untuk set Rp10.000\n" +
+            "• Konfirmasi sebelum bayar, pengingat pesanan belum dibayar (30 menit)\n" +
+            "• <code>/promo</code> (user) | <code>/promoadmin</code> (ringkasan admin)\n" +
+            "• <code>/umumkantombol</code> — kabari user soal menu baru\n\n" +
+            "<b>🛡️ Anti-spam</b>\n" +
+            "• Ban 1 menit untuk pelanggaran pertama, 5 menit untuk berulang\n" +
+            "• User bisa cek sisa jeda lewat ⏳ Cek Jeda\n" +
+            "• Admin dapat notifikasi setiap ada spam\n\n" +
+            "<b>📖 Sambutan</b>\n" +
+            "• Panduan singkat otomatis untuk user yang pertama kali /start\n\n" +
+            "<b>⚡ Promo & harga</b>\n" +
+            "• <code>/flashsale NO | HARGA | MENIT</code> | <code>/stopflashsale</code>\n" +
+            "• <code>/hargamassal</code> — edit harga banyak set\n\n" +
+            "<b>🧾 Admin lain</b>\n" +
+            "• <code>/logadmin</code> — 20 perintah admin terakhir\n" +
+            "• <code>/omset</code> | <code>/error</code> | <code>/broadcast</code>\n" +
+            "• <code>/addsaldo ID NOMINAL</code> | <code>/ceksaldo ID</code>\n" +
+            "• <code>/listwd</code> | <code>/listbot</code> | <code>/backup</code> | <code>/restore</code>",
+        });
+        return res.status(200).json({ ok: true });
+      }
+      if (isAdmin && rawText.startsWith("/logadmin")) {
+        const rawLog = await redisCommand(["LRANGE", REDIS_ADMINLOG_KEY, "0", "19"]);
+        const lines = (Array.isArray(rawLog) ? rawLog : [])
+          .map((e) => {
+            try {
+              const o = JSON.parse(e);
+              return `• ${escapeHtml(o.t)} — ${escapeHtml(o.msg)}`;
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: lines.length ? "🧾 <b>Log Admin (20 terakhir)</b>\n" + lines.join("\n") : "Log admin masih kosong.",
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
 
       // VERIFIKASI NOMOR: member membagikan kontak miliknya
       if (msg.contact) {
@@ -10977,6 +11352,33 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 10A1. ADMIN: /umumkantombol — kabari semua user soal menu baru (manual, sekali)
+      if (rawText.startsWith("/umumkantombol")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const allUserIds = (await redisCommand(["SMEMBERS", REDIS_USERS_KEY])) || [];
+        const bannedIds = new Set(((await redisCommand(["HKEYS", REDIS_BLACKLIST_KEY])) || []).map(String));
+        const userIds = allUserIds.filter((uid) => !bannedIds.has(String(uid)));
+        const announceText =
+          "📢 <b>Menu baru sudah tersedia!</b>\n\n" +
+          "Ketik /start untuk memuat ulang menu di bawah, lalu pakai tombol <b>🎁 Promo Saya</b> untuk cek sisa waktu harga khusus.";
+        let sentCount = 0;
+        for (let i = 0; i < userIds.length; i += 20) {
+          const batch = userIds.slice(i, i + 20);
+          const results = await Promise.all(
+            batch.map((uid) => tgRequest(token, "sendMessage", { chat_id: uid, text: announceText, parse_mode: "HTML" }))
+          );
+          results.forEach((r) => {
+            if (r && r.ok) sentCount++;
+          });
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ Pengumuman terkirim ke <b>${sentCount}</b> dari <b>${userIds.length}</b> user.`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 10A2. ADMIN: /flashsale — mulai promo kilat (default 1 jam) untuk satu set
       if (rawText.startsWith("/flashsale")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -11353,7 +11755,8 @@ module.exports = async function handler(req, res) {
               "• <code>/flashsale NO | HARGA | MENIT</code> | <code>/stopflashsale</code> — promo kilat + auto broadcast\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
-              "• <code>/error</code> — lihat error terakhir | <code>/error clear</code>\n" +
+              "• <code>/fiturbot</code> — daftar fitur penting bot\n" +
+            "• <code>/error</code> — lihat error terakhir | <code>/error clear</code>\n" +
               "• <code>/omset</code> — omset hari ini, kemarin, dan total | <code>/setomset</code> — tujuan notif omset\n" +
               "• <code>/hargamassal semua|mini|full|harga|creator ... HARGA/%</code> — edit harga banyak set\n" +
               "• <code>/listbot</code> | <code>/matikanbot ID</code> | <code>/aktifkanbot ID</code>\n" +
@@ -11370,6 +11773,13 @@ module.exports = async function handler(req, res) {
             parse_mode: "HTML",
             reply_markup: getCompactReplyKeyboard(),
           });
+
+          try {
+            const firstWelcome = Number(await redisCommand(["HSETNX", REDIS_WELCOMED_KEY, String(senderId), "1"])) === 1;
+            if (firstWelcome) await sendWelcomeGuide(token, chatId, senderId);
+          } catch (welcomeErr) {
+            console.error("Panduan sambutan error:", welcomeErr);
+          }
 
           await sendMainMenuCard(token, chatId);
         } else if (text === "💰 Saldo & Depo" || text === "💰 Saldo & Deposit") {
@@ -11401,6 +11811,10 @@ module.exports = async function handler(req, res) {
           await sendMoreMenu(token, chatId);
         } else if (text === "💎 Info & Channel") {
           await sendChannelLainnya(token, chatId);
+        } else if (text === "⏳ Cek Jeda" || text === "/cekban") {
+          await sendCekJeda(token, chatId, senderId);
+        } else if (text === "/promo" || text === "🎁 Promo Saya") {
+          await sendPromoStatus(token, chatId, senderId);
         } else if (text === "/undang" || text === "/referral") {
           await sendReferralMenu(token, chatId, senderId);
         } else if (text === "🤝 Reseller" || text === "/reseller") {
