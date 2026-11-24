@@ -111,16 +111,25 @@ const UPSELL_WINDOW_MINUTES = 10; // lama penawaran berlaku
 const FLASHSALE_DEFAULT_MINUTES = 60; // durasi default 1 jam kalau admin tidak menentukan durasi
 const REDIS_FLASHSALE_KEY = "lumine_main_flashsale"; // JSON: { item_id, item_nama, original_harga, original_nominal, flash_price, start_ts, end_ts }
 
-// ---- PRE ORDER (pembeli bayar dulu, file dikirim otomatis saat admin /rilispo) ----
-// Flag per set ada di katalog: item.preorder = true, item.po_eta = teks perkiraan rilis (opsional)
-// Order PO per set disimpan di hash: REDIS_PO_PREFIX + itemId -> { orderId: buyerId }
-const REDIS_PO_PREFIX = "lumine_main_po_";
-
 // ---- HADIAH LEADERBOARD BULANAN (saldo otomatis untuk Top 3 pembeli bulan lalu) ----
 const LB_REWARD_ENABLED = true; // false = matikan hadiah
 const LB_REWARD_SALDO = [10000, 5000, 3000]; // hadiah saldo untuk peringkat 1, 2, 3
 const LB_REWARD_MIN_OMSET = 20000; // minimal total belanja bulan itu agar berhak dapat hadiah
 const REDIS_LB_REWARD_LOCK_PREFIX = "lumine_main_lb_reward_";
+
+// ---- MINI GAME: TAP CHALLENGE (1x gratis per hari WIB, papan skor mingguan + hadiah saldo juara) ----
+const TAP_ENABLED = true; // false = matikan game
+const TAP_DURASI_DETIK = 10; // lama satu sesi
+const TAP_MAX_PER_DETIK = 15; // klik di atas ini per detik dari satu user diabaikan (anti bot)
+const TAP_HADIAH = [10000, 5000, 3000]; // hadiah saldo juara 1, 2, 3 minggu lalu
+const TAP_SESI_JEDA_DETIK = 60; // data sesi disimpan sedikit lebih lama dari durasi supaya skor akhir masih bisa ditampilkan
+const REDIS_TAP_START_PREFIX = "lumine_main_tap_start_"; // key per user: "waktuMulaiMs:weekKey"
+const REDIS_TAP_CNT_PREFIX = "lumine_main_tap_cnt_"; // key per user: hitungan tap sesi (INCR di server)
+const REDIS_TAP_DAY_PREFIX = "lumine_main_tap_day_"; // hash per hari (WIB): id user -> 1 (jatah main hari ini sudah dipakai)
+const REDIS_TAP_RL_PREFIX = "lumine_main_tap_rl_"; // key per user per detik: batas kecepatan klik
+const REDIS_TAP_WEEK_PREFIX = "lumine_main_tap_week_"; // sorted set per minggu (WIB): id user -> skor terbaik
+const REDIS_TAP_NAMES_KEY = "lumine_main_tap_names"; // hash: id user -> nama tampil di papan skor
+const REDIS_TAP_REWARD_LOCK_PREFIX = "lumine_main_tap_reward_"; // lock hadiah per minggu (anti dobel)
 
 // ---- BOT RESELLER (WHITE-LABEL) ----
 // Harga jual reseller di bot mereka: MINIMAL = harga retail toko utama (tidak boleh lebih murah dari kamu),
@@ -1459,6 +1468,310 @@ async function maybeAwardLastMonth(token) {
   await awardMonthlyLeaderboard(token, monthKey);
 }
 
+// ==========================================
+// MINI GAME: TAP CHALLENGE
+// ==========================================
+function getPrevWeekKey() {
+  const { weekKey } = getWibPeriods();
+  const d = new Date(Date.parse(`${weekKey}T00:00:00Z`) - 7 * 86400 * 1000);
+  return d.toISOString().slice(0, 10);
+}
+
+function buildTapHadiahLine() {
+  const medals = ["🥇", "🥈", "🥉"];
+  return TAP_HADIAH.map((v, i) => `${medals[i]} ${formatRupiah(v)}`).join(" • ");
+}
+
+// Posisi user di papan skor minggu tertentu. null = belum punya skor.
+async function getTapStanding(weekKey, userId) {
+  const zkey = REDIS_TAP_WEEK_PREFIX + weekKey;
+  const [rank, score] = await Promise.all([
+    redisCommand(["ZREVRANK", zkey, String(userId)]),
+    redisCommand(["ZSCORE", zkey, String(userId)]),
+  ]);
+  if (rank === null || rank === undefined || score === null || score === undefined) return null;
+  return { rank: Number(rank) + 1, best: Math.floor(parseFloat(score)) };
+}
+
+// Sesi user: { startMs, weekKey, running } atau null kalau tidak ada / sudah dibersihkan Redis.
+async function getTapSession(userId) {
+  const raw = await redisCommand(["GET", REDIS_TAP_START_PREFIX + String(userId)]);
+  if (!raw) return null;
+  const [ms, weekKey] = String(raw).split(":");
+  const startMs = parseInt(ms, 10);
+  if (!startMs || !weekKey) return null;
+  return { startMs, weekKey, running: Date.now() <= startMs + TAP_DURASI_DETIK * 1000 };
+}
+
+function buildTapResultText(count, standing) {
+  let teks = `🏁 <b>Waktu habis!</b>\nSkor kamu: <b>${count} tap</b>.`;
+  if (standing) {
+    teks += ` Peringkatmu minggu ini: <b>#${standing.rank}</b>.`;
+    if (standing.best > count) teks += `\n<i>Skor terbaikmu minggu ini: ${standing.best} tap.</i>`;
+  } else {
+    teks += " Kamu belum masuk papan skor minggu ini.";
+  }
+  return teks;
+}
+
+async function sendTapMenu(token, chatId, userId) {
+  if (!TAP_ENABLED) {
+    return tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Tap Challenge sedang tidak aktif." });
+  }
+  const { dayKey, weekKey } = getWibPeriods();
+  const played = Number(await redisCommand(["HEXISTS", REDIS_TAP_DAY_PREFIX + dayKey, String(userId)])) === 1;
+  const standing = await getTapStanding(weekKey, userId);
+
+  let teks =
+    "👆 <b>TAP CHALLENGE</b>\n" +
+    `Tekan tombol <b>👆 Tap!</b> sebanyak mungkin dalam <b>${TAP_DURASI_DETIK} detik</b>.\n\n` +
+    "🎟️ 1x main gratis per hari (reset 00:00 WIB)\n" +
+    `🎁 <b>Hadiah juara mingguan (saldo):</b> ${buildTapHadiahLine()}\n` +
+    "<i>Dibagikan Senin 00:00 WIB berdasarkan skor terbaik minggu itu.</i>\n\n";
+  if (standing) teks += `📍 Skor terbaikmu minggu ini: <b>${standing.best} tap</b> (#${standing.rank})\n`;
+  teks += played ? "✅ Jatah mainmu hari ini sudah dipakai. Balik lagi besok ya!" : "Siap? Tekan Mulai!";
+
+  const rows = [];
+  if (!played) rows.push([{ text: "▶️ Mulai", callback_data: "tap_mulai" }]);
+  rows.push([{ text: "🏆 Papan Skor Minggu Ini", callback_data: "tap_skor" }]);
+  return tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: teks,
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+async function sendTapSkor(token, chatId, userId) {
+  const { weekKey } = getWibPeriods();
+  const raw = await redisCommand(["ZREVRANGE", REDIS_TAP_WEEK_PREFIX + weekKey, "0", "9", "WITHSCORES"]);
+  const ids = [];
+  const skors = [];
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      ids.push(raw[i]);
+      skors.push(Math.floor(parseFloat(raw[i + 1])) || 0);
+    }
+  }
+  const names = ids.length ? (await redisCommand(["HMGET", REDIS_TAP_NAMES_KEY, ...ids])) || [] : [];
+  const medals = ["🥇", "🥈", "🥉"];
+  const lines = ids.map((id, i) => {
+    const badge = i < 3 ? medals[i] : `<b>${i + 1}.</b>`;
+    const nama = (Array.isArray(names) && names[i]) || "Member Lumine";
+    return `${badge} <b>${escapeHtml(nama)}</b> — ${skors[i]} tap`;
+  });
+  const standing = await getTapStanding(weekKey, userId);
+  const posisi = standing
+    ? `📍 Posisimu: <b>#${standing.rank}</b> (${standing.best} tap)`
+    : "📍 Kamu belum punya skor minggu ini.";
+  return tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text:
+      "🏆 <b>PAPAN SKOR TAP CHALLENGE — MINGGU INI</b>\n" +
+      `🎁 Hadiah juara: ${buildTapHadiahLine()}\n\n` +
+      (lines.length ? lines.join("\n") : "<i>Belum ada skor minggu ini. Jadilah yang pertama!</i>") +
+      "\n\n" +
+      posisi,
+    parse_mode: "HTML",
+  });
+}
+
+// Semua tombol "tap_*" lewat sini. SENGAJA tidak memakai checkRateLimit global:
+// batasnya 12 aksi / 10 detik lalu ban, jadi pemain normal yang tap cepat malah kena ban.
+// Di sini batasnya sendiri: maks TAP_MAX_PER_DETIK klik per detik, klik berlebih diabaikan tanpa ban.
+async function handleTapCallback(token, call, isCallerAdmin) {
+  const uid = String(call.from.id);
+  const chatId = call.message.chat.id;
+  const messageId = call.message.message_id;
+  const data = call.data;
+  const answer = (text, alert) =>
+    tgRequest(token, "answerCallbackQuery", {
+      callback_query_id: call.id,
+      ...(text ? { text } : {}),
+      ...(alert ? { show_alert: true } : {}),
+    }).catch(() => {});
+
+  try {
+    if (!isCallerAdmin && (await isBanned(call.from.id))) return;
+    if (!TAP_ENABLED) return answer("⚠️ Tap Challenge sedang tidak aktif.", true);
+
+    if (data === "tap_skor") {
+      await answer();
+      return sendTapSkor(token, chatId, uid);
+    }
+
+    // ---- MULAI ----
+    if (data === "tap_mulai") {
+      const sesi = await getTapSession(uid);
+      if (sesi && sesi.running) return answer("⏳ Sesimu sedang berjalan. Tekan 👆 Tap!", true);
+
+      const { dayKey, weekKey } = getWibPeriods();
+      const dayHash = REDIS_TAP_DAY_PREFIX + dayKey;
+      // Jatah 1x per hari: HSETNX anti klik ganda
+      const claimed = await redisCommand(["HSETNX", dayHash, uid, "1"]);
+      if (Number(claimed) !== 1) {
+        return answer("✅ Kamu sudah main hari ini. Balik lagi besok ya!", true);
+      }
+      await redisCommand(["EXPIRE", dayHash, String(60 * 60 * 24 * 3)]);
+
+      const ttl = String(TAP_DURASI_DETIK + TAP_SESI_JEDA_DETIK);
+      try {
+        const nama = call.from.username
+          ? maskUsername(call.from.username)
+          : String(call.from.first_name || "Member Lumine").slice(0, 12);
+        await redisCommand(["SET", REDIS_TAP_CNT_PREFIX + uid, "0", "EX", ttl]);
+        await redisCommand(["SET", REDIS_TAP_START_PREFIX + uid, `${Date.now()}:${weekKey}`, "EX", ttl]);
+        await redisCommand(["HSET", REDIS_TAP_NAMES_KEY, uid, nama]);
+      } catch (e) {
+        await redisCommand(["HDEL", dayHash, uid]); // gagal mulai: kembalikan jatah
+        throw e;
+      }
+
+      await answer("🚀 Mulai! Tap sekarang!");
+      const payload = {
+        text:
+          `👆 <b>TAP SEKARANG!</b> Waktumu ${TAP_DURASI_DETIK} detik.\n` +
+          "<i>Setelah waktu habis, tekan tombol sekali lagi untuk melihat skor akhirmu.</i>",
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "👆 Tap!", callback_data: "tap_klik" }]] },
+      };
+      const edited = await tgRequest(token, "editMessageText", { chat_id: chatId, message_id: messageId, ...payload });
+      if (!edited || !edited.ok) await tgRequest(token, "sendMessage", { chat_id: chatId, ...payload });
+      return;
+    }
+
+    // ---- KLIK TAP ----
+    if (data === "tap_klik") {
+      const now = Date.now();
+
+      // Batas kecepatan per user per detik (klik berlebih tidak dihitung)
+      const rlKey = `${REDIS_TAP_RL_PREFIX}${uid}_${Math.floor(now / 1000)}`;
+      const rl = parseInt(await redisCommand(["INCR", rlKey]), 10) || 0;
+      if (rl === 1) await redisCommand(["EXPIRE", rlKey, "3"]);
+      if (rl > TAP_MAX_PER_DETIK) return answer();
+
+      const sesi = await getTapSession(uid);
+      if (!sesi) {
+        await answer("⌛ Sesi sudah selesai. Buka 👆 Tap Challenge untuk melihat papan skor.", true);
+        await tgRequest(token, "editMessageReplyMarkup", {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: { inline_keyboard: [] },
+        }).catch(() => {});
+        return;
+      }
+
+      // Waktu habis: tolak klik, tampilkan skor akhir
+      if (now > sesi.startMs + TAP_DURASI_DETIK * 1000) {
+        const count = parseInt(await redisCommand(["GET", REDIS_TAP_CNT_PREFIX + uid]), 10) || 0;
+        const standing = await getTapStanding(sesi.weekKey, uid);
+        await answer("⌛ Waktu habis!");
+        await tgRequest(token, "editMessageText", {
+          chat_id: chatId,
+          message_id: messageId,
+          text: buildTapResultText(count, standing),
+          parse_mode: "HTML",
+          reply_markup: { inline_keyboard: [[{ text: "🏆 Papan Skor", callback_data: "tap_skor" }]] },
+        }).catch(() => {});
+        return;
+      }
+
+      // Hitung di server. Skor di sorted set = tap + pecahan kecil (tie-break: yang lebih dulu mencapai skor itu menang).
+      // ZADD GT: hanya naik, jadi skor terbaik minggu itu yang tersimpan.
+      const n = parseInt(await redisCommand(["INCR", REDIS_TAP_CNT_PREFIX + uid]), 10) || 0;
+      const weekStartMs = Date.parse(`${sesi.weekKey}T00:00:00+07:00`);
+      const skor = n + (1 - (now - weekStartMs) / 1e9);
+      const zkey = REDIS_TAP_WEEK_PREFIX + sesi.weekKey;
+      await Promise.all([
+        redisCommand(["ZADD", zkey, "GT", String(skor), uid]),
+        redisCommand(["EXPIRE", zkey, "1209600"]),
+      ]);
+      return answer(`👆 ${n}`);
+    }
+
+    return answer();
+  } catch (e) {
+    console.error("Tap Challenge error:", e);
+    await answer("⚠️ Terjadi gangguan, coba lagi.");
+  }
+}
+
+// ---- HADIAH JUARA TAP CHALLENGE MINGGUAN ----
+// Aman dipanggil berkali-kali: hanya jalan sekali per minggu (lock).
+async function awardTapWeek(token, weekKey) {
+  if (!TAP_ENABLED) return { ok: false, reason: "disabled" };
+  const lockKey = `${REDIS_TAP_REWARD_LOCK_PREFIX}${weekKey}`;
+  const lock = await redisCommand(["SET", lockKey, "1", "NX", "EX", "5184000"]);
+  if (lock !== "OK") return { ok: false, reason: "already" };
+
+  const raw = await redisCommand([
+    "ZREVRANGE",
+    REDIS_TAP_WEEK_PREFIX + weekKey,
+    "0",
+    String(TAP_HADIAH.length - 1),
+    "WITHSCORES",
+  ]);
+  const winners = [];
+  if (Array.isArray(raw)) {
+    for (let i = 0; i < raw.length; i += 2) {
+      winners.push({ userId: raw[i], skor: Math.floor(parseFloat(raw[i + 1])) || 0 });
+    }
+  }
+  const names = winners.length
+    ? (await redisCommand(["HMGET", REDIS_TAP_NAMES_KEY, ...winners.map((w) => w.userId)])) || []
+    : [];
+
+  const medals = ["🥇", "🥈", "🥉"];
+  const awarded = [];
+  for (let i = 0; i < winners.length; i++) {
+    const w = winners[i];
+    if (w.skor < 1) continue;
+    const hadiah = TAP_HADIAH[i];
+    try {
+      const saldoBaru = await addUserSaldo(w.userId, hadiah);
+      awarded.push({ rank: i + 1, userId: w.userId, nama: names[i] || "Member Lumine", skor: w.skor, hadiah });
+      await logAdminAction(
+        `🎮 Hadiah Tap Challenge minggu ${weekKey}: #${i + 1} ${w.userId} skor ${w.skor} +${formatRupiah(hadiah)}`
+      ).catch(() => {});
+      await tgRequest(token, "sendMessage", {
+        chat_id: w.userId,
+        text:
+          `🏆 <b>SELAMAT! KAMU JUARA #${i + 1} TAP CHALLENGE</b> ${medals[i]}\n` +
+          `Minggu ${weekKey} • skor terbaik <b>${w.skor} tap</b>\n\n` +
+          `🎁 <b>Hadiah:</b> +<code>${formatRupiah(hadiah)}</code> saldo\n` +
+          `💳 <b>Saldo Kamu Sekarang:</b> <code>${formatRupiah(saldoBaru)}</code>`,
+        parse_mode: "HTML",
+      }).catch(() => {});
+    } catch (e) {
+      console.error(`Hadiah Tap Challenge gagal (minggu ${weekKey}, user ${w.userId}, hadiah ${hadiah}):`, e);
+    }
+  }
+
+  if (awarded.length > 0) {
+    const lines = awarded
+      .map((a) => `${medals[a.rank - 1]} <b>${escapeHtml(a.nama)}</b> (<code>${a.userId}</code>) — ${a.skor} tap ➜ +${formatRupiah(a.hadiah)}`)
+      .join("\n");
+    const qris = await getQris();
+    if (qris && qris.admin_chat_id) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: qris.admin_chat_id,
+        text: `🎮 <b>HADIAH TAP CHALLENGE ${weekKey} DIBAGIKAN</b>\n\n${lines}`,
+        parse_mode: "HTML",
+      }).catch(() => {});
+    }
+  }
+  return { ok: true, awarded };
+}
+
+// Dipanggil tiap ada pesan masuk: cek murah (1 GET), baru jalan kalau minggu lalu belum dibagikan.
+async function maybeAwardTapLastWeek(token) {
+  if (!TAP_ENABLED) return;
+  const weekKey = getPrevWeekKey();
+  const done = await redisCommand(["GET", `${REDIS_TAP_REWARD_LOCK_PREFIX}${weekKey}`]);
+  if (done) return;
+  await awardTapWeek(token, weekKey);
+}
+
 // ---- UPSELL: PENAWARAN SET BERIKUTNYA SETELAH ACC ----
 function formatWibClock(ms) {
   const d = new Date(ms + 7 * 3600 * 1000);
@@ -1884,130 +2197,6 @@ async function processResellerPremOrder(token, order) {
   return { deliveredName: `Reseller Prem (bonus saldo ${formatRupiah(bonusGiven)})`, deliveredLink: "" };
 }
 
-// ==========================================
-// 4C. PRE ORDER: bayar dulu, file dikirim otomatis saat admin /rilispo
-// ==========================================
-async function processPreorderPaid(token, order) {
-  order.status = "preorder";
-  order.po_paid_ms = Date.now();
-  await saveOrder(order.id, order);
-
-  const itemId = String(order.item_id || "");
-  await redisCommand(["HSET", REDIS_PO_PREFIX + itemId, String(order.id), String(order.buyer_id)]);
-
-  const katalogList = await getKatalog();
-  const idx = katalogList.findIndex((k) => String(k.id) === itemId);
-  const item = idx !== -1 ? katalogList[idx] : null;
-
-  // Omset, leaderboard & hitungan terjual dihitung saat pembayaran lunas
-  await recordPurchaseToLeaderboard(order);
-  await addStoreOmset(order.total_nominal);
-  if (await isReseller(order.buyer_id)) {
-    await addResellerOmset(order.buyer_id, order.total_nominal);
-  }
-  if (item) {
-    item.sold = (Number(item.sold) || 0) + 1;
-    await saveKatalog(katalogList);
-  }
-
-  const etaLine = item && item.po_eta ? `📅 Perkiraan rilis: <b>${escapeHtml(item.po_eta)}</b>\n` : "";
-  await tgRequest(token, "sendMessage", {
-    chat_id: order.buyer_id,
-    parse_mode: "HTML",
-    text:
-      `🕒 <b>PRE ORDER DITERIMA! (Pesanan #${order.id})</b>\n\n` +
-      `📦 <b>${escapeHtml(order.item_nama)}</b>\n` +
-      `Pembayaranmu sudah kami terima. Set ini belum rilis, jadi file akan otomatis dikirim ke chat ini begitu sudah siap.\n` +
-      etaLine +
-      `\n<i>Kamu tidak perlu order ulang. Harga sudah terkunci.</i>`,
-    reply_markup: { inline_keyboard: [[{ text: "🎒 Koleksi Saya", callback_data: "menu_koleksi" }]] },
-  });
-
-  try {
-    const qris = await getQris();
-    const adminChat = qris && qris.admin_chat_id;
-    if (adminChat) {
-      await tgRequest(token, "sendMessage", {
-        chat_id: adminChat,
-        text:
-          `🕒 PO baru #${order.id}\n👤 ${order.buyer_name}\n📦 ${order.item_nama}\n\n` +
-          `Saat set siap, kirim file ke semua pembeli PO dengan: /rilispo ${idx !== -1 ? idx + 1 : "NO"}`,
-      });
-    }
-  } catch (poNotifErr) {
-    console.error("Notif PO admin error:", poNotifErr);
-  }
-
-  return { deliveredName: order.item_nama, deliveredLink: "", preorder: true };
-}
-
-async function releasePreorders(token, katalogList, idx) {
-  const item = katalogList[idx];
-  const itemId = String(item.id);
-  // Pakai link & file TERBARU dari katalog (admin biasanya mengisinya setelah pesanan masuk)
-  const links =
-    Array.isArray(item.links) && item.links.length > 0
-      ? item.links.map(normalizeUrl)
-      : item.link
-      ? [normalizeUrl(item.link)]
-      : [];
-  const files = Array.isArray(item.files) ? item.files : [];
-
-  const flat = (await redisCommand(["HGETALL", REDIS_PO_PREFIX + itemId])) || [];
-  let sent = 0;
-  let failed = 0;
-  for (let i = 0; i < flat.length; i += 2) {
-    const orderId = String(flat[i]);
-    const order = await getOrder(orderId);
-    if (!order || order.status !== "preorder") {
-      await redisCommand(["HDEL", REDIS_PO_PREFIX + itemId, orderId]);
-      continue;
-    }
-    try {
-      const linksBlock =
-        links.length > 0
-          ? links.map((l) => `🔗 ${escapeHtml(l)}`).join("\n")
-          : "<i>(File dikirim langsung di pesan berikutnya)</i>";
-      await tgRequest(token, "sendMessage", {
-        chat_id: order.buyer_id,
-        parse_mode: "HTML",
-        text:
-          `🎉 <b>PRE ORDER SUDAH RILIS! (Pesanan #${order.id})</b>\n\n` +
-          `Set <b>${escapeHtml(item.nama)}</b> yang kamu pesan sudah siap.\n` +
-          `Berikut akses file kamu:\n${linksBlock}\n\n` +
-          `<i>Link tersimpan otomatis di 🎒 Koleksi Saya.</i>`,
-        reply_markup: {
-          inline_keyboard: [
-            ...links.slice(0, 8).map((link, n) => [
-              { text: links.length > 1 ? `📂 Buka File ${n + 1}` : "📂 Buka Link File Sekarang", url: link },
-            ]),
-            [{ text: "⭐ Beri Rating & Ulasan", callback_data: `rate_init_${order.id}` }],
-          ],
-        },
-      });
-      for (const f of files) {
-        if (!f || !f.file_id) continue;
-        if (f.type === "document") {
-          await tgRequest(token, "sendDocument", { chat_id: order.buyer_id, document: f.file_id });
-        } else {
-          await tgRequest(token, "sendPhoto", { chat_id: order.buyer_id, photo: f.file_id });
-        }
-      }
-      await addKoleksi(order.buyer_id, item.nama, links[0] || "");
-      order.status = "acc";
-      order.po_released_ms = Date.now();
-      order.target_links = links;
-      await saveOrder(order.id, order);
-      await redisCommand(["HDEL", REDIS_PO_PREFIX + itemId, orderId]);
-      sent++;
-    } catch (releaseErr) {
-      failed++;
-      console.error(`Rilis PO #${orderId} gagal:`, releaseErr);
-    }
-  }
-  return { sent, failed };
-}
-
 async function processAccOrderCore(token, order) {
   order.status = "acc";
   await saveOrder(order.id, order);
@@ -2060,11 +2249,6 @@ async function processAccOrderCore(token, order) {
       vouchers[order.voucher_code] = v;
       await saveVouchers(vouchers);
     }
-  }
-
-  // KHUSUS ORDER PRE ORDER: pembayaran diterima sekarang, file dikirim saat admin pakai /rilispo
-  if (order.is_preorder) {
-    return await processPreorderPaid(token, order);
   }
 
   const katalogList = await getKatalog();
@@ -2272,6 +2456,7 @@ function getCompactReplyKeyboard() {
       [{ text: "🎒 Koleksi Saya" }, { text: "🎲 Mystery Box" }],
       [{ text: "☰ Lainnya" }, { text: "📖 Panduan" }],
       [{ text: "🎁 Promo Saya" }, { text: "⏳ Cek Jeda" }],
+      [{ text: "👆 Tap Challenge" }],
     ],
     resize_keyboard: true,
   };
@@ -4192,10 +4377,6 @@ function buildLumineItemRows(slice, rankMap, defaultIcon) {
     } else if (sold > 0) {
       suffix = ` (${sold}x)`;
     }
-    if (item.preorder) {
-      prefix = "🕒";
-      suffix = " • PRE ORDER";
-    }
     return [
       {
         text: `${prefix} ${item.nama} — ${item.harga}${suffix}`,
@@ -4695,7 +4876,7 @@ async function sendMoreMenu(token, chatId) {
   return {
     ok: true,
     itemId: String(item.id),
-    itemNama: item.preorder ? `${item.nama} (PRE ORDER)` : item.nama,
+    itemNama: item.nama,
     tierLabel,
     baseNominal,
     targetLink: itemLinks[0] || "",
@@ -4703,7 +4884,6 @@ async function sendMoreMenu(token, chatId) {
     targetFiles: itemFiles,
     isMystery: false,
     isFlashSale: Boolean(flashActive),
-    extra: item.preorder ? { is_preorder: true } : {},
   };
 }
 
@@ -8235,197 +8415,6 @@ async function getMacroLogChatId() {
   return raw ? String(raw) : null;
 }
 
-// ==========================================
-// AUTO-POST SET BARU KE CHANNEL (pakai link bot, BUKAN link file asli -> anti bocor)
-// ==========================================
-const REDIS_POST_CHANNEL_KEY = "lumine_main_post_channel"; // chat_id (-100...) atau @username channel tujuan auto-post set baru
-
-async function getPostChannel() {
-  const raw = await redisCommand(["GET", REDIS_POST_CHANNEL_KEY]);
-  return raw ? String(raw) : "";
-}
-
-async function setPostChannel(val) {
-  await redisCommand(["SET", REDIS_POST_CHANNEL_KEY, String(val)]);
-}
-
-// Dipanggil setiap ada set baru tersimpan lewat /tambah. Postingan ke channel HANYA berisi
-// preview + tombol yang mengarah ke bot (deep-link /start buy_ID), bukan link Drive/file aslinya.
-async function postNewSetToChannel(token, item) {
-  try {
-    const targetChannel = await getPostChannel();
-    if (!targetChannel) return; // belum diset admin lewat /setpostchannel
-
-    const botUname = await getBotUsername(token);
-    if (!botUname) return;
-
-    const deepLink = `https://t.me/${botUname}?start=buy_${item.id}`;
-    const katIcon = item.kategori === "full" ? "📦" : "🧩";
-    const caption =
-      `🆕 <b>SET BARU RILIS!</b>\n\n` +
-      `${katIcon} <b>${escapeHtml(item.nama)}</b>\n` +
-      (item.creator ? `👤 Creator: ${escapeHtml(item.creator)}\n` : "") +
-      `📂 Isi: ${escapeHtml(item.isi)}\n` +
-      `💰 Harga: <b>${escapeHtml(item.harga)}</b>\n\n` +
-      `Klik tombol di bawah buat lihat & beli langsung lewat bot 👇`;
-
-    const replyMarkup = { inline_keyboard: [[{ text: "🛒 Lihat & Beli", url: deepLink }]] };
-
-    if (item.photo_id) {
-      await tgRequest(token, "sendPhoto", {
-        chat_id: targetChannel,
-        photo: item.photo_id,
-        caption,
-        parse_mode: "HTML",
-        reply_markup: replyMarkup,
-      });
-    } else {
-      await tgRequest(token, "sendMessage", {
-        chat_id: targetChannel,
-        text: caption,
-        parse_mode: "HTML",
-        reply_markup: replyMarkup,
-      });
-    }
-  } catch (e) {
-    console.error("Auto-post set ke channel gagal:", e && e.message);
-  }
-}
-
-// Tampilkan detail 1 set. Dipakai oleh callback "detail_ID" (tombol di dalam bot) DAN oleh
-// deep-link /start buy_ID (dari tombol channel), supaya tampilannya konsisten di kedua jalur.
-async function sendItemDetailView(token, chatId, callerId, itemId) {
-  const katalogList = await getKatalog();
-  const item = katalogList.find((k) => String(k.id) === String(itemId));
-
-  if (!item) {
-    await tgRequest(token, "sendMessage", {
-      chat_id: chatId,
-      text: "⚠️ Maaf, set ini sudah dihapus atau diperbarui oleh admin.",
-    });
-    return;
-  }
-
-  const rankMap = getRankedKatalog(katalogList);
-  const rank = rankMap[String(item.id)];
-  const sold = Number(item.sold) || 0;
-  let popularityLine = "";
-  if (rank === 1) {
-    popularityLine = `│ • <b>Status :</b> 🔥 <b>#1 BESTSELLER</b> (${sold}x terjual)\n`;
-  } else if (rank === 2 || rank === 3) {
-    popularityLine = `│ • <b>Status :</b> ⭐ <b>#${rank} POPULER</b> (${sold}x terjual)\n`;
-  } else if (sold > 0) {
-    popularityLine = `│ • <b>Terjual :</b> ${sold}x pembelian\n`;
-  }
-
-  const [activeV, saldo] = await Promise.all([
-    getActiveUserVoucher(callerId),
-    getUserSaldo(callerId),
-  ]);
-  const voucherNote = activeV
-    ? `\n🎟️ <i>Voucher aktif: <b>${escapeHtml(activeV.code)}</b> (-${formatRupiah(activeV.discount)})</i>`
-    : "";
-
-  const itemRatingBlock = buildRatingBlock(await getItemRating(item.id));
-  const flashSaleNow = await getFlashSale();
-  const itemFlashActive = Boolean(flashSaleNow && String(flashSaleNow.item_id) === String(item.id));
-  const flashLine = itemFlashActive
-    ? `│ • ⚡ <b>FLASH SALE :</b> <s>${escapeHtml(item.harga)}</s> ➜ <code>${formatRupiah(flashSaleNow.flash_price)}</code>\n` +
-      `│ • ⏱️ <b>Berakhir :</b> ${getFlashSaleRemainingText(flashSaleNow)} (${formatWibClock(flashSaleNow.end_ts)})\n`
-    : "";
-  const captionText =
-    (itemFlashActive ? `⚡⚡⚡ <b>FLASH SALE AKTIF!</b> ⚡⚡⚡\n\n` : "") +
-    `✨ <b>${escapeHtml(item.nama)}</b>\n\n` +
-    itemRatingBlock +
-    (item.preorder ? "🕒 <b>PRE ORDER</b>" + (item.po_eta ? " • rilis: " + escapeHtml(item.po_eta) : "") + "\n\n" : "") +
-    `╭─── 📦 <b>DETAIL PAKET</b> ───\n` +
-    popularityLine +
-    (item.creator ? `│ • <b>Creator :</b> 👤 ${escapeHtml(item.creator)}\n` : "") +
-    `│ • <b>Isi :</b> ${escapeHtml(item.isi)}\n` +
-    (itemFlashActive
-      ? flashLine
-      : `│ • <b>Harga :</b> <code>${escapeHtml(item.harga)}</code>\n`) +
-    `│ • <b>Saldo Kamu :</b> <code>${formatRupiah(saldo)}</code>\n` +
-    `╰────────────────────${voucherNote}\n\n` +
-    `💳 Klik tombol di bawah untuk checkout via <b>Saldo</b> atau <b>QRIS</b>!`;
-
-  const wlRowMarkup = [buildWishlistButton(await isInWishlist(callerId, item.id), item.id)];
-  const inlineMarkup = {
-    inline_keyboard: [
-      [
-        {
-          text: item.preorder ? `🕒 Pre Order Set Ini (${item.harga})` : `💳 Beli Set Ini (${item.harga})`,
-          callback_data: `buy_${item.id}`,
-        },
-      ],
-      [
-        {
-          text: "🔙 Kembali ke Katalog",
-          callback_data: "menu_katalog",
-        },
-      ],
-    ],
-  };
-
-  inlineMarkup.inline_keyboard.splice(1, 0, wlRowMarkup);
-  if (VIP_ENABLED && (await isVipUser(callerId))) {
-    inlineMarkup.inline_keyboard[0] = [{ text: "🎁 Ambil Gratis (VIP)", callback_data: `vipget_${item.id}` }];
-  }
-  const newUserSpecial = getNewUserPrice(parseNominal(item.harga));
-  if (newUserSpecial && (await isNewBuyer(callerId)) && (await isNewUserPromoActive(callerId))) {
-    if (await isPhoneVerified(callerId)) {
-      inlineMarkup.inline_keyboard[0] = [
-        { text: `💳 Beli Set Ini (${formatRupiah(newUserSpecial)} • harga khusus)`, callback_data: `buyconf_${item.id}` },
-      ];
-    } else {
-      inlineMarkup.inline_keyboard.unshift([
-        { text: "📱 Verifikasi Nomor untuk Harga Khusus", callback_data: "verify_phone" },
-      ]);
-    }
-  }
-  const tierNow = await getMemberTier(callerId);
-  if (tierNow.pct > 0 && !newUserSpecial) {
-    const curBtn = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
-    if (curBtn && String(curBtn.callback_data || "").startsWith("buy_")) {
-      const tierPrice = applyTierPrice(parseNominal(item.harga), tierNow);
-      inlineMarkup.inline_keyboard[0] = [
-        { text: `💳 Beli Set Ini (${formatRupiah(tierPrice)} • ${tierNow.name} -${tierNow.pct}%)`, callback_data: `buy_${item.id}` },
-      ];
-    }
-  }
-  if (itemFlashActive) {
-    const curBtnFlash = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
-    if (curBtnFlash && String(curBtnFlash.callback_data || "").startsWith("buy_")) {
-      inlineMarkup.inline_keyboard[0] = [
-        { text: `⚡ Beli Flash Sale (${formatRupiah(flashSaleNow.flash_price)})`, callback_data: `buy_${item.id}` },
-      ];
-    }
-  }
-  const botUname = await getBotUsername(token);
-  if (botUname && /^[A-Za-z0-9_-]{1,30}$/.test(String(item.id))) {
-    inlineMarkup.inline_keyboard.splice(2, 0, [
-      { text: "📤 Bagikan Set", url: buildShareUrl(botUname, callerId, item.id, item.nama) },
-    ]);
-  }
-
-  if (item.photo_id) {
-    await tgRequest(token, "sendPhoto", {
-      chat_id: chatId,
-      photo: item.photo_id,
-      caption: captionText,
-      parse_mode: "HTML",
-      reply_markup: inlineMarkup,
-    });
-  } else {
-    await tgRequest(token, "sendMessage", {
-      chat_id: chatId,
-      text: captionText,
-      parse_mode: "HTML",
-      reply_markup: inlineMarkup,
-    });
-  }
-}
-
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -8665,6 +8654,12 @@ module.exports = async function handler(req, res) {
       const callerUsername = (call.from && call.from.username) || "";
       const isCallerAdmin = await isAdminUser(call.from);
 
+      // TAP CHALLENGE: punya pembatas kecepatan sendiri (rate limit global akan mem-ban pemain yang tap cepat)
+      if (data && data.startsWith("tap_")) {
+        await handleTapCallback(token, call, isCallerAdmin);
+        return res.status(200).json({ ok: true });
+      }
+
       // BLACKLIST & RATE LIMIT (admin dikecualikan)
       if (!isCallerAdmin) {
         if (await isBanned(callerId)) return res.status(200).json({ ok: true });
@@ -8820,9 +8815,136 @@ module.exports = async function handler(req, res) {
         await sendWishlist(token, chatId, callerId);
         return res.status(200).json({ ok: true });
       } else if (data.startsWith("detail_")) {
+        const katalogList = await getKatalog();
         const itemId = data.replace("detail_", "");
-        await sendItemDetailView(token, chatId, callerId, itemId);
-      } else if (data.startsWith("buyqris_")) {
+        const item = katalogList.find((k) => String(k.id) === itemId);
+
+        if (!item) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "⚠️ Maaf, set ini sudah dihapus atau diperbarui oleh admin.",
+          });
+          return res.status(200).json({ ok: true });
+        }
+
+        const rankMap = getRankedKatalog(katalogList);
+        const rank = rankMap[String(item.id)];
+        const sold = Number(item.sold) || 0;
+        let popularityLine = "";
+        if (rank === 1) {
+          popularityLine = `│ • <b>Status :</b> 🔥 <b>#1 BESTSELLER</b> (${sold}x terjual)\n`;
+        } else if (rank === 2 || rank === 3) {
+          popularityLine = `│ • <b>Status :</b> ⭐ <b>#${rank} POPULER</b> (${sold}x terjual)\n`;
+        } else if (sold > 0) {
+          popularityLine = `│ • <b>Terjual :</b> ${sold}x pembelian\n`;
+        }
+
+        const [activeV, saldo] = await Promise.all([
+          getActiveUserVoucher(callerId),
+          getUserSaldo(callerId),
+        ]);
+        const voucherNote = activeV
+          ? `\n🎟️ <i>Voucher aktif: <b>${escapeHtml(activeV.code)}</b> (-${formatRupiah(activeV.discount)})</i>`
+          : "";
+
+        const itemRatingBlock = buildRatingBlock(await getItemRating(item.id));
+        const flashSaleNow = await getFlashSale();
+        const itemFlashActive = Boolean(flashSaleNow && String(flashSaleNow.item_id) === String(item.id));
+        const flashLine = itemFlashActive
+          ? `│ • ⚡ <b>FLASH SALE :</b> <s>${escapeHtml(item.harga)}</s> ➜ <code>${formatRupiah(flashSaleNow.flash_price)}</code>\n` +
+            `│ • ⏱️ <b>Berakhir :</b> ${getFlashSaleRemainingText(flashSaleNow)} (${formatWibClock(flashSaleNow.end_ts)})\n`
+          : "";
+        const captionText =
+          (itemFlashActive ? `⚡⚡⚡ <b>FLASH SALE AKTIF!</b> ⚡⚡⚡\n\n` : "") +
+          `✨ <b>${escapeHtml(item.nama)}</b>\n\n` +
+          itemRatingBlock +
+          `╭─── 📦 <b>DETAIL PAKET</b> ───\n` +
+          popularityLine +
+          (item.creator ? `│ • <b>Creator :</b> 👤 ${escapeHtml(item.creator)}\n` : "") +
+          `│ • <b>Isi :</b> ${escapeHtml(item.isi)}\n` +
+          (itemFlashActive
+            ? flashLine
+            : `│ • <b>Harga :</b> <code>${escapeHtml(item.harga)}</code>\n`) +
+          `│ • <b>Saldo Kamu :</b> <code>${formatRupiah(saldo)}</code>\n` +
+          `╰────────────────────${voucherNote}\n\n` +
+          `💳 Klik tombol di bawah untuk checkout via <b>Saldo</b> atau <b>QRIS</b>!`;
+
+        const wlRowMarkup = [buildWishlistButton(await isInWishlist(callerId, item.id), item.id)];
+        const inlineMarkup = {
+          inline_keyboard: [
+            [
+              {
+                text: `💳 Beli Set Ini (${item.harga})`,
+                callback_data: `buy_${item.id}`,
+              },
+            ],
+            [
+              {
+                text: "🔙 Kembali ke Katalog",
+                callback_data: "menu_katalog",
+              },
+            ],
+          ],
+        };
+
+        inlineMarkup.inline_keyboard.splice(1, 0, wlRowMarkup);
+        if (VIP_ENABLED && (await isVipUser(callerId))) {
+          inlineMarkup.inline_keyboard[0] = [{ text: "🎁 Ambil Gratis (VIP)", callback_data: `vipget_${item.id}` }];
+        }
+        const newUserSpecial = getNewUserPrice(parseNominal(item.harga));
+        if (newUserSpecial && (await isNewBuyer(callerId)) && (await isNewUserPromoActive(callerId))) {
+          if (await isPhoneVerified(callerId)) {
+            inlineMarkup.inline_keyboard[0] = [
+              { text: `💳 Beli Set Ini (${formatRupiah(newUserSpecial)} • harga khusus)`, callback_data: `buyconf_${item.id}` },
+            ];
+          } else {
+            inlineMarkup.inline_keyboard.unshift([
+              { text: "📱 Verifikasi Nomor untuk Harga Khusus", callback_data: "verify_phone" },
+            ]);
+          }
+        }
+        const tierNow = await getMemberTier(callerId);
+        if (tierNow.pct > 0 && !newUserSpecial) {
+          const curBtn = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
+          if (curBtn && String(curBtn.callback_data || "").startsWith("buy_")) {
+            const tierPrice = applyTierPrice(parseNominal(item.harga), tierNow);
+            inlineMarkup.inline_keyboard[0] = [
+              { text: `💳 Beli Set Ini (${formatRupiah(tierPrice)} • ${tierNow.name} -${tierNow.pct}%)`, callback_data: `buy_${item.id}` },
+            ];
+          }
+        }
+        if (itemFlashActive) {
+          const curBtnFlash = inlineMarkup.inline_keyboard[0] && inlineMarkup.inline_keyboard[0][0];
+          if (curBtnFlash && String(curBtnFlash.callback_data || "").startsWith("buy_")) {
+            inlineMarkup.inline_keyboard[0] = [
+              { text: `⚡ Beli Flash Sale (${formatRupiah(flashSaleNow.flash_price)})`, callback_data: `buy_${item.id}` },
+            ];
+          }
+        }
+        const botUname = await getBotUsername(token);
+        if (botUname && /^[A-Za-z0-9_-]{1,30}$/.test(String(item.id))) {
+          inlineMarkup.inline_keyboard.splice(2, 0, [
+            { text: "📤 Bagikan Set", url: buildShareUrl(botUname, callerId, item.id, item.nama) },
+          ]);
+        }
+
+        if (item.photo_id) {
+          await tgRequest(token, "sendPhoto", {
+            chat_id: chatId,
+            photo: item.photo_id,
+            caption: captionText,
+            parse_mode: "HTML",
+            reply_markup: inlineMarkup,
+          });
+        } else {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: captionText,
+            parse_mode: "HTML",
+            reply_markup: inlineMarkup,
+          });
+          }
+                } else if (data.startsWith("buyqris_")) {
         const targetKey = data.replace("buyqris_", "");
         const target = await resolvePurchaseTarget(targetKey, callerId);
         if (!target.ok) {
@@ -8835,13 +8957,6 @@ module.exports = async function handler(req, res) {
         const target = await resolvePurchaseTarget(targetKey, callerId);
         if (!target.ok) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: target.error });
-          return res.status(200).json({ ok: true });
-        }
-        if (target.extra && target.extra.is_preorder) {
-          await tgRequest(token, "sendMessage", {
-            chat_id: chatId,
-            text: "⚠️ Set pre order hanya bisa dibayar lewat QRIS.",
-          });
           return res.status(200).json({ ok: true });
         }
 
@@ -8956,8 +9071,7 @@ module.exports = async function handler(req, res) {
         const discount = bestDiscount.discount;
         const effectivePrice = Math.max(500, target.baseNominal - discount);
 
-        const isPreorderTarget = Boolean(target.extra && target.extra.is_preorder);
-        if (!isPreorderTarget && saldo >= effectivePrice) {
+        if (saldo >= effectivePrice) {
           const sisaSaldo = saldo - effectivePrice;
           const voucherLine = buildDiscountLine(bestDiscount.source, bestDiscount.code, discount);
 
@@ -9391,6 +9505,13 @@ module.exports = async function handler(req, res) {
         await maybeAwardLastMonth(token);
       } catch (awardErr) {
         console.error("Award Leaderboard Error:", awardErr);
+      }
+
+      // Hadiah juara Tap Challenge minggu lalu (sekali per minggu, otomatis)
+      try {
+        await maybeAwardTapLastWeek(token);
+      } catch (tapAwardErr) {
+        console.error("Award Tap Challenge Error:", tapAwardErr);
       }
 
       const rawText = (msg.text || msg.caption || "").trim();
@@ -11390,7 +11511,6 @@ module.exports = async function handler(req, res) {
               `\n<i>Mau lampirkan file upload langsung? Kirim foto/dokumen dengan caption <code>/tambahfile ${added[0].no}</code></i>`,
             parse_mode: "HTML",
           });
-          await postNewSetToChannel(token, newItem);
           return res.status(200).json({ ok: true });
         }
 
@@ -11433,9 +11553,6 @@ module.exports = async function handler(req, res) {
             text,
             parse_mode: "HTML",
           });
-        }
-        for (const { item } of added) {
-          await postNewSetToChannel(token, item);
         }
         return res.status(200).json({ ok: true });
       }
@@ -11595,86 +11712,6 @@ module.exports = async function handler(req, res) {
       }
 
       // 10A2. ADMIN: /flashsale — mulai promo kilat (default 1 jam) untuk satu set
-      if (rawText.startsWith("/preorder") || rawText.startsWith("/rilispo")) {
-        if (!isAdmin) return res.status(200).json({ ok: true });
-        const isRilis = rawText.startsWith("/rilispo");
-        const katalogList = await getKatalog();
-        const arg = rawText.replace(/^\/(preorder|rilispo)\s*/i, "").trim();
-        const sayAdmin = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
-
-        if (!arg) {
-          const poLines = [];
-          for (let i = 0; i < katalogList.length; i++) {
-            const it = katalogList[i];
-            if (!it.preorder) continue;
-            const pending = Number(await redisCommand(["HLEN", REDIS_PO_PREFIX + String(it.id)])) || 0;
-            poLines.push(`${i + 1}. <b>${escapeHtml(it.nama)}</b> — ETA: ${escapeHtml(it.po_eta || "-")} — pending: ${pending}`);
-          }
-          await sayAdmin(
-            (poLines.length > 0 ? "🕒 <b>SET PRE ORDER AKTIF</b>\n\n" + poLines.join("\n") : "🕒 Belum ada set pre order aktif.") +
-              "\n\n<b>Perintah:</b>\n" +
-              "<code>/preorder NO ETA</code> — aktifkan PO (ETA opsional)\n" +
-              "<code>/preorder NO off</code> — matikan PO\n" +
-              "<code>/rilispo NO</code> — kirim file ke semua pembeli PO"
-          );
-          return res.status(200).json({ ok: true });
-        }
-
-        const parts = arg.split(/\s+/);
-        const idx = parseInt(parts[0], 10) - 1;
-        if (isNaN(idx) || idx < 0 || idx >= katalogList.length) {
-          await sayAdmin("⚠️ Nomor set tidak valid.");
-          return res.status(200).json({ ok: true });
-        }
-        const item = katalogList[idx];
-        const itemId = String(item.id);
-        const restArg = arg.slice(parts[0].length).trim();
-
-        if (isRilis) {
-          if (!item.preorder) {
-            await sayAdmin(`ℹ️ <b>${escapeHtml(item.nama)}</b> tidak sedang mode pre order.`);
-            return res.status(200).json({ ok: true });
-          }
-          const { sent, failed } = await releasePreorders(token, katalogList, idx);
-          const left = Number(await redisCommand(["HLEN", REDIS_PO_PREFIX + itemId])) || 0;
-          if (left === 0) {
-            item.preorder = false;
-            delete item.po_eta;
-            await saveKatalog(katalogList);
-          }
-          await sayAdmin(
-            `✅ Rilis PO <b>${escapeHtml(item.nama)}</b>: terkirim ${sent}, gagal ${failed}.` +
-              (left > 0
-                ? `\n⚠️ ${left} pesanan belum terkirim. Jalankan <code>/rilispo ${idx + 1}</code> lagi.`
-                : "\n🎉 Set ini sudah tidak mode pre order.")
-          );
-          return res.status(200).json({ ok: true });
-        }
-
-        if (restArg.toLowerCase() === "off") {
-          item.preorder = false;
-          delete item.po_eta;
-          await saveKatalog(katalogList);
-          const left = Number(await redisCommand(["HLEN", REDIS_PO_PREFIX + itemId])) || 0;
-          await sayAdmin(
-            `✅ PO <b>${escapeHtml(item.nama)}</b> dimatikan.` +
-              (left > 0 ? `\n⚠️ Masih ada ${left} pesanan PO. Jalankan <code>/rilispo ${idx + 1}</code> untuk mengirim filenya.` : "")
-          );
-          return res.status(200).json({ ok: true });
-        }
-
-        item.preorder = true;
-        if (restArg) item.po_eta = restArg;
-        else delete item.po_eta;
-        await saveKatalog(katalogList);
-        await sayAdmin(
-          `🕒 <b>${escapeHtml(item.nama)}</b> sekarang PRE ORDER.` +
-            (restArg ? `\nPerkiraan rilis: <b>${escapeHtml(restArg)}</b>` : "") +
-            `\n\nKirim file ke pembeli saat siap: <code>/rilispo ${idx + 1}</code>`
-        );
-        return res.status(200).json({ ok: true });
-      }
-
       if (rawText.startsWith("/flashsale")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const katalogList = await getKatalog();
@@ -11798,42 +11835,6 @@ module.exports = async function handler(req, res) {
           text: activeFs
             ? `🛑 Flash sale <b>${escapeHtml(activeFs.item_nama)}</b> dihentikan.`
             : "ℹ️ Tidak ada flash sale yang sedang aktif.",
-          parse_mode: "HTML",
-        });
-        return res.status(200).json({ ok: true });
-      }
-
-      // 10A4. ADMIN: /setpostchannel — set/lihat channel tujuan auto-post set baru
-      if (rawText.startsWith("/setpostchannel")) {
-        if (!isAdmin) return res.status(200).json({ ok: true });
-        const arg = rawText.replace(/^\/setpostchannel\s*/i, "").trim();
-
-        if (!arg) {
-          const current = await getPostChannel();
-          await tgRequest(token, "sendMessage", {
-            chat_id: chatId,
-            text:
-              `📢 <b>Channel Auto-Post Set Baru</b>\n\n` +
-              `Saat ini: ${current ? `<code>${escapeHtml(current)}</code>` : "<i>belum diset</i>"}\n\n` +
-              `Gunakan: <code>/setpostchannel ID_atau_@username</code>\n` +
-              `<i>• Bot harus jadi admin di channel tersebut.\n` +
-              `• Set baru lewat /tambah akan otomatis diposting ke sana, isinya cuma preview + tombol ke bot (bukan link file asli).\n` +
-              `• Kosongkan lagi dengan <code>/setpostchannel off</code>.</i>`,
-            parse_mode: "HTML",
-          });
-          return res.status(200).json({ ok: true });
-        }
-
-        if (arg.toLowerCase() === "off") {
-          await setPostChannel("");
-          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Auto-post ke channel dimatikan." });
-          return res.status(200).json({ ok: true });
-        }
-
-        await setPostChannel(arg);
-        await tgRequest(token, "sendMessage", {
-          chat_id: chatId,
-          text: `✅ Channel auto-post diset ke: <code>${escapeHtml(arg)}</code>\n<i>Pastikan bot sudah jadi admin di channel itu ya.</i>`,
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
@@ -12068,13 +12069,6 @@ module.exports = async function handler(req, res) {
           }
         }
 
-        // Deep-link dari tombol auto-post channel: /start buy_ID -> langsung buka detail set itu
-        const startBuyMatch = /^\/start\s+buy_([A-Za-z0-9_-]{1,30})$/i.exec(text);
-        if (startBuyMatch) {
-          await sendItemDetailView(token, chatId, senderId, startBuyMatch[1]);
-          return res.status(200).json({ ok: true });
-        }
-
         if (text === "/start" || startRefMatch || startMitraMatch || startShareMatch) {
           const buyerName = escapeHtml((msg.from && msg.from.first_name) || "Kak");
           let headerText = `👋 Halo <b>${buyerName}</b>! Selamat datang di <b>Lumine Photopack Store</b>.\n🆔 ID kamu: <code>${senderId}</code>`;
@@ -12091,7 +12085,6 @@ module.exports = async function handler(req, res) {
               "• <code>/tambah</code> (1 baris = 1 set, bisa banyak sekaligus) | <code>/edit</code> | <code>/hapus</code>\n" +
               "• <code>/tambahfile NO</code> | <code>/hapusfile NO NO</code> | <code>/listfile NO</code> — lampirkan banyak file/link\n" +
               "• <code>/flashsale NO | HARGA | MENIT</code> | <code>/stopflashsale</code> — promo kilat + auto broadcast\n" +
-              "• <code>/preorder NO ETA</code> | <code>/preorder NO off</code> | <code>/rilispo NO</code> — pre order\n" +
               "• <code>/addreseller ID NAMA</code> | <code>/delreseller ID</code> | <code>/listreseller</code>\n" +
               "• <code>/omsetreseller ID</code> | <code>/omsettoko</code> | <code>/listrating</code>\n" +
               "• <code>/fiturbot</code> — daftar fitur penting bot\n" +
@@ -12131,6 +12124,10 @@ module.exports = async function handler(req, res) {
           await sendKatalogCreatorMenu(token, chatId);
         } else if (text === "🎲 Mystery Box") {
           await sendMysteryMenu(token, chatId);
+        } else if (text === "👆 Tap Challenge" || text === "/tap") {
+          await sendTapMenu(token, chatId, senderId);
+        } else if (text === "/tapskor") {
+          await sendTapSkor(token, chatId, senderId);
         } else if (text === "🎁 Promo 5k" || text === "🎁 Promo Bundling 5k") {
           // tombol lama (promo bundling sudah dihapus) -> arahkan ke katalog
           await sendKatalogMenu(token, chatId);
