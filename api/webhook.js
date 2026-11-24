@@ -8796,6 +8796,63 @@ async function handlePreviewMassalPhoto(token, msg) {
   return true;
 }
 
+// ---- POST SET BERDASARKAN NOMOR (/postset), jatah harian sendiri POSTALL_PER_DAY ----
+const REDIS_POSTSET_QUEUE_KEY = "lumine_main_postset_queue"; // list: id set yang antre
+const REDIS_POSTSET_DAY_PREFIX = "lumine_main_postset_day_"; // counter posting per hari (WIB)
+const REDIS_POSTSET_LOCK_KEY = "lumine_main_postset_lock";
+
+// Posting dari antrean /postset sesuai sisa jatah hari ini. Aman dipanggil berkali-kali.
+async function runPostSetBatch(token) {
+  const qLen = Number(await redisCommand(["LLEN", REDIS_POSTSET_QUEUE_KEY])) || 0;
+  if (qLen === 0) return { ran: false, reason: "empty" };
+
+  const { dayKey } = getWibPeriods();
+  const dayKeyCnt = REDIS_POSTSET_DAY_PREFIX + dayKey;
+  if ((Number(await redisCommand(["GET", dayKeyCnt])) || 0) >= POSTALL_PER_DAY) {
+    return { ran: false, reason: "quota" };
+  }
+  const channel = await getPostChannel();
+  if (!channel) return { ran: false, reason: "nochannel" };
+  const botUname = await getBotUsername(token);
+  if (!botUname) return { ran: false, reason: "nobot" };
+
+  const lockOk = await redisCommand(["SET", REDIS_POSTSET_LOCK_KEY, "1", "NX", "EX", "120"]);
+  if (lockOk !== "OK") return { ran: false, reason: "locked" };
+
+  let posted = 0;
+  let failed = 0;
+  let skipped = 0;
+  try {
+    const byId = new Map((await getKatalog()).map((k) => [String(k.id), k]));
+    while (true) {
+      const used = Number(await redisCommand(["GET", dayKeyCnt])) || 0;
+      if (used >= POSTALL_PER_DAY) break;
+      const id = await redisCommand(["LPOP", REDIS_POSTSET_QUEUE_KEY]);
+      if (!id) break;
+      const item = byId.get(String(id));
+      if (!item || Number(await redisCommand(["HEXISTS", REDIS_POSTALL_DONE_KEY, String(id)])) === 1) {
+        skipped++;
+        continue;
+      }
+      const ok = await postOneSetToChannel(token, item, channel, botUname);
+      if (ok) {
+        await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, String(id), "1"]);
+        await redisCommand(["INCR", dayKeyCnt]);
+        await redisCommand(["EXPIRE", dayKeyCnt, String(60 * 60 * 24 * 3)]);
+        posted++;
+      } else {
+        failed++;
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTALL_DELAY_MS));
+    }
+  } finally {
+    await redisCommand(["DEL", REDIS_POSTSET_LOCK_KEY]);
+  }
+
+  const sisa = Number(await redisCommand(["LLEN", REDIS_POSTSET_QUEUE_KEY])) || 0;
+  return { ran: true, posted, failed, skipped, sisa };
+}
+
 async function postNewSetToChannel(token, item) {
   try {
     const targetChannel = await getPostChannel();
@@ -10184,6 +10241,11 @@ module.exports = async function handler(req, res) {
         await runPostAllBatch(token);
       } catch (paErr) {
         console.error("Posting massal error:", paErr);
+      }
+      try {
+        await runPostSetBatch(token);
+      } catch (psErr) {
+        console.error("Postset error:", psErr);
       }
 
       // REFERRAL APLIKASI: input ID / nama dari member (perintah / selain /batal diabaikan)
@@ -12132,6 +12194,78 @@ module.exports = async function handler(req, res) {
       }
 
       // 10. ADMIN: /edit
+      // POST SET BERDASARKAN NOMOR: /postset 5 | /postset 5 9 12 | /postset 5-20
+      if (/^\/postset(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const replyS = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+        const argS = rawText.replace(/^\/postset\s*/i, "").trim();
+        const katalogS = await getKatalog();
+        const usageS =
+          "⚠️ Format: <code>/postset 5</code>, <code>/postset 5 9 12</code>, atau <code>/postset 5-20</code>\n" +
+          "Nomor sama dengan di <code>/edit</code>.";
+        if (!argS) {
+          await replyS(usageS);
+          return res.status(200).json({ ok: true });
+        }
+
+        const nosS = new Set();
+        const salahS = [];
+        for (const tok of argS.split(/[\s,]+/).filter(Boolean)) {
+          const rg = /^(\d+)-(\d+)$/.exec(tok);
+          if (rg) {
+            let a = parseInt(rg[1], 10);
+            let b = parseInt(rg[2], 10);
+            if (a > b) [a, b] = [b, a];
+            if (b - a > 200) {
+              salahS.push(tok);
+              continue;
+            }
+            for (let n = a; n <= b; n++) nosS.add(n);
+          } else if (/^\d+$/.test(tok)) {
+            nosS.add(parseInt(tok, 10));
+          } else {
+            salahS.push(tok);
+          }
+        }
+        const validS = [...nosS].filter((n) => n >= 1 && n <= katalogS.length);
+        salahS.push(...[...nosS].filter((n) => n < 1 || n > katalogS.length).map(String));
+        if (validS.length === 0) {
+          await replyS(usageS);
+          return res.status(200).json({ ok: true });
+        }
+
+        const doneS = new Set((await redisCommand(["HKEYS", REDIS_POSTALL_DONE_KEY])) || []);
+        let antreS = 0;
+        let sudahS = 0;
+        for (const n of validS) {
+          const id = String(katalogS[n - 1].id);
+          if (doneS.has(id)) {
+            sudahS++;
+            continue;
+          }
+          await redisCommand(["RPUSH", REDIS_POSTSET_QUEUE_KEY, id]);
+          antreS++;
+        }
+
+        await replyS(
+          `📮 Antre <b>${antreS}</b> set` +
+            (sudahS ? ` • sudah pernah diposting <b>${sudahS}</b> (dilewati)` : "") +
+            (salahS.length ? ` • nomor tidak valid: ${escapeHtml(salahS.join(", "))}` : "") +
+            `.\nJatah posting ${POSTALL_PER_DAY} set per hari.`
+        );
+
+        const runS = await runPostSetBatch(token);
+        if (runS.ran) {
+          await replyS(
+            `✅ Diposting: <b>${runS.posted}</b> • gagal: ${runS.failed}\n` +
+              (runS.sisa > 0 ? `⏳ Sisa antrean: <b>${runS.sisa}</b> set, lanjut besok otomatis.` : "🎉 Antrean kosong.")
+          );
+        } else if (runS.reason === "quota") {
+          await replyS(`⏳ Jatah hari ini sudah habis. Antrean dilanjutkan besok otomatis.`);
+        }
+        return res.status(200).json({ ok: true });
+      }
+
       // PREVIEW MASSAL: mulai / hentikan / cek sesi
       if (/^\/previewmassal(\s|$)/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
