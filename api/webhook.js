@@ -135,6 +135,11 @@ const REDIS_TAP_RL_PREFIX = "lumine_main_tap_rl_"; // key per user per detik: ba
 const REDIS_TAP_WEEK_PREFIX = "lumine_main_tap_week_"; // sorted set per minggu (WIB): id user -> skor terbaik
 const REDIS_TAP_NAMES_KEY = "lumine_main_tap_names"; // hash: id user -> nama tampil di papan skor
 const REDIS_TAP_REWARD_LOCK_PREFIX = "lumine_main_tap_reward_"; // lock hadiah per minggu (anti dobel)
+// ---- SESI TAMBAHAN TAP CHALLENGE (bayar saldo, hadiah tetap, TANPA undian) ----
+const TAP_TIKET_ENABLED = true; // false = matikan sesi tambahan
+const TAP_TIKET_HARGA = 2000; // harga satu sesi tambahan (saldo)
+const TAP_TIKET_MAX_PER_HARI = 5; // maks sesi tambahan per user per hari (WIB)
+const REDIS_TAP_PAID_PREFIX = "lumine_main_tap_paid_"; // hash per hari (WIB): id user -> jumlah sesi tambahan
 
 // ---- BOT RESELLER (WHITE-LABEL) ----
 // Harga jual reseller di bot mereka: MINIMAL = harga retail toko utama (tidak boleh lebih murah dari kamu),
@@ -1534,10 +1539,20 @@ async function sendTapMenu(token, chatId, userId) {
     `🎁 <b>Hadiah juara mingguan (saldo):</b> ${buildTapHadiahLine()}\n` +
     "<i>Dibagikan Senin 00:00 WIB berdasarkan skor terbaik minggu itu.</i>\n\n";
   if (standing) teks += `📍 Skor terbaikmu minggu ini: <b>${standing.best} tap</b> (#${standing.rank})\n`;
-  teks += played ? "✅ Jatah mainmu hari ini sudah dipakai. Balik lagi besok ya!" : "Siap? Tekan Mulai!";
+  const paidUsed = parseInt(await redisCommand(["HGET", REDIS_TAP_PAID_PREFIX + dayKey, String(userId)]), 10) || 0;
+  const paidLeft = Math.max(0, TAP_TIKET_MAX_PER_HARI - paidUsed);
+  teks += played
+    ? "✅ Jatah gratismu hari ini sudah dipakai." +
+      (TAP_TIKET_ENABLED && paidLeft > 0
+        ? `\n🎟️ Mau main lagi? Sesi tambahan <b>${formatRupiah(TAP_TIKET_HARGA)}</b> (sisa ${paidLeft}x hari ini).`
+        : "")
+    : "Siap? Tekan Mulai!";
 
   const rows = [];
   if (!played) rows.push([{ text: "▶️ Mulai", callback_data: "tap_mulai" }]);
+  if (played && TAP_TIKET_ENABLED && paidLeft > 0) {
+    rows.push([{ text: `🎟️ Sesi Tambahan (${formatRupiah(TAP_TIKET_HARGA)})`, callback_data: "tap_bayar" }]);
+  }
   rows.push([{ text: "🏆 Papan Skor Minggu Ini", callback_data: "tap_skor" }]);
   return tgRequest(token, "sendMessage", {
     chat_id: chatId,
@@ -1642,6 +1657,56 @@ async function handleTapCallback(token, call, isCallerAdmin) {
       };
       const edited = await tgRequest(token, "editMessageText", { chat_id: chatId, message_id: messageId, ...payload });
       if (!edited || !edited.ok) await tgRequest(token, "sendMessage", { chat_id: chatId, ...payload });
+      return;
+    }
+
+    // ---- SESI TAMBAHAN BERBAYAR (saldo) ----
+    if (data === "tap_bayar") {
+      if (!TAP_TIKET_ENABLED) return answer("⚠️ Sesi tambahan sedang tidak tersedia.", true);
+      const sesiBayar = await getTapSession(uid);
+      if (sesiBayar && sesiBayar.running) return answer("⏳ Sesimu sedang berjalan. Tekan 👆 Tap!", true);
+
+      const { dayKey, weekKey } = getWibPeriods();
+      const paidHash = REDIS_TAP_PAID_PREFIX + dayKey;
+      // Klaim slot dulu supaya klik ganda tidak lolos batas harian
+      const used = parseInt(await redisCommand(["HINCRBY", paidHash, uid, "1"]), 10) || 0;
+      await redisCommand(["EXPIRE", paidHash, String(60 * 60 * 24 * 3)]);
+      if (used > TAP_TIKET_MAX_PER_HARI) {
+        await redisCommand(["HINCRBY", paidHash, uid, "-1"]);
+        return answer(`✅ Batas ${TAP_TIKET_MAX_PER_HARI} sesi tambahan hari ini sudah tercapai.`, true);
+      }
+
+      const bayar = await deductUserSaldo(uid, TAP_TIKET_HARGA);
+      if (!bayar.ok) {
+        await redisCommand(["HINCRBY", paidHash, uid, "-1"]);
+        return answer(`💰 Saldo kurang. Butuh ${formatRupiah(TAP_TIKET_HARGA)}.`, true);
+      }
+
+      const ttlBayar = String(TAP_DURASI_DETIK + TAP_SESI_JEDA_DETIK);
+      try {
+        const nama = call.from.username
+          ? maskUsername(call.from.username)
+          : String(call.from.first_name || "Member Lumine").slice(0, 12);
+        await redisCommand(["SET", REDIS_TAP_CNT_PREFIX + uid, "0", "EX", ttlBayar]);
+        await redisCommand(["SET", REDIS_TAP_START_PREFIX + uid, `${Date.now()}:${weekKey}`, "EX", ttlBayar]);
+        await redisCommand(["HSET", REDIS_TAP_NAMES_KEY, uid, nama]);
+      } catch (e) {
+        // Gagal mulai: kembalikan saldo dan slot
+        await addUserSaldo(uid, TAP_TIKET_HARGA);
+        await redisCommand(["HINCRBY", paidHash, uid, "-1"]);
+        throw e;
+      }
+
+      await answer("🚀 Mulai! Tap sekarang!");
+      const payloadBayar = {
+        text:
+          `👆 <b>TAP SEKARANG!</b> Waktumu ${TAP_DURASI_DETIK} detik. <i>(sesi tambahan)</i>\n` +
+          "<i>Setelah waktu habis, tekan tombol sekali lagi untuk melihat skor akhirmu.</i>",
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "👆 Tap!", callback_data: "tap_klik" }]] },
+      };
+      const editedBayar = await tgRequest(token, "editMessageText", { chat_id: chatId, message_id: messageId, ...payloadBayar });
+      if (!editedBayar || !editedBayar.ok) await tgRequest(token, "sendMessage", { chat_id: chatId, ...payloadBayar });
       return;
     }
 
