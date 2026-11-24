@@ -8558,6 +8558,121 @@ async function setPostChannel(val) {
 
 // Dipanggil setiap ada set baru tersimpan lewat /tambah. Postingan ke channel HANYA berisi
 // preview + tombol yang mengarah ke bot (deep-link /start buy_ID), bukan link Drive/file aslinya.
+// ---- POSTING MASSAL SET LAMA KE CHANNEL (bertahap, POSTALL_PER_DAY set per hari WIB) ----
+const POSTALL_PER_DAY = 10; // jatah posting per hari (WIB)
+const POSTALL_DELAY_MS = 1000; // jeda antar posting supaya tidak kena limit Telegram
+const REDIS_POSTALL_STATE_KEY = "lumine_main_postall_state"; // JSON: { active, queue, day, count }
+const REDIS_POSTALL_DONE_KEY = "lumine_main_postall_done"; // hash: id set -> 1 (sudah diposting)
+const REDIS_POSTALL_LOCK_KEY = "lumine_main_postall_lock"; // kunci anti jalan ganda
+
+async function getPostAllState() {
+  const raw = await redisCommand(["GET", REDIS_POSTALL_STATE_KEY]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function savePostAllState(st) {
+  await redisCommand(["SET", REDIS_POSTALL_STATE_KEY, JSON.stringify(st)]);
+}
+
+// Kirim satu set ke channel: foto preview (kalau ada) + tombol ke bot. Link file asli tidak ikut.
+async function postOneSetToChannel(token, item, channel, botUname) {
+  const deepLink = `https://t.me/${botUname}?start=buy_${item.id}`;
+  const katIcon = item.kategori === "full" ? "📦" : "🧩";
+  const caption =
+    `✨ <b>${escapeHtml(item.nama)}</b>\n` +
+    `${katIcon} ${item.kategori === "full" ? "Full Set" : "Mini Set"}\n` +
+    (item.creator ? `👤 Creator: ${escapeHtml(item.creator)}\n` : "") +
+    (item.isi ? `📂 Isi: ${escapeHtml(item.isi)}\n` : "") +
+    `💰 Harga: <b>${escapeHtml(String(item.harga))}</b>\n\n` +
+    `Klik tombol di bawah untuk lihat & beli lewat bot 👇`;
+  const replyMarkup = { inline_keyboard: [[{ text: "🛒 Lihat & Beli", url: deepLink }]] };
+
+  const r = item.photo_id
+    ? await tgRequest(token, "sendPhoto", {
+        chat_id: channel,
+        photo: item.photo_id,
+        caption,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup,
+      })
+    : await tgRequest(token, "sendMessage", {
+        chat_id: channel,
+        text: caption,
+        parse_mode: "HTML",
+        reply_markup: replyMarkup,
+      });
+  return Boolean(r && r.ok);
+}
+
+// Posting sebagian antrean sesuai jatah harian. Aman dipanggil berkali-kali (hook tiap pesan masuk).
+async function runPostAllBatch(token) {
+  const st0 = await getPostAllState();
+  if (!st0 || !st0.active) return { ran: false, reason: "inactive" };
+
+  const lockOk = await redisCommand(["SET", REDIS_POSTALL_LOCK_KEY, "1", "NX", "EX", "120"]);
+  if (lockOk !== "OK") return { ran: false, reason: "locked" };
+
+  try {
+    const st = await getPostAllState();
+    if (!st || !st.active) return { ran: false, reason: "inactive" };
+
+    const { dayKey } = getWibPeriods();
+    if (st.day !== dayKey) {
+      st.day = dayKey;
+      st.count = 0;
+    }
+    if (st.count >= POSTALL_PER_DAY) return { ran: false, reason: "quota" };
+
+    const channel = await getPostChannel();
+    if (!channel) return { ran: false, reason: "nochannel" };
+    const botUname = await getBotUsername(token);
+    if (!botUname) return { ran: false, reason: "nobot" };
+
+    const byId = new Map((await getKatalog()).map((k) => [String(k.id), k]));
+    let posted = 0;
+    let failed = 0;
+    while (st.count < POSTALL_PER_DAY && st.queue.length > 0) {
+      const id = String(st.queue.shift());
+      const item = byId.get(id);
+      if (!item) continue; // set sudah dihapus dari katalog
+      if (Number(await redisCommand(["HEXISTS", REDIS_POSTALL_DONE_KEY, id])) === 1) continue;
+
+      const ok = await postOneSetToChannel(token, item, channel, botUname);
+      if (ok) {
+        await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, id, "1"]);
+        st.count++;
+        posted++;
+      } else {
+        failed++; // gagal dikirim: dilewati, tidak diulang otomatis
+      }
+      await new Promise((resolve) => setTimeout(resolve, POSTALL_DELAY_MS));
+    }
+
+    if (st.queue.length === 0) st.active = false;
+    await savePostAllState(st);
+
+    const qris = await getQris();
+    if (qris && qris.admin_chat_id && (posted > 0 || failed > 0)) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: qris.admin_chat_id,
+        text:
+          `📢 <b>Posting massal ke channel</b>\n` +
+          `✅ Terkirim: ${posted} • ❌ Gagal: ${failed}\n` +
+          (st.active ? `⏳ Sisa antrean: ${st.queue.length} set (lanjut besok, ${POSTALL_PER_DAY}/hari)` : "🎉 Antrean selesai."),
+        parse_mode: "HTML",
+      });
+    }
+    return { ran: true, posted, failed, left: st.queue.length };
+  } finally {
+    await redisCommand(["DEL", REDIS_POSTALL_LOCK_KEY]);
+  }
+}
+
 async function postNewSetToChannel(token, item) {
   try {
     const targetChannel = await getPostChannel();
@@ -9939,6 +10054,13 @@ module.exports = async function handler(req, res) {
         await maybeRunUndianDraw(token);
       } catch (udErr) {
         console.error("Cek undian error:", udErr);
+      }
+
+      // POSTING MASSAL: kirim jatah harian set lama ke channel (no-op kalau tidak aktif)
+      try {
+        await runPostAllBatch(token);
+      } catch (paErr) {
+        console.error("Posting massal error:", paErr);
       }
 
       // REFERRAL APLIKASI: input ID / nama dari member (perintah / selain /batal diabaikan)
@@ -11887,6 +12009,76 @@ module.exports = async function handler(req, res) {
       }
 
       // 10. ADMIN: /edit
+      // PREVIEW SET: atur, hapus, dan cek preview foto per set (admin)
+      if (/^\/(setpreview|hapuspreview|cekpreview)(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const replyP = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+        const katalogP = await getKatalog();
+        const cmdP = rawText.split(/\s+/)[0].toLowerCase();
+        const argP = rawText.slice(cmdP.length).trim();
+
+        if (cmdP === "/cekpreview" && !argP) {
+          const tanpa = katalogP.map((k, i) => ({ k, no: i + 1 })).filter((x) => !x.k.photo_id);
+          let t =
+            `🖼 <b>CEK PREVIEW SET</b>\n` +
+            `✅ Punya preview: <b>${katalogP.length - tanpa.length}</b>\n` +
+            `❌ Belum ada: <b>${tanpa.length}</b> dari ${katalogP.length} set\n\n`;
+          if (tanpa.length > 0) {
+            t += tanpa.slice(0, 40).map((x) => `${x.no}. ${escapeHtml(x.k.nama)}`).join("\n");
+            if (tanpa.length > 40) t += `\n…dan ${tanpa.length - 40} lainnya`;
+            t += "\n\n";
+          }
+          t += "Cek satu set: <code>/cekpreview NO</code>\nAtur preview: kirim foto dengan caption <code>/setpreview NO</code>";
+          await replyP(t);
+          return res.status(200).json({ ok: true });
+        }
+
+        const noP = parseInt(argP, 10);
+        const idxP = noP - 1;
+        if (!argP || isNaN(noP) || idxP < 0 || idxP >= katalogP.length) {
+          await replyP(
+            "⚠️ Nomor set tidak valid. Lihat nomor di <code>/edit</code>.\n" +
+              "• <code>/cekpreview NO</code> — cek ada preview atau tidak\n" +
+              "• Kirim foto dengan caption <code>/setpreview NO</code> — pasang/ganti preview\n" +
+              "• <code>/hapuspreview NO</code> — hapus preview"
+          );
+          return res.status(200).json({ ok: true });
+        }
+        const itemP = katalogP[idxP];
+
+        if (cmdP === "/cekpreview") {
+          await replyP(
+            `${itemP.photo_id ? "✅" : "❌"} <b>${escapeHtml(itemP.nama)}</b> ` +
+              (itemP.photo_id ? "sudah punya preview." : "belum punya preview.")
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        if (cmdP === "/hapuspreview") {
+          if (!itemP.photo_id) {
+            await replyP(`ℹ️ <b>${escapeHtml(itemP.nama)}</b> memang belum punya preview.`);
+            return res.status(200).json({ ok: true });
+          }
+          delete itemP.photo_id;
+          await saveKatalog(katalogP);
+          await replyP(`🗑 Preview <b>${escapeHtml(itemP.nama)}</b> dihapus.`);
+          return res.status(200).json({ ok: true });
+        }
+
+        // /setpreview NO (wajib kirim foto)
+        if (!msg.photo || msg.photo.length === 0) {
+          await replyP("📸 Kirim <b>foto</b> dengan caption <code>/setpreview " + noP + "</code> untuk memasang preview.");
+          return res.status(200).json({ ok: true });
+        }
+        const adaSebelumnya = Boolean(itemP.photo_id);
+        itemP.photo_id = msg.photo[msg.photo.length - 1].file_id;
+        await saveKatalog(katalogP);
+        await replyP(
+          `✅ Preview <b>${escapeHtml(itemP.nama)}</b> ${adaSebelumnya ? "diganti" : "dipasang"}.`
+        );
+        return res.status(200).json({ ok: true });
+      }
+
       if (rawText.startsWith("/edit")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const katalogList = await getKatalog();
@@ -12250,6 +12442,63 @@ module.exports = async function handler(req, res) {
       }
 
       // 10A4. ADMIN: /setpostchannel — set/lihat channel tujuan auto-post set baru
+      if (rawText.startsWith("/postsemua")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/postsemua\s*/i, "").trim().toLowerCase();
+        const reply = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+
+        if (arg === "stop") {
+          const st = await getPostAllState();
+          if (st) {
+            st.active = false;
+            await savePostAllState(st);
+          }
+          await reply("⏹ Posting massal dihentikan.");
+          return res.status(200).json({ ok: true });
+        }
+
+        if (arg === "status") {
+          const st = await getPostAllState();
+          if (!st || !st.active) {
+            await reply("ℹ️ Tidak ada posting massal yang berjalan.");
+          } else {
+            await reply(`ℹ️ Posting massal aktif. Sisa antrean: <b>${st.queue.length}</b> set (${POSTALL_PER_DAY}/hari).`);
+          }
+          return res.status(200).json({ ok: true });
+        }
+
+        const channel = await getPostChannel();
+        if (!channel) {
+          await reply("⚠️ Atur channel dulu lewat <code>/setpostchannel @username_channel</code>.");
+          return res.status(200).json({ ok: true });
+        }
+        const existing = await getPostAllState();
+        if (existing && existing.active) {
+          await reply(`⚠️ Posting massal sudah berjalan (sisa ${existing.queue.length} set). Cek dengan <code>/postsemua status</code>.`);
+          return res.status(200).json({ ok: true });
+        }
+
+        const katalog = await getKatalog();
+        const done = new Set((await redisCommand(["HKEYS", REDIS_POSTALL_DONE_KEY])) || []);
+        const queue = katalog.filter((k) => k && k.id && !done.has(String(k.id))).map((k) => String(k.id));
+        if (queue.length === 0) {
+          await reply("✅ Semua set sudah pernah diposting ke channel.");
+          return res.status(200).json({ ok: true });
+        }
+
+        await savePostAllState({ active: true, queue, day: "", count: 0 });
+        await reply(
+          `🚀 Posting massal dimulai.\n` +
+            `Antrean: <b>${queue.length}</b> set • jatah <b>${POSTALL_PER_DAY}</b> set per hari.\n` +
+            `Cek sisa dengan <code>/postsemua status</code>, hentikan dengan <code>/postsemua stop</code>.`
+        );
+        const first = await runPostAllBatch(token);
+        if (first.ran === false && first.reason === "locked") {
+          await reply("ℹ️ Batch sedang berjalan, akan lanjut otomatis.");
+        }
+        return res.status(200).json({ ok: true });
+      }
+
       if (rawText.startsWith("/setpostchannel")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const arg = rawText.replace(/^\/setpostchannel\s*/i, "").trim();
