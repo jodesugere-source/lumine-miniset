@@ -8673,6 +8673,57 @@ async function runPostAllBatch(token) {
   }
 }
 
+// ---- PREVIEW MASSAL: admin kirim foto tanpa caption, dipasang berurutan ke set yang belum punya preview ----
+const REDIS_PREVIEWMASSAL_KEY = "lumine_main_previewmassal"; // JSON: { active, queue: [id set] }
+
+async function getPreviewMassal() {
+  const raw = await redisCommand(["GET", REDIS_PREVIEWMASSAL_KEY]);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function savePreviewMassal(st) {
+  await redisCommand(["SET", REDIS_PREVIEWMASSAL_KEY, JSON.stringify(st)]);
+}
+
+// Dipanggil untuk tiap foto admin tanpa caption. Return true kalau foto ini dipakai untuk sesi massal.
+async function handlePreviewMassalPhoto(token, msg) {
+  const st = await getPreviewMassal();
+  if (!st || !st.active) return false;
+  const chatId = msg.chat.id;
+  const reply = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+
+  const katalog = await getKatalog();
+  let idx = -1;
+  while (st.queue.length > 0 && idx === -1) {
+    const id = String(st.queue.shift());
+    const i = katalog.findIndex((k) => String(k.id) === id);
+    if (i !== -1 && !katalog[i].photo_id) idx = i;
+  }
+  if (idx === -1) {
+    st.active = false;
+    await savePreviewMassal(st);
+    await reply("🎉 Semua set sudah punya preview. Sesi massal selesai.");
+    return true;
+  }
+
+  katalog[idx].photo_id = msg.photo[msg.photo.length - 1].file_id;
+  await saveKatalog(katalog);
+  if (st.queue.length === 0) st.active = false;
+  await savePreviewMassal(st);
+
+  const sisa = st.queue.length;
+  await reply(
+    `✅ ${idx + 1}. <b>${escapeHtml(katalog[idx].nama)}</b> dipasang.\n` +
+      (sisa > 0 ? `Sisa antrean: <b>${sisa}</b> set. Kirim foto berikutnya.` : "🎉 Antrean habis, sesi massal selesai.")
+  );
+  return true;
+}
+
 async function postNewSetToChannel(token, item) {
   try {
     const targetChannel = await getPostChannel();
@@ -12009,6 +12060,50 @@ module.exports = async function handler(req, res) {
       }
 
       // 10. ADMIN: /edit
+      // PREVIEW MASSAL: mulai / hentikan / cek sesi
+      if (/^\/previewmassal(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const replyM = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+        const subM = rawText.replace(/^\/previewmassal\s*/i, "").trim().toLowerCase();
+
+        if (subM === "stop") {
+          const st = await getPreviewMassal();
+          if (st) {
+            st.active = false;
+            await savePreviewMassal(st);
+          }
+          await replyM("⏹ Sesi preview massal dihentikan.");
+          return res.status(200).json({ ok: true });
+        }
+
+        const katalogM = await getKatalog();
+        if (subM === "status") {
+          const st = await getPreviewMassal();
+          await replyM(
+            st && st.active
+              ? `ℹ️ Sesi aktif. Sisa antrean: <b>${st.queue.length}</b> set.`
+              : "ℹ️ Tidak ada sesi preview massal yang aktif."
+          );
+          return res.status(200).json({ ok: true });
+        }
+
+        const queueM = katalogM.filter((k) => k && k.id && !k.photo_id).map((k) => String(k.id));
+        if (queueM.length === 0) {
+          await replyM("✅ Semua set sudah punya preview.");
+          return res.status(200).json({ ok: true });
+        }
+        await savePreviewMassal({ active: true, queue: queueM });
+        const pertama = katalogM.findIndex((k) => String(k.id) === queueM[0]);
+        await replyM(
+          `🖼 <b>Mode preview massal aktif.</b>\n` +
+            `Antrean: <b>${queueM.length}</b> set yang belum punya preview.\n` +
+            `Set pertama: <b>${pertama + 1}. ${escapeHtml(katalogM[pertama].nama)}</b>\n\n` +
+            `Kirim foto <b>tanpa caption</b> satu per satu, urut sesuai nomor. ` +
+            `Hentikan dengan <code>/previewmassal stop</code>.`
+        );
+        return res.status(200).json({ ok: true });
+      }
+
       // PREVIEW SET: atur, hapus, dan cek preview foto per set (admin)
       if (/^\/(setpreview|hapuspreview|cekpreview)(\s|$)/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -12024,12 +12119,10 @@ module.exports = async function handler(req, res) {
             `✅ Punya preview: <b>${katalogP.length - tanpa.length}</b>\n` +
             `❌ Belum ada: <b>${tanpa.length}</b> dari ${katalogP.length} set\n\n`;
           if (tanpa.length > 0) {
-            t += tanpa.slice(0, 40).map((x) => `${x.no}. ${escapeHtml(x.k.nama)}`).join("\n");
-            if (tanpa.length > 40) t += `\n…dan ${tanpa.length - 40} lainnya`;
-            t += "\n\n";
+            t += "<b>Belum punya preview:</b>\n" + tanpa.map((x) => `${x.no}. ${escapeHtml(x.k.nama)}`).join("\n") + "\n\n";
           }
           t += "Cek satu set: <code>/cekpreview NO</code>\nAtur preview: kirim foto dengan caption <code>/setpreview NO</code>";
-          await replyP(t);
+          await sendLongText(token, chatId, t);
           return res.status(200).json({ ok: true });
         }
 
@@ -12692,6 +12785,13 @@ module.exports = async function handler(req, res) {
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
+      }
+
+      // PREVIEW MASSAL: foto admin tanpa caption saat sesi aktif
+      if (isAdmin && msg.photo && msg.photo.length > 0 && !rawText) {
+        if (await handlePreviewMassalPhoto(token, msg)) {
+          return res.status(200).json({ ok: true });
+        }
       }
 
       // 12A. SCREENSHOT REFERRAL APLIKASI (hanya saat user sedang di langkah 3)
