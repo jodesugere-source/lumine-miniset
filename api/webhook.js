@@ -8713,13 +8713,37 @@ async function handlePreviewMassalPhoto(token, msg) {
 
   katalog[idx].photo_id = msg.photo[msg.photo.length - 1].file_id;
   await saveKatalog(katalog);
-  if (st.queue.length === 0) st.active = false;
+  // Checklist: catat yang sudah dipasang di sesi ini
+  st.done = Array.isArray(st.done) ? st.done : [];
+  st.done.push(`${idx + 1}. ${katalog[idx].nama}`);
+  if (st.done.length > 50) st.done = st.done.slice(-50);
+
+  // Set berikutnya yang belum punya preview
+  let nextIdx = -1;
+  for (const id of st.queue) {
+    const i = katalog.findIndex((k) => String(k.id) === String(id));
+    if (i !== -1 && !katalog[i].photo_id) {
+      nextIdx = i;
+      break;
+    }
+  }
+  if (nextIdx === -1) st.active = false;
   await savePreviewMassal(st);
 
-  const sisa = st.queue.length;
+  const checklist = st.done
+    .slice(-5)
+    .map((d) => `✅ ${escapeHtml(d)}`)
+    .join("\n");
+  const bawah =
+    nextIdx !== -1
+      ? `⏭ Berikutnya: <b>${nextIdx + 1}. ${escapeHtml(katalog[nextIdx].nama)}</b>\n` +
+        `Sisa antrean: <b>${st.queue.length}</b> set. Kirim foto berikutnya.`
+      : "🎉 Semua set sudah dipasangi preview. Sesi massal selesai.";
   await reply(
-    `✅ ${idx + 1}. <b>${escapeHtml(katalog[idx].nama)}</b> dipasang.\n` +
-      (sisa > 0 ? `Sisa antrean: <b>${sisa}</b> set. Kirim foto berikutnya.` : "🎉 Antrean habis, sesi massal selesai.")
+    `📋 <b>Checklist sesi ini</b> (${st.done.length} terpasang)\n` +
+      checklist +
+      `\n\n` +
+      bawah
   );
   return true;
 }
