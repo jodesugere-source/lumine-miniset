@@ -9148,12 +9148,11 @@ function extractBackupPairs(m, katalog, botUname) {
       const li = lines.findIndex((x) => l.start >= x.start && l.start <= x.end);
       if (li >= 0) {
         cands.push(stripUrl(lines[li].text));
-        if (!normCore(stripUrl(lines[li].text))) {
-          for (let pj = li - 1; pj >= 0; pj--) {
-            if (normCore(lines[pj].text)) {
-              cands.push(lines[pj].text);
-              break;
-            }
+        // nama set bisa ada di baris di atas (mis. "Nama Set" lalu "Link : https://...")
+        for (let pj = li - 1; pj >= 0; pj--) {
+          if (normCore(lines[pj].text)) {
+            cands.push(lines[pj].text);
+            break;
           }
         }
       }
