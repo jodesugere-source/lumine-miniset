@@ -4,6 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#6366f1">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Admin">
 <title>Dashboard Admin</title>
 <style>
   :root {
@@ -174,7 +179,7 @@
     </div>
 
     <div class="stats">
-      <div class="stat"><div class="icon">💰</div><div class="label">Omset hari ini</div><div class="value skel" id="sOmsetToday">&nbsp;</div></div>
+      <div class="stat"><div class="icon">💰</div><div class="label">Omset hari ini</div><div class="value skel" id="sOmsetToday">&nbsp;</div><div class="hint" id="sOmsetDiff"></div></div>
       <div class="stat"><div class="icon">🧾</div><div class="label">Order hari ini</div><div class="value skel" id="sOrderToday">&nbsp;</div></div>
       <div class="stat"><div class="icon">📈</div><div class="label">Total omset</div><div class="value skel" id="sOmsetTotal">&nbsp;</div></div>
       <div class="stat"><div class="icon">🛒</div><div class="label">Total order</div><div class="value skel" id="sOrderTotal">&nbsp;</div></div>
@@ -252,6 +257,17 @@ async function load() {
 
   const s = d.summary;
   setStat("sOmsetToday", rp(s.omset_today));
+  // Bandingkan dengan kemarin (dari data 7 hari yang sudah ada)
+  const yest = d.chart.length >= 2 ? d.chart[d.chart.length - 2].rupiah : 0;
+  const diffEl = $("sOmsetDiff");
+  if (!yest) {
+    diffEl.textContent = "Kemarin belum ada omset";
+  } else {
+    const pct = Math.round(((s.omset_today - yest) / yest) * 100);
+    const arrow = pct >= 0 ? "▲" : "▼";
+    diffEl.style.color = pct >= 0 ? "var(--good)" : "var(--bad)";
+    diffEl.textContent = arrow + " " + Math.abs(pct) + "% dari kemarin";
+  }
   setStat("sOrderToday", s.order_today + " order");
   setStat("sOmsetTotal", rp(s.omset_total));
   setStat("sOrderTotal", s.order_total + " order");
@@ -298,6 +314,10 @@ $("refreshBtn").onclick = load;
 $("logoutBtn").onclick = () => showLogin();
 
 load();
+// Auto-refresh tiap 60 detik (hanya saat sudah login dan tab terlihat)
+setInterval(() => {
+  if (!document.hidden && !$("dashView").classList.contains("hidden")) load();
+}, 60000);
 </script>
 </body>
 </html>
