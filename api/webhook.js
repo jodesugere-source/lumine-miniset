@@ -1329,7 +1329,7 @@ function formatRupiah(angka) {
 
 function getTierBadge(totalPurchases) {
   const n = Number(totalPurchases) || 0;
-  if (n >= 7) return "👑 Sultan Lumine";
+  if (n >= 7) return "💎 VIP Member";
   if (n >= 4) return "💎 VIP Member";
   if (n >= 2) return "🔥 Collector";
   if (n >= 1) return "🌱 Newbie";
@@ -1493,6 +1493,12 @@ async function recordPurchaseToLeaderboard(order) {
   const displayName = order.buyer_name || "Pembeli";
   const pertamaKali = Number(await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, memberId])) === 0;
   if (pertamaKali) kirimSelamatDatang(memberId).catch((e) => console.error("Selamat datang error:", e));
+  await catatPembelianSultan(memberId, nominal, String(order.order_id || order.id || Date.now()));
+  const sultanSekarang = await statusSultan(memberId);
+  if (sultanSekarang.lolos) {
+    const dapat = await redisCommand(["SET", `${REDIS_SULTAN_REWARD_PREFIX}${memberId}`, "1", "NX", "EX", String(SULTAN_PERIODE_DETIK)]);
+    if (dapat === "OK") await beriVoucherSultan(memberId).catch((e) => console.error("Voucher sultan error:", e));
+  }
 
   const kDayRp = `${REDIS_LB_PREFIX}day_rp_${dayKey}`;
   const kDayCnt = `${REDIS_LB_PREFIX}day_cnt_${dayKey}`;
@@ -1574,7 +1580,8 @@ async function buildLeaderboardPayload(period, viewerId) {
       const buyCount = parseInt((Array.isArray(counts) && counts[idx]) || "1", 10) || 1;
       const lifetimeCount =
         parseInt((Array.isArray(allCounts) && allCounts[idx]) || String(buyCount), 10) || buyCount;
-      const tier = getTierBadge(lifetimeCount);
+      const sultanList = await statusSultan(userIds[idx]);
+      const tier = sultanList.lolos ? "👑 Sultan Lumine+" : getTierBadge(lifetimeCount);
       listLines += `│ ${rankBadge} <b>${escapeHtml(rawName)}</b> [${tier}]\n│     └ ${buyCount}x beli (<code>${formatRupiah(totals[idx])}</code>)\n`;
     }
   }
@@ -2139,7 +2146,10 @@ async function resolveBestDiscount(userId, itemId, baseNominal) {
   let voucher = null;
   const activeVoucher = await getActiveUserVoucher(userId);
   if (activeVoucher) {
-    voucherDisc = Math.min(Number(activeVoucher.discount) || 0, maxCut);
+    const pctV = Number(activeVoucher.percent) || 0;
+    voucherDisc = pctV > 0
+      ? Math.min(Math.floor((baseNominal * pctV) / 100), Number(activeVoucher.discount) || Infinity, maxCut)
+      : Math.min(Number(activeVoucher.discount) || 0, maxCut);
     if (voucherDisc > 0) voucher = activeVoucher;
   }
 
@@ -10598,6 +10608,58 @@ async function kirimSelamatDatang(uid) {
       "🔗 Link isi produk Drive harus dibuka <b>Siapa saja yang memiliki link</b>.\n\n" +
       "Ketik pertanyaanmu di sini, bot bantu jawab yang umum.",
   });
+}
+
+// ---- SULTAN LUMINE+ (12 pembelian & Rp 300.000 dalam 90 hari) ----
+const REDIS_SULTAN_PREFIX = "lumine_main_sultan_"; // ZSET pembelian per user (skor = waktu)
+const REDIS_SULTAN_REWARD_PREFIX = "lumine_main_sultan_reward_"; // 1 hadiah per periode 90 hari
+const SULTAN_PERIODE_DETIK = 90 * 24 * 3600;
+const SULTAN_MIN_BELI = 12;
+const SULTAN_MIN_RP = 300000;
+const SULTAN_VOUCHER_PERSEN = 20;
+const SULTAN_VOUCHER_MAKS = 10000;
+
+async function catatPembelianSultan(uid, nominal, orderId) {
+  const key = `${REDIS_SULTAN_PREFIX}${uid}`;
+  const now = Math.floor(Date.now() / 1000);
+  await redisCommand(["ZADD", key, String(now), `${nominal}|${orderId}`]);
+  await redisCommand(["ZREMRANGEBYSCORE", key, "-inf", String(now - SULTAN_PERIODE_DETIK)]);
+  await redisCommand(["EXPIRE", key, String(SULTAN_PERIODE_DETIK * 2)]);
+}
+
+async function statusSultan(uid) {
+  const now = Math.floor(Date.now() / 1000);
+  const raw = await redisCommand(["ZRANGEBYSCORE", `${REDIS_SULTAN_PREFIX}${uid}`, String(now - SULTAN_PERIODE_DETIK), "+inf"]);
+  const list = Array.isArray(raw) ? raw : [];
+  const count = list.length;
+  const rp = list.reduce((a, m) => a + (Number(String(m).split("|")[0]) || 0), 0);
+  return { count, rp, lolos: count >= SULTAN_MIN_BELI && rp >= SULTAN_MIN_RP };
+}
+
+async function beriVoucherSultan(uid) {
+  const kode = `SULTAN${uid}${Date.now().toString(36).toUpperCase()}`;
+  const vm = await getVouchers();
+  vm[kode] = {
+    code: kode,
+    discount: SULTAN_VOUCHER_MAKS,
+    percent: SULTAN_VOUCHER_PERSEN,
+    quota: 1,
+    used_by: [],
+    source: "sultan",
+  };
+  await saveVouchers(vm);
+  await redisCommand(["SET", `${REDIS_USER_VOUCHER_PREFIX}${uid}`, kode, "EX", String(30 * 24 * 3600)]);
+  const token = process.env.BOT_TOKEN;
+  if (token) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: uid,
+      parse_mode: "HTML",
+      text:
+        `👑 <b>Kamu naik jadi Sultan Lumine+!</b>\n` +
+        `Voucher diskon ${SULTAN_VOUCHER_PERSEN}% (maks ${formatRupiah(SULTAN_VOUCHER_MAKS)}) sudah aktif buat pembelian berikutnya, berlaku 30 hari.\n` +
+        `Kode: <code>${kode}</code>`,
+    });
+  }
 }
 
 function barterLinkHost(u) {
