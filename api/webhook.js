@@ -12320,6 +12320,56 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 5C. ADMIN: /hapuslb ID_ATAU_NAMA — hapus satu akun dari klasemen (+ hitungan beli & tier)
+      if (/^\/hapuslb(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const target = rawText.replace(/^\/hapuslb\s*/i, "").trim();
+        if (!target) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: "Format: <code>/hapuslb ID</code> atau <code>/hapuslb NAMA</code>",
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        let memberId = /^\d+$/.test(target) ? target : null;
+        if (!memberId) {
+          const flat = (await redisCommand(["HGETALL", REDIS_LB_NAMES_KEY])) || [];
+          for (let i = 0; i < flat.length; i += 2) {
+            if (String(flat[i + 1] || "").trim().toLowerCase() === target.toLowerCase()) {
+              memberId = String(flat[i]);
+              break;
+            }
+          }
+        }
+        if (!memberId) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `❌ Akun "${escapeHtml(target)}" tidak ditemukan di klasemen.`,
+            parse_mode: "HTML",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const { dayKey, weekKey, monthKey } = getWibPeriods();
+        await Promise.all([
+          redisCommand(["ZREM", `${REDIS_LB_PREFIX}day_rp_${dayKey}`, memberId]),
+          redisCommand(["ZREM", `${REDIS_LB_PREFIX}day_cnt_${dayKey}`, memberId]),
+          redisCommand(["ZREM", `${REDIS_LB_PREFIX}week_rp_${weekKey}`, memberId]),
+          redisCommand(["ZREM", `${REDIS_LB_PREFIX}week_cnt_${weekKey}`, memberId]),
+          redisCommand(["ZREM", `${REDIS_LB_PREFIX}month_rp_${monthKey}`, memberId]),
+          redisCommand(["ZREM", `${REDIS_LB_PREFIX}month_cnt_${monthKey}`, memberId]),
+          redisCommand(["HDEL", REDIS_LB_ALLCNT_KEY, memberId]),
+          redisCommand(["HDEL", REDIS_LB_NAMES_KEY, memberId]),
+          redisCommand(["HDEL", REDIS_BUYER_SPEND_KEY, memberId]),
+        ]);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `✅ Akun <code>${escapeHtml(memberId)}</code> dihapus dari klasemen (termasuk hitungan beli & tier).\n<i>Riwayat order dan saldo tidak ikut berubah.</i>`,
+          parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 6. ADMIN: /resetlb
       if (rawText.startsWith("/resetlb")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
