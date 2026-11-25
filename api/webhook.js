@@ -1491,6 +1491,8 @@ async function recordPurchaseToLeaderboard(order) {
   const memberId = String(order.buyer_id);
   const nominal = Number(order.final_base_nominal || order.base_nominal) || 2000;
   const displayName = order.buyer_name || "Pembeli";
+  const pertamaKali = Number(await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, memberId])) === 0;
+  if (pertamaKali) kirimSelamatDatang(memberId).catch((e) => console.error("Selamat datang error:", e));
 
   const kDayRp = `${REDIS_LB_PREFIX}day_rp_${dayKey}`;
   const kDayCnt = `${REDIS_LB_PREFIX}day_cnt_${dayKey}`;
@@ -10531,6 +10533,73 @@ async function cekMd5Barter(uid, md5s) {
   return null;
 }
 
+// ---- JAM BUKA TOKO, BALASAN OTOMATIS, SELAMAT DATANG ----
+// Jadwal default (WIB): Sen-Jum 09.00-21.00, Sab-Min 10.00-17.00
+const REDIS_TOKO_STATUS_KEY = "lumine_main_toko_status"; // "offline" = paksa tutup, "online" = paksa buka, kosong = ikut jadwal
+const REDIS_TOKO_NOTICE_PREFIX = "lumine_main_toko_notice_"; // anti-spam: 1 balasan per 30 menit per user
+
+function jadwalBuka(hari) {
+  return hari >= 1 && hari <= 5 ? { buka: 9, tutup: 21 } : { buka: 10, tutup: 17 };
+}
+
+async function statusToko() {
+  const paksa = await redisCommand(["GET", REDIS_TOKO_STATUS_KEY]);
+  const wib = new Date(Date.now() + 7 * 3600 * 1000);
+  const hari = wib.getUTCDay();
+  const jam = wib.getUTCHours() + wib.getUTCMinutes() / 60;
+  const j = jadwalBuka(hari);
+  if (paksa === "offline") return { buka: false, paksa: true, hari, jam };
+  if (paksa === "online") return { buka: true, paksa: true, hari, jam };
+  return { buka: jam >= j.buka && jam < j.tutup, paksa: false, hari, jam };
+}
+
+function teksJamBuka(st) {
+  const j = jadwalBuka(st.hari);
+  if (!st.paksa && st.jam < j.buka) return `hari ini jam ${String(j.buka).padStart(2, "0")}.00 WIB`;
+  const besok = jadwalBuka((st.hari + 1) % 7).buka;
+  return `besok jam ${String(besok).padStart(2, "0")}.00 WIB`;
+}
+
+async function pesanJamToko() {
+  const st = await statusToko();
+  if (st.buka) return "";
+  return `\n\n🌙 Admin lagi offline. Biasanya bales lagi ${teksJamBuka(st)}. Pengajuanmu tetap masuk antrean, gak akan hilang.`;
+}
+
+// Jawaban singkat untuk pertanyaan umum. Cuma hal yang pasti ada di bot.
+const FAQ_TOKO = [
+  { kata: /\b(bayar|pembayaran|qris)\b/i, jawab: "💳 Pembayaran dilakukan lewat QRIS dari tombol beli di menu." },
+  { kata: /\b(barter|tukar)\b/i, jawab: "🔁 Ketik /barter untuk nukar produk di koleksimu ke admin. Link isi harus Google Drive yang publik." },
+  { kata: /\b(koleksi|produk saya)\b/i, jawab: "🎒 Produk yang udah kamu beli ada di menu 🎒 Koleksi Saya." },
+];
+
+async function balasOtomatisToko(token, chatId, uid, rawText) {
+  const faq = FAQ_TOKO.find((f) => f.kata.test(rawText));
+  const st = await statusToko();
+  if (st.buka && !faq) return; // buka dan bukan pertanyaan umum: diam, admin yang bales
+  const kunci = `${REDIS_TOKO_NOTICE_PREFIX}${uid}`;
+  if ((await redisCommand(["SET", kunci, "1", "NX", "EX", "1800"])) !== "OK") return;
+  const bagian = [];
+  if (!st.buka) bagian.push(`🌙 Admin lagi offline. Biasanya bales lagi ${teksJamBuka(st)}.`);
+  if (faq) bagian.push(faq.jawab);
+  await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: bagian.join("\n\n") });
+}
+
+async function kirimSelamatDatang(uid) {
+  const token = process.env.BOT_TOKEN;
+  if (!token) return;
+  await tgRequest(token, "sendMessage", {
+    chat_id: uid,
+    parse_mode: "HTML",
+    text:
+      "👋 <b>Selamat datang di Lumine!</b>\n\n" +
+      "🎒 <b>Koleksi Saya</b> nyimpen semua produk yang udah kamu beli.\n" +
+      "🔁 Ketik <code>/barter</code> buat nukar produk koleksimu ke admin.\n" +
+      "🔗 Link isi produk Drive harus dibuka <b>Siapa saja yang memiliki link</b>.\n\n" +
+      "Ketik pertanyaanmu di sini, bot bantu jawab yang umum.",
+  });
+}
+
 function barterLinkHost(u) {
   try { return new URL(String(u)).hostname.replace(/^www\./, ""); } catch { return "?"; }
 }
@@ -10637,6 +10706,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
     md5s: md5List,
     status: "menunggu_acc",
   };
+  const catatanToko = await pesanJamToko();
   for (const m of md5List) await redisCommand(["SET", `${REDIS_BARTER_MD5_PREFIX}${m}`, String(uid), "EX", "15552000"]);
   await redisCommand(["SET", `${REDIS_BARTER_PEND_PREFIX}${uid}`, "1", "EX", "259200"]);
   await redisCommand(["SET", `${REDIS_BARTER_LAST_PREFIX}${uid}`, "1", "EX", "86400"]);
@@ -10644,7 +10714,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
   await barterLog(b, "menunggu");
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
-    text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.`,
+    text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.${catatanToko}`,
   });
   const adminId = await getNotifyAdminId();
   if (adminId) {
@@ -12109,6 +12179,14 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
       }
+      // BALASAN OTOMATIS: chat pribadi dari user (bukan admin, bukan perintah)
+      if (msg.chat && msg.chat.type === "private" && !isAdmin && rawText && !rawText.startsWith("/")) {
+        try {
+          await balasOtomatisToko(token, msg.chat.id, String(msg.from.id), rawText);
+        } catch (e) {
+          console.error("Balasan toko error:", e);
+        }
+      }
       const lowerText = rawText.toLowerCase();
 
       // Catat setiap perintah admin, lalu tampilkan log bila diminta
@@ -12980,6 +13058,24 @@ module.exports = async function handler(req, res) {
             info +
             `📌 <b>Barang yang dibutuhkan admin</b>\n${daftar}\n\n` +
             `Perintah:\n<code>/butuh tambah NAMA</code>\n<code>/butuh hapus NAMA</code>\n<code>/butuh kosong</code>`,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0E00. ADMIN: /offline, /online, /jadwal (atur status buka toko)
+      if (/^\/(offline|online|jadwal)(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        if (!msg.chat || msg.chat.type !== "private") return res.status(200).json({ ok: true });
+        const aksi = rawText.trim().split(/\s+/)[0].slice(1).toLowerCase();
+        if (aksi === "offline") await redisCommand(["SET", REDIS_TOKO_STATUS_KEY, "offline"]);
+        else if (aksi === "online") await redisCommand(["SET", REDIS_TOKO_STATUS_KEY, "online"]);
+        else await redisCommand(["DEL", REDIS_TOKO_STATUS_KEY]);
+        const st = await statusToko();
+        const label = aksi === "jadwal" ? "ikut jadwal" : `paksa ${aksi}`;
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: `${st.buka ? "🟢 Toko <b>buka</b>" : "🔴 Toko <b>tutup</b>"} (${label}).\n\nJadwal default: Sen-Jum 09.00-21.00 WIB, Sab-Min 10.00-17.00 WIB.`,
         });
         return res.status(200).json({ ok: true });
       }
