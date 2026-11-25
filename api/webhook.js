@@ -2302,6 +2302,11 @@ async function processAccOrder(token, order) {
     console.error("Tiket undian error:", utErr);
   }
   try {
+    await trackCommunityTarget(token, order);
+  } catch (tgErr) {
+    console.error("Target komunitas error:", tgErr);
+  }
+  try {
     await sendTestiReminder(token, order.buyer_id);
   } catch (tiErr) {
     console.error("Pengingat testimoni error:", tiErr);
@@ -9615,6 +9620,81 @@ async function sendItemDetailView(token, chatId, callerId, itemId) {
   }
 }
 
+// ---- TARGET KOMUNITAS (hadiah saldo untuk setiap pembeli unik) ----
+const REDIS_TARGET_KEY = "lumine_main_target"; // JSON: {target, hadiah, end_ts, status, count, channel_id, pinned_msg_id}
+const REDIS_TARGET_BUYERS_KEY = "lumine_main_target_buyers"; // HASH: id pembeli -> 1 (dihitung sekali per pembeli)
+const REDIS_TARGET_LOCK_KEY = "lumine_main_target_lock"; // kunci hadiah, anti dobel
+
+async function getTarget() {
+  const raw = await redisCommand(["GET", REDIS_TARGET_KEY]);
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function saveTarget(t) {
+  await redisCommand(["SET", REDIS_TARGET_KEY, JSON.stringify(t)]);
+}
+
+async function refreshTargetMessage(token, t) {
+  const filled = Math.min(10, Math.floor((t.count / t.target) * 10));
+  const bar = "▓".repeat(filled) + "░".repeat(10 - filled);
+  const text =
+    `🎯 <b>TARGET KOMUNITAS</b>\n` +
+    `${bar} ${t.count}/${t.target} pembeli\n` +
+    `Hadiah: saldo ${formatRupiah(t.hadiah)} untuk semua pembeli!`;
+  if (t.pinned_msg_id) {
+    const r = await tgRequest(token, "editMessageText", {
+      chat_id: t.channel_id,
+      message_id: t.pinned_msg_id,
+      text,
+      parse_mode: "HTML",
+    });
+    if (r && r.ok) return;
+  }
+  const sent = await tgRequest(token, "sendMessage", { chat_id: t.channel_id, text, parse_mode: "HTML" });
+  if (sent && sent.ok) {
+    t.pinned_msg_id = sent.result.message_id;
+    await tgRequest(token, "pinChatMessage", { chat_id: t.channel_id, message_id: t.pinned_msg_id });
+    await saveTarget(t);
+  }
+}
+
+async function completeCommunityTarget(token, t) {
+  const lock = await redisCommand(["SET", REDIS_TARGET_LOCK_KEY, "1", "NX", "EX", "604800"]);
+  if (lock !== "OK") return; // hadiah sudah pernah diberikan
+  t.status = "tercapai";
+  await saveTarget(t);
+  const buyers = (await redisCommand(["HKEYS", REDIS_TARGET_BUYERS_KEY])) || [];
+  for (const uid of buyers) {
+    try {
+      await addUserSaldo(uid, t.hadiah, "gratis");
+    } catch (e) {
+      console.error("Hadiah target error:", uid, e);
+    }
+  }
+  await tgRequest(token, "sendMessage", {
+    chat_id: t.channel_id,
+    parse_mode: "HTML",
+    text:
+      `🎉 <b>TARGET TERCAPAI!</b>\n` +
+      `Semua ${buyers.length} pembeli dapat saldo <b>${formatRupiah(t.hadiah)}</b>. Terima kasih!`,
+  });
+}
+
+async function trackCommunityTarget(token, order) {
+  if (order.is_deposit) return; // isi saldo bukan pembelian produk
+  const t = await getTarget();
+  if (!t || t.status !== "aktif" || Date.now() > t.end_ts) return;
+
+  // HSETNX: 1 = pembeli baru di periode ini, 0 = sudah pernah dihitung
+  const isNew = Number(await redisCommand(["HSETNX", REDIS_TARGET_BUYERS_KEY, String(order.buyer_id), "1"]));
+  if (isNew !== 1) return;
+
+  t.count = Number(await redisCommand(["HLEN", REDIS_TARGET_BUYERS_KEY])) || 0;
+  await saveTarget(t);
+  if (t.count % 10 === 0 || t.count >= t.target) await refreshTargetMessage(token, t);
+  if (t.count >= t.target) await completeCommunityTarget(token, t);
+}
+
 module.exports = async function handler(req, res) {
   const token = process.env.BOT_TOKEN;
 
@@ -11597,6 +11677,61 @@ module.exports = async function handler(req, res) {
 
       if (rawText.startsWith("/saldo")) {
         await sendSaldoMenu(token, chatId, senderId);
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0B. ADMIN: /target & /targetstop (TARGET KOMUNITAS)
+      if (/^\/targetstop(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const t = await getTarget();
+        if (t && t.status === "aktif") {
+          t.status = "dibatalkan";
+          await saveTarget(t);
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "🛑 Target komunitas dibatalkan.", parse_mode: "HTML" });
+        } else {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Tidak ada target yang sedang berjalan." });
+        }
+        return res.status(200).json({ ok: true });
+      }
+
+      if (/^\/target(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        if (!msg.chat || msg.chat.type !== "private") return res.status(200).json({ ok: true });
+        const args = rawText.trim().split(/\s+/).slice(1);
+        const jumlah = parseInt(args[0], 10);
+        const hadiah = parseInt(args[1], 10);
+        const hari = parseInt(args[2], 10);
+        if (!jumlah || !hadiah || !hari || jumlah < 1 || hadiah < 1 || hari < 1) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            parse_mode: "HTML",
+            text: "Format: <code>/target JUMLAH_PEMBELI HADIAH_RP HARI</code>\nContoh: <code>/target 200 10000 7</code>",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const channelId = await getPostChannel();
+        if (!channelId) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Channel posting belum diatur. Atur dulu lewat menu admin." });
+          return res.status(200).json({ ok: true });
+        }
+        const t = {
+          target: jumlah,
+          hadiah,
+          end_ts: Date.now() + hari * 86400000,
+          status: "aktif",
+          count: 0,
+          channel_id: channelId,
+          pinned_msg_id: null,
+        };
+        await redisCommand(["DEL", REDIS_TARGET_BUYERS_KEY]);
+        await redisCommand(["DEL", REDIS_TARGET_LOCK_KEY]);
+        await saveTarget(t);
+        await refreshTargetMessage(token, t);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: `✅ Target komunitas dibuat: <b>${jumlah} pembeli</b>, hadiah <b>${formatRupiah(hadiah)}</b> per pembeli, berlaku <b>${hari} hari</b>.`,
+        });
         return res.status(200).json({ ok: true });
       }
 
