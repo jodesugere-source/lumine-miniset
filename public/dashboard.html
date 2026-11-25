@@ -12,141 +12,129 @@
 <title>Dashboard Admin</title>
 <style>
   :root {
-    --bg: #f4f5fb;
-    --card: #ffffff;
-    --text: #161a2b;
-    --muted: #6b7280;
-    --line: #e7e9f3;
-    --accent: #6366f1;
-    --accent2: #a855f7;
-    --good: #10b981;
-    --warn: #f59e0b;
-    --bad: #ef4444;
-    --shadow: 0 1px 2px rgba(16,24,40,.04), 0 8px 24px rgba(16,24,40,.06);
+    --bg: #eef0ff;
+    --card: rgba(255,255,255,.86);
+    --text: #141829;
+    --muted: #6b7290;
+    --line: rgba(99,102,241,.12);
+    --a1: #6366f1; --a2: #a855f7; --a3: #ec4899;
+    --good: #059669; --bad: #dc2626; --warn: #d97706;
+    --shadow: 0 10px 30px -12px rgba(79,70,229,.25);
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #0b0d14;
-      --card: #141824;
-      --text: #e9ecf6;
-      --muted: #8b93a7;
-      --line: #20263a;
-      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
+      --bg: #0a0c18;
+      --card: rgba(22,26,46,.85);
+      --text: #eceefe;
+      --muted: #97a0c4;
+      --line: rgba(129,140,248,.16);
+      --good: #34d399; --bad: #f87171; --warn: #fbbf24;
+      --shadow: 0 10px 30px -12px rgba(0,0,0,.6);
     }
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; }
   body {
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    -webkit-font-smoothing: antialiased;
+    color: var(--text); min-height: 100vh; -webkit-font-smoothing: antialiased;
+    background:
+      radial-gradient(900px 500px at -10% -10%, rgba(168,85,247,.22), transparent 60%),
+      radial-gradient(800px 500px at 110% 0%, rgba(99,102,241,.22), transparent 60%),
+      radial-gradient(700px 500px at 50% 120%, rgba(236,72,153,.14), transparent 60%),
+      var(--bg);
+    background-attachment: fixed;
   }
-  .wrap { max-width: 1040px; margin: 0 auto; padding: 20px 16px 40px; }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 18px 14px 40px; }
 
   /* Header */
-  .header {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    color: #fff; border-radius: 18px; padding: 18px 20px; box-shadow: var(--shadow);
-    margin-bottom: 18px;
-  }
-  .header h1 { font-size: 20px; margin: 0; font-weight: 700; }
-  .header .sub { font-size: 12.5px; opacity: .85; margin-top: 3px; }
+  .top { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo { width: 44px; height: 44px; border-radius: 14px; display: grid; place-items: center; font-size: 22px;
+          background: linear-gradient(135deg, var(--a1), var(--a2), var(--a3)); box-shadow: var(--shadow); }
+  .brand h1 { font-size: 19px; margin: 0; font-weight: 800; letter-spacing: -.01em; }
+  .brand .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
   .actions { display: flex; gap: 8px; }
-  .btn {
-    border: 0; border-radius: 10px; padding: 9px 14px; font-size: 13px; font-weight: 600;
-    cursor: pointer; background: rgba(255,255,255,.18); color: #fff; transition: background .15s;
-  }
-  .btn:hover { background: rgba(255,255,255,.28); }
-  .btn:active { transform: scale(.98); }
+  .btn { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 12px;
+         padding: 9px 14px; font-size: 13px; font-weight: 600; cursor: pointer; backdrop-filter: blur(8px); }
+  .btn:active { transform: scale(.97); }
 
-  /* Stat cards */
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 18px; }
-  .stat {
-    background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px;
-    box-shadow: var(--shadow); position: relative; overflow: hidden;
+  /* Hero */
+  .hero {
+    border-radius: 22px; padding: 22px; color: #fff; margin-bottom: 14px; box-shadow: var(--shadow);
+    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 50%, #db2777 100%); position: relative; overflow: hidden;
   }
-  .stat .icon {
-    width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center;
-    font-size: 18px; background: color-mix(in srgb, var(--accent) 14%, transparent);
-  }
-  .stat .label { color: var(--muted); font-size: 12.5px; margin-top: 10px; }
-  .stat .value { font-size: 21px; font-weight: 700; margin-top: 3px; letter-spacing: -.01em; }
-  .stat .hint { color: var(--muted); font-size: 11.5px; margin-top: 4px; }
+  .hero::after { content: ""; position: absolute; right: -40px; top: -40px; width: 180px; height: 180px; border-radius: 50%;
+                 background: rgba(255,255,255,.12); }
+  .hero .k { font-size: 12.5px; opacity: .85; letter-spacing: .04em; text-transform: uppercase; }
+  .hero .v { font-size: 34px; font-weight: 800; margin-top: 6px; letter-spacing: -.02em; }
+  .hero .meta { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; font-size: 13px; }
+  .chip { background: rgba(255,255,255,.18); border-radius: 999px; padding: 4px 11px; font-weight: 600; }
 
-  /* Section card */
-  .card {
-    background: var(--card); border: 1px solid var(--line); border-radius: 16px;
-    padding: 18px; box-shadow: var(--shadow); margin-bottom: 18px;
-  }
+  /* Stats */
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 18px; padding: 16px; box-shadow: var(--shadow); backdrop-filter: blur(10px); }
+  .stat .ic { width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center; font-size: 18px; }
+  .stat .label { color: var(--muted); font-size: 12.5px; margin-top: 12px; }
+  .stat .value { font-size: 20px; font-weight: 800; margin-top: 3px; letter-spacing: -.01em; }
+  .c1 { background: rgba(99,102,241,.16); }
+  .c2 { background: rgba(168,85,247,.16); }
+  .c3 { background: rgba(236,72,153,.16); }
+  .c4 { background: rgba(16,185,129,.16); }
+  .c5 { background: rgba(245,158,11,.16); }
+
+  /* Card */
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 18px; box-shadow: var(--shadow);
+          backdrop-filter: blur(10px); margin-bottom: 14px; }
   .card-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; gap: 8px; flex-wrap: wrap; }
-  .card-head h2 { font-size: 15px; margin: 0; font-weight: 700; }
-  .pill {
-    font-size: 11.5px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 3px 10px;
-  }
+  .card-head h2 { font-size: 15px; margin: 0; font-weight: 800; }
+  .pill { font-size: 11.5px; font-weight: 600; color: var(--a1); background: rgba(99,102,241,.12); border-radius: 999px; padding: 4px 11px; }
 
   /* Chart */
-  .chart { display: flex; align-items: flex-end; gap: 10px; height: 190px; padding-top: 8px; }
-  .col { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; min-width: 0; }
+  .chart { display: flex; align-items: flex-end; gap: 10px; height: 200px; }
+  .col { flex: 1; height: 100%; min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; }
   .bar-wrap { width: 100%; flex: 1; display: flex; align-items: flex-end; }
-  .bar {
-    width: 100%; min-height: 4px; border-radius: 8px 8px 4px 4px;
-    background: linear-gradient(180deg, var(--accent2), var(--accent));
-    transition: height .5s cubic-bezier(.2,.8,.2,1);
-  }
-  .col.today .bar { box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent); }
-  .bv { font-size: 11px; color: var(--muted); margin-bottom: 6px; white-space: nowrap; }
+  .bar { width: 100%; min-height: 6px; border-radius: 10px 10px 5px 5px;
+         background: linear-gradient(180deg, var(--a2), var(--a1)); transition: height .6s cubic-bezier(.2,.8,.2,1); }
+  .col.today .bar { background: linear-gradient(180deg, var(--a3), var(--a2)); box-shadow: 0 8px 18px -6px rgba(236,72,153,.6); }
+  .bv { font-size: 11px; font-weight: 700; color: var(--muted); margin-bottom: 6px; white-space: nowrap; }
   .bl { font-size: 11px; color: var(--muted); margin-top: 8px; }
-  .col.today .bl { color: var(--text); font-weight: 700; }
+  .col.today .bl { color: var(--text); font-weight: 800; }
 
   /* Table */
-  .table-wrap { overflow-x: auto; margin: 0 -4px; }
+  .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 13.5px; min-width: 520px; }
-  th, td { text-align: left; padding: 11px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-  td.num { font-variant-numeric: tabular-nums; }
-  .tag {
-    display: inline-block; font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
-    background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn);
-  }
-  .empty { text-align: center; color: var(--muted); padding: 28px 8px; font-size: 13.5px; }
+  th, td { text-align: left; padding: 12px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 700; font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; }
+  td.num { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tag { font-size: 11.5px; font-weight: 700; padding: 4px 10px; border-radius: 999px; background: rgba(217,119,6,.15); color: var(--warn); }
+  .empty { text-align: center; padding: 30px 10px; color: var(--muted); font-size: 14px; }
+  .empty .big { font-size: 34px; margin-bottom: 6px; }
 
   /* Skeleton */
-  .skel { background: linear-gradient(90deg, var(--line) 25%, transparent 50%, var(--line) 75%); background-size: 200% 100%; animation: sh 1.2s infinite; border-radius: 8px; }
+  .skel { color: transparent !important; background: linear-gradient(90deg, rgba(128,128,160,.15) 25%, rgba(128,128,160,.05) 50%, rgba(128,128,160,.15) 75%);
+          background-size: 200% 100%; animation: sh 1.2s infinite; border-radius: 8px; }
   @keyframes sh { to { background-position: -200% 0; } }
 
   /* Login */
   .login-wrap { min-height: 80vh; display: grid; place-items: center; }
-  .login {
-    width: 100%; max-width: 360px; background: var(--card); border: 1px solid var(--line);
-    border-radius: 18px; padding: 26px; box-shadow: var(--shadow); text-align: center;
-  }
-  .login .logo {
-    width: 52px; height: 52px; margin: 0 auto 12px; border-radius: 16px; display: grid; place-items: center;
-    background: linear-gradient(135deg, var(--accent), var(--accent2)); font-size: 24px;
-  }
-  .login h1 { font-size: 18px; margin: 0; }
+  .login { width: 100%; max-width: 360px; background: var(--card); border: 1px solid var(--line); border-radius: 24px; padding: 28px; box-shadow: var(--shadow); text-align: center; backdrop-filter: blur(10px); }
+  .login .logo { margin: 0 auto 14px; width: 60px; height: 60px; font-size: 28px; border-radius: 20px; }
+  .login h1 { font-size: 19px; margin: 0; }
   .login p { color: var(--muted); font-size: 13px; margin: 6px 0 18px; }
-  input {
-    width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line);
-    background: var(--bg); color: var(--text); font-size: 15px; outline: none;
-  }
-  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
-  .btn-primary {
-    width: 100%; margin-top: 10px; padding: 12px; border: 0; border-radius: 12px; cursor: pointer;
-    background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; font-size: 15px; font-weight: 600;
-  }
+  input { width: 100%; padding: 13px 14px; border-radius: 14px; border: 1px solid var(--line); background: rgba(128,128,160,.08);
+          color: var(--text); font-size: 15px; outline: none; }
+  input:focus { border-color: var(--a1); box-shadow: 0 0 0 4px rgba(99,102,241,.2); }
+  .btn-primary { width: 100%; margin-top: 12px; padding: 13px; border: 0; border-radius: 14px; cursor: pointer; color: #fff; font-size: 15px; font-weight: 700;
+                 background: linear-gradient(135deg, var(--a1), var(--a2), var(--a3)); box-shadow: var(--shadow); }
   .err { color: var(--bad); font-size: 13px; min-height: 18px; margin-top: 10px; }
 
   .hidden { display: none !important; }
   .footer { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 8px; }
 
   @media (max-width: 480px) {
-    .wrap { padding: 14px 12px 30px; }
-    .stat .value { font-size: 18px; }
-    .chart { height: 160px; gap: 6px; }
+    .hero .v { font-size: 28px; }
+    .stat .value { font-size: 17px; }
+    .chart { height: 170px; gap: 6px; }
   }
 </style>
 </head>
@@ -167,10 +155,13 @@
 
   <!-- DASHBOARD -->
   <div id="dashView" class="hidden">
-    <div class="header">
-      <div>
-        <h1>📊 Dashboard Admin</h1>
-        <div class="sub" id="updated">Memuat data...</div>
+    <div class="top">
+      <div class="brand">
+        <div class="logo">📊</div>
+        <div>
+          <h1>Dashboard Admin</h1>
+          <div class="sub" id="updated">Memuat data...</div>
+        </div>
       </div>
       <div class="actions">
         <button id="refreshBtn" class="btn">↻ Refresh</button>
@@ -178,13 +169,20 @@
       </div>
     </div>
 
+    <div class="hero">
+      <div class="k">Omset hari ini</div>
+      <div class="v skel" id="heroOmset">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</div>
+      <div class="meta">
+        <span class="chip" id="heroOrder">-</span>
+        <span class="chip" id="heroDiff">-</span>
+      </div>
+    </div>
+
     <div class="stats">
-      <div class="stat"><div class="icon">💰</div><div class="label">Omset hari ini</div><div class="value skel" id="sOmsetToday">&nbsp;</div><div class="hint" id="sOmsetDiff"></div></div>
-      <div class="stat"><div class="icon">🧾</div><div class="label">Order hari ini</div><div class="value skel" id="sOrderToday">&nbsp;</div></div>
-      <div class="stat"><div class="icon">📈</div><div class="label">Total omset</div><div class="value skel" id="sOmsetTotal">&nbsp;</div></div>
-      <div class="stat"><div class="icon">🛒</div><div class="label">Total order</div><div class="value skel" id="sOrderTotal">&nbsp;</div></div>
-      <div class="stat"><div class="icon">🗂️</div><div class="label">Set di katalog</div><div class="value skel" id="sKatalog">&nbsp;</div></div>
-      <div class="stat"><div class="icon">⏳</div><div class="label">Pending</div><div class="value skel" id="sPending">&nbsp;</div></div>
+      <div class="stat"><div class="ic c4">💰</div><div class="label">Total omset</div><div class="value skel" id="sOmsetTotal">&nbsp;</div></div>
+      <div class="stat"><div class="ic c2">🛒</div><div class="label">Total order</div><div class="value skel" id="sOrderTotal">&nbsp;</div></div>
+      <div class="stat"><div class="ic c1">🗂️</div><div class="label">Set di katalog</div><div class="value skel" id="sKatalog">&nbsp;</div></div>
+      <div class="stat"><div class="ic c5">⏳</div><div class="label">Pesanan pending</div><div class="value skel" id="sPending">&nbsp;</div></div>
     </div>
 
     <div class="card">
@@ -226,7 +224,7 @@ function showLogin(msg) {
   $("loginErr").textContent = msg || "";
 }
 
-function setStat(id, text) {
+function setText(id, text) {
   const el = $(id);
   el.classList.remove("skel");
   el.textContent = text;
@@ -256,29 +254,30 @@ async function load() {
   $("updated").textContent = "Diperbarui " + new Date(d.generated_at).toLocaleString("id-ID", { timeZone: "Asia/Jakarta", dateStyle: "medium", timeStyle: "short" }) + " WIB";
 
   const s = d.summary;
-  setStat("sOmsetToday", rp(s.omset_today));
-  // Bandingkan dengan kemarin (dari data 7 hari yang sudah ada)
   const yest = d.chart.length >= 2 ? d.chart[d.chart.length - 2].rupiah : 0;
-  const diffEl = $("sOmsetDiff");
-  if (!yest) {
-    diffEl.textContent = "Kemarin belum ada omset";
-  } else {
+
+  // Hero: omset hari ini + perbandingan dengan kemarin
+  setText("heroOmset", rp(s.omset_today));
+  setText("heroOrder", s.order_today + " order hari ini");
+  let diffText;
+  if (!yest) diffText = "Belum ada pembanding kemarin";
+  else {
     const pct = Math.round(((s.omset_today - yest) / yest) * 100);
-    const arrow = pct >= 0 ? "▲" : "▼";
-    diffEl.style.color = pct >= 0 ? "var(--good)" : "var(--bad)";
-    diffEl.textContent = arrow + " " + Math.abs(pct) + "% dari kemarin";
+    diffText = (pct >= 0 ? "▲ " : "▼ ") + Math.abs(pct) + "% dari kemarin";
   }
-  setStat("sOrderToday", s.order_today + " order");
-  setStat("sOmsetTotal", rp(s.omset_total));
-  setStat("sOrderTotal", s.order_total + " order");
-  setStat("sKatalog", s.katalog_count + " set");
-  setStat("sPending", s.pending_count + " pesanan");
+  $("heroDiff").textContent = diffText;
+
+  setText("sOmsetTotal", rp(s.omset_total));
+  setText("sOrderTotal", s.order_total + " order");
+  setText("sKatalog", s.katalog_count + " set");
+  setText("sPending", s.pending_count + " pesanan");
 
   // Grafik batang
   const max = Math.max(1, ...d.chart.map((c) => c.rupiah));
   const todayKey = d.chart.length ? d.chart[d.chart.length - 1].day : "";
-  $("chart").innerHTML = d.chart.map((c) => {
-    const h = c.rupiah ? Math.max(4, Math.round((c.rupiah / max) * 100)) : 2;
+  const hasData = d.chart.some((c) => c.rupiah > 0);
+  $("chart").innerHTML = hasData ? d.chart.map((c) => {
+    const h = c.rupiah ? Math.max(6, Math.round((c.rupiah / max) * 100)) : 3;
     const label = c.day.slice(8, 10) + "/" + c.day.slice(5, 7);
     const isToday = c.day === todayKey ? " today" : "";
     return '<div class="col' + isToday + '">' +
@@ -286,12 +285,12 @@ async function load() {
       '<div class="bar-wrap"><div class="bar" style="height:' + h + '%" title="' +
         esc(rp(c.rupiah) + " • " + c.count + " order") + '"></div></div>' +
       '<div class="bl">' + esc(label) + "</div></div>";
-  }).join("");
+  }).join("") : '<div class="empty" style="width:100%"><div class="big">📭</div>Belum ada omset dalam 7 hari terakhir.</div>';
 
   // Tabel pending
   $("pendingCount").textContent = d.pending.length + " pesanan";
   if (!d.pending.length) {
-    $("pendingWrap").innerHTML = '<div class="empty">✅ Tidak ada pesanan pending.</div>';
+    $("pendingWrap").innerHTML = '<div class="empty"><div class="big">✅</div>Semua pesanan sudah beres. Tidak ada yang pending.</div>';
   } else {
     $("pendingWrap").innerHTML =
       '<table><thead><tr><th>ID</th><th>Pembeli</th><th>Set</th><th>Total</th><th>Status</th></tr></thead><tbody>' +
@@ -314,7 +313,6 @@ $("refreshBtn").onclick = load;
 $("logoutBtn").onclick = () => showLogin();
 
 load();
-// Auto-refresh tiap 60 detik (hanya saat sudah login dan tab terlihat)
 setInterval(() => {
   if (!document.hidden && !$("dashView").classList.contains("hidden")) load();
 }, 60000);
