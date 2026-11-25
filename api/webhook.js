@@ -8613,7 +8613,7 @@ async function postOneSetToChannel(token, item, channel, botUname, requirePhoto 
       });
   if (r && r.ok) {
     const mid = r.result && r.result.message_id;
-    if (mid) await recordPostMsg(item.id, (r.result.chat && r.result.chat.id) || channel, mid, item.cadangan || "");
+    if (mid) await recordPostMsg(item.id, (r.result.chat && r.result.chat.id) || channel, mid, cadanganKey(item));
   }
   return Boolean(r && r.ok);
 }
@@ -8866,10 +8866,26 @@ async function runPostSetBatch(token) {
 // ---- TOMBOL "LINK CADANGAN" PADA POSTINGAN CHANNEL (diedit langsung, tanpa posting ulang) ----
 const REDIS_POSTMSG_KEY = "lumine_main_post_msgs"; // hash: id set -> JSON { chat_id, message_id, cad } (postingan channel milik set itu)
 
-// Tombol postingan: tombol beli ke bot + (kalau set punya link cadangan) tombol "Link Cadangan"
+// Semua link cadangan satu set: link utama (item.cadangan) + link tambahan (item.cadangan_extra)
+function getCadanganList(item) {
+  const out = [];
+  if (item && item.cadangan) out.push(String(item.cadangan));
+  if (item && Array.isArray(item.cadangan_extra)) {
+    for (const u of item.cadangan_extra) if (u && !out.includes(String(u))) out.push(String(u));
+  }
+  return out;
+}
+
+function cadanganKey(item) {
+  return getCadanganList(item).join("|");
+}
+
+// Tombol postingan: tombol beli ke bot + tombol untuk tiap link cadangan set
 function buildPostMarkup(item, botUname) {
   const rows = [[{ text: "🛒 Lihat & Beli", url: `https://t.me/${botUname}?start=buy_${item.id}` }]];
-  if (item.cadangan) rows.push([{ text: "🔗 Beli di Link Cadangan", url: String(item.cadangan) }]);
+  getCadanganList(item).forEach((u, i) => {
+    rows.push([{ text: i === 0 ? "🔗 Beli di Link Cadangan" : `🔗 Link Cadangan ${i + 1}`, url: u }]);
+  });
   return { inline_keyboard: rows };
 }
 
@@ -8901,7 +8917,7 @@ async function getAllPostMsgs() {
 async function editPostButtons(token, item, botUname) {
   const rec = await getPostMsg(item.id);
   if (!rec) return { ok: false, reason: "belum tercatat" };
-  const want = item.cadangan || "";
+  const want = cadanganKey(item);
   if ((rec.cad || "") === want) return { ok: true, skipped: true };
   const r = await tgRequest(token, "editMessageReplyMarkup", {
     chat_id: rec.chat_id,
@@ -8992,6 +9008,193 @@ function parsePostedSet(m, katalog) {
   return { item: null, why: `tidak ada set bernama "${nama}"` };
 }
 
+// ---- CHANNEL CADANGAN: bot membaca link dari postingan channel cadangan, dicocokkan ke nama set ----
+const REDIS_BACKUP_CH_KEY = "lumine_main_backup_channel"; // channel cadangan (@username atau id)
+const REDIS_KATALOG_LOCK_KEY = "lumine_main_katalog_lock"; // kunci anti tabrakan tulis katalog
+
+async function getBackupChannel() {
+  const raw = await redisCommand(["GET", REDIS_BACKUP_CH_KEY]);
+  return raw ? String(raw) : "";
+}
+
+function sameChannelCfg(cfg, chat) {
+  if (!cfg || !chat) return false;
+  if (String(cfg) === String(chat.id)) return true;
+  return String(cfg).startsWith("@") && Boolean(chat.username) && String(cfg).toLowerCase() === "@" + String(chat.username).toLowerCase();
+}
+
+async function getNotifyAdminId() {
+  if (ADMIN_IDS.length > 0) return ADMIN_IDS[0];
+  const pinned = await redisCommand(["GET", REDIS_ADMIN_ID_KEY]);
+  return pinned ? String(pinned) : "";
+}
+
+const normCore = (x) => String(x || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+// Cari nama set di dalam sebuah teks (nama terpanjang yang menang; kembar/ambigu dilaporkan).
+function findSetInText(text, katalog) {
+  const t = " " + normCore(text) + " ";
+  const hits = [];
+  for (const it of katalog) {
+    const n = normCore(it.nama);
+    if (n.length >= 3 && t.includes(" " + n + " ")) hits.push({ it, n });
+  }
+  if (!hits.length) return { item: null, ambiguous: false };
+  const maxLen = Math.max(...hits.map((h) => h.n.length));
+  const best = hits.filter((h) => h.n.length === maxLen);
+  if (best.length > 1) return { item: null, ambiguous: true, names: best.map((b) => b.it.nama) };
+  return { item: best[0].it, ambiguous: false };
+}
+
+// Ambil semua link dari satu postingan (teks, hyperlink, tombol) lalu pasangkan ke set berdasarkan nama.
+function extractBackupPairs(m, katalog, botUname) {
+  const text = String(m.text || m.caption || "");
+  const ents = m.entities || m.caption_entities || [];
+  const raw = [];
+  const push = (url, start, end, label) => {
+    let u = String(url || "").trim().replace(/[)\].,;]+$/, "");
+    if (!u) return;
+    if (!/^https?:\/\//i.test(u)) {
+      if (/^(t\.me|telegram\.me)\//i.test(u) || /^[\w-]+(\.[\w-]+)+\//.test(u)) u = "https://" + u;
+      else return;
+    }
+    raw.push({ url: u, start, end, label: label || "" });
+  };
+  for (const e of ents) {
+    if (e.type === "text_link" && e.url) push(e.url, e.offset, e.offset + e.length, text.substr(e.offset, e.length));
+    else if (e.type === "url") push(text.substr(e.offset, e.length), e.offset, e.offset + e.length, "");
+  }
+  for (const row of (m.reply_markup && m.reply_markup.inline_keyboard) || []) {
+    for (const b of row) if (b && b.url) push(b.url, -1, -1, b.text || "");
+  }
+  const mine = botUname ? new RegExp("t\\.me/" + botUname + "(\\b|/|\\?)", "i") : null;
+  const seen = new Set();
+  const links = raw.filter((l) => {
+    if (/[?&]start=buy_/i.test(l.url) || (mine && mine.test(l.url))) return false;
+    const key = l.url + "@" + l.start;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const lines = [];
+  let pos = 0;
+  for (const ln of text.split("\n")) {
+    lines.push({ start: pos, end: pos + ln.length, text: ln });
+    pos += ln.length + 1;
+  }
+  const stripUrl = (x) => String(x).replace(/https?:\/\/\S+/g, " ");
+
+  const pairsList = [];
+  const unmatched = [];
+  const ambiguous = [];
+  for (const l of links) {
+    const cands = [];
+    if (l.label && !/^https?:\/\//i.test(l.label.trim())) cands.push(l.label);
+    if (l.start >= 0) {
+      const li = lines.findIndex((x) => l.start >= x.start && l.start <= x.end);
+      if (li >= 0) {
+        cands.push(stripUrl(lines[li].text));
+        if (!normCore(stripUrl(lines[li].text))) {
+          for (let pj = li - 1; pj >= 0; pj--) {
+            if (normCore(lines[pj].text)) {
+              cands.push(lines[pj].text);
+              break;
+            }
+          }
+        }
+      }
+    } else cands.push(text);
+    if (links.length === 1) cands.push(text);
+
+    let found = null;
+    let amb = null;
+    for (const c of cands) {
+      const r = findSetInText(c, katalog);
+      if (r.item) {
+        found = r.item;
+        break;
+      }
+      if (r.ambiguous && !amb) amb = r.names;
+    }
+    if (found) pairsList.push({ item: found, url: l.url });
+    else if (amb) ambiguous.push({ url: l.url, names: amb });
+    else unmatched.push({ url: l.url, label: (l.label || cands[1] || "").trim().slice(0, 40) });
+  }
+  return { total: links.length, pairs: pairsList, unmatched, ambiguous };
+}
+
+// Simpan link cadangan ke katalog (dengan kunci supaya banyak postingan yang masuk bersamaan tidak saling menimpa).
+async function applyBackupPairs(pairs) {
+  let locked = false;
+  for (let i = 0; i < 30 && !locked; i++) {
+    locked = (await redisCommand(["SET", REDIS_KATALOG_LOCK_KEY, "1", "NX", "EX", "15"])) === "OK";
+    if (!locked) await new Promise((rs) => setTimeout(rs, 200));
+  }
+  try {
+    const list = await getKatalog();
+    const changed = [];
+    let unchanged = 0;
+    for (const p of pairs) {
+      const idx = list.findIndex((k) => String(k.id) === String(p.item.id));
+      if (idx < 0) continue;
+      const old = list[idx].cadangan || "";
+      if (getCadanganList(list[idx]).includes(p.url)) {
+        unchanged++;
+        continue;
+      }
+      if (!old) {
+        list[idx].cadangan = p.url;
+      } else {
+        if (!Array.isArray(list[idx].cadangan_extra)) list[idx].cadangan_extra = [];
+        list[idx].cadangan_extra.push(p.url);
+      }
+      if (!changed.some((c) => c.no === idx + 1)) changed.push({ no: idx + 1, item: list[idx], old, added: Boolean(old) });
+    }
+    if (changed.length) await saveKatalog(list);
+    return { changed, unchanged };
+  } finally {
+    if (locked) await redisCommand(["DEL", REDIS_KATALOG_LOCK_KEY]);
+  }
+}
+
+// Proses satu postingan dari channel cadangan (atau yang di-forward admin dari sana).
+async function handleBackupPost(token, m, reportChatId, alwaysNotify) {
+  const katalog = await getKatalog();
+  const botUname = await getBotUsername(token);
+  const ex = extractBackupPairs(m, katalog, botUname);
+  const to = reportChatId || (await getNotifyAdminId());
+  const say = (t) => (to ? tgRequest(token, "sendMessage", { chat_id: to, text: t, parse_mode: "HTML", disable_web_page_preview: true }) : null);
+  if (ex.total === 0) {
+    if (alwaysNotify) await say("⚠️ Tidak ada link di postingan ini.");
+    return;
+  }
+  const ap = ex.pairs.length ? await applyBackupPairs(ex.pairs) : { changed: [], unchanged: 0 };
+  const syncTxt = ap.changed.length ? await syncSummaryText(token, ap.changed.map((c) => ({ no: c.no, item: c.item }))) : "";
+
+  const problem = ex.unmatched.length > 0 || ex.ambiguous.length > 0;
+  const cnt = Number(await redisCommand(["INCR", "lumine_main_bk_cnt"])) || 1;
+  if (cnt === 1) await redisCommand(["EXPIRE", "lumine_main_bk_cnt", "120"]);
+  const periodic = cnt === 1 || cnt % 10 === 0;
+  if (!problem && !(periodic && (ap.changed.length || alwaysNotify))) return;
+
+  const short = (u) => (u.length > 55 ? u.slice(0, 52) + "..." : u);
+  const lines = [];
+  for (const c of ap.changed.slice(0, 15)) {
+    lines.push(`🔗 #${c.no} <b>${escapeHtml(c.item.nama)}</b> ← ${escapeHtml(short(c.item.cadangan))} (${c.added ? "ditambah" : c.old ? "diperbarui" : "baru"})`);
+  }
+  if (ap.changed.length > 15) lines.push(`… dan ${ap.changed.length - 15} set lain`);
+  if (!ap.changed.length && ap.unchanged) lines.push(`✅ ${ap.unchanged} set sudah punya link yang sama, tidak ada perubahan.`);
+  for (const u of ex.unmatched.slice(0, 5)) {
+    lines.push(`❓ Link tidak cocok dengan set manapun: ${escapeHtml(short(u.url))}${u.label ? ` (teks: "${escapeHtml(u.label)}")` : ""}`);
+  }
+  for (const a of ex.ambiguous.slice(0, 3)) {
+    lines.push(`⚠️ Nama kembar, dilewati: ${escapeHtml(a.names.slice(0, 3).join(" / "))} → ${escapeHtml(short(a.url))}`);
+  }
+  if (cnt > 1 && periodic) lines.push(`<i>(${cnt} postingan diproses dalam 2 menit terakhir)</i>`);
+  await say(`📥 <b>Channel cadangan</b>\n${lines.join("\n")}${syncTxt}`);
+}
+
 async function postNewSetToChannel(token, item) {
   try {
     const targetChannel = await getPostChannel();
@@ -9031,7 +9234,7 @@ async function postNewSetToChannel(token, item) {
       await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, String(item.id), "1"]);
       // catat id pesan channel supaya tombol bisa diedit nanti (tombol Link Cadangan) tanpa posting ulang
       const mid = rNew.result && rNew.result.message_id;
-      if (mid) await recordPostMsg(item.id, (rNew.result.chat && rNew.result.chat.id) || targetChannel, mid, item.cadangan || "");
+      if (mid) await recordPostMsg(item.id, (rNew.result.chat && rNew.result.chat.id) || targetChannel, mid, cadanganKey(item));
     }
   } catch (e) {
     console.error("Auto-post set ke channel gagal:", e && e.message);
@@ -9352,11 +9555,51 @@ module.exports = async function handler(req, res) {
       typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
     // ------------------------------------------
+    // 0a. CHANNEL CADANGAN: postingan yang DIEDIT juga dibaca ulang (mis. admin membetulkan link)
+    // ------------------------------------------
+    if (update.edited_channel_post) {
+      const ep = update.edited_channel_post;
+      try {
+        const bkCfgE = await getBackupChannel();
+        if (bkCfgE && sameChannelCfg(bkCfgE, ep.chat)) await handleBackupPost(token, ep, "", false);
+      } catch (bkErr) {
+        console.error("Channel cadangan (edit) error:", bkErr && bkErr.message);
+      }
+      return res.status(200).json({ ok: true });
+    }
+
+    // ------------------------------------------
     // 0. HANDLER POSTINGAN CHANNEL (/settesti LANGSUNG DI CH)
     // ------------------------------------------
     if (update.channel_post) {
       const post = update.channel_post;
       const postText = (post.text || "").trim();
+
+      // /setchcadangan langsung di channel cadangan: jadikan channel ini sumber link cadangan
+      if (postText.startsWith("/setchcadangan")) {
+        await redisCommand(["SET", REDIS_BACKUP_CH_KEY, String(post.chat.id)]);
+        await tgRequest(token, "deleteMessage", { chat_id: post.chat.id, message_id: post.message_id });
+        const adm = await getNotifyAdminId();
+        if (adm) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: adm,
+            parse_mode: "HTML",
+            text: `✅ <b>Channel cadangan terhubung:</b> ${escapeHtml(post.chat.title || "")}\nID: <code>${post.chat.id}</code>\nSetiap postingan di sana yang berisi link + nama set akan otomatis dicocokkan.`,
+          });
+        }
+        return res.status(200).json({ ok: true });
+      }
+
+      // Postingan di channel cadangan: baca link, cocokkan ke nama set, perbarui link cadangan
+      try {
+        const bkCfg = await getBackupChannel();
+        if (bkCfg && sameChannelCfg(bkCfg, post.chat)) {
+          await handleBackupPost(token, post, "", false);
+          return res.status(200).json({ ok: true });
+        }
+      } catch (bkErr) {
+        console.error("Channel cadangan error:", bkErr && bkErr.message);
+      }
       if (postText.startsWith("/settesti")) {
         const me = await tgRequest(token, "getMe", {});
         const botUsername = (me && me.result && me.result.username) || "";
@@ -10225,6 +10468,12 @@ module.exports = async function handler(req, res) {
           }
           return res.status(200).json({ ok: true });
         }
+        // forward dari CHANNEL CADANGAN: baca link-nya dan cocokkan ke nama set (untuk postingan lama)
+        const bkCfgF = await getBackupChannel();
+        if (fchat && bkCfgF && sameChannelCfg(bkCfgF, fchat)) {
+          await handleBackupPost(token, msg, chatId, true);
+          return res.status(200).json({ ok: true });
+        }
       }
 
       // BLACKLIST & RATE LIMIT (admin dikecualikan)
@@ -10385,7 +10634,7 @@ module.exports = async function handler(req, res) {
             "<b>🧾 Admin lain</b>\n" +
             "• <code>/logadmin</code> — 20 perintah admin terakhir\n" +
             "• <code>/omset</code> | <code>/error</code> | <code>/broadcast</code>\n" +
-            "• <code>/setcadangan NO LINK</code> | <code>/cekcadangan</code> | <code>/cekpost</code> | <code>/updatepost</code> | <code>/pengumuman 1,2,3</code> — link cadangan per set (postingan channel diedit otomatis)\n" +
+            "• <code>/setchcadangan</code> | <code>/setcadangan NO LINK</code> | <code>/cekcadangan</code> | <code>/cekpost</code> | <code>/updatepost</code> | <code>/pengumuman 1,2,3</code> — link cadangan per set (postingan channel diedit otomatis)\n" +
             "• <code>/addsaldo ID NOMINAL</code> | <code>/ceksaldo ID</code>\n" +
             "• <code>/listwd</code> | <code>/listbot</code> | <code>/backup</code> | <code>/restore</code>",
         });
@@ -13105,6 +13354,31 @@ module.exports = async function handler(req, res) {
       };
       const cadUrlOk = (u) => /^https?:\/\/[^\s<>"]+\.[^\s<>"]+$/i.test(u);
 
+      if (rawText.startsWith("/setchcadangan")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const argB = rawText.replace(/^\/setchcadangan\s*/i, "").trim();
+        const sendB = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML", disable_web_page_preview: true });
+        if (!argB) {
+          const cur = await getBackupChannel();
+          await sendB(
+            `📥 <b>Channel Cadangan (sumber link)</b>\n\nSaat ini: ${cur ? `<code>${escapeHtml(cur)}</code>` : "<i>belum diset</i>"}\n\n` +
+              `Atur: <code>/setchcadangan @username_channel</code> (atau ID -100...)\n` +
+              `Atau kirim <code>/setchcadangan</code> langsung di channel cadangan.\nMatikan: <code>/setchcadangan off</code>\n\n` +
+              `<b>Cara kerja:</b> bot harus jadi admin di channel itu. Tiap postingan baru (atau yang diedit) yang berisi nama set + link otomatis mengisi link cadangan set tersebut, lalu postingan set di channel utama ikut diedit. ` +
+              `Postingan lama: teruskan (forward) dari channel cadangan ke bot ini.`
+          );
+          return res.status(200).json({ ok: true });
+        }
+        if (argB.toLowerCase() === "off") {
+          await redisCommand(["DEL", REDIS_BACKUP_CH_KEY]);
+          await sendB("✅ Pembacaan channel cadangan dimatikan.");
+          return res.status(200).json({ ok: true });
+        }
+        await redisCommand(["SET", REDIS_BACKUP_CH_KEY, argB.split(/\s+/)[0]]);
+        await sendB(`✅ Channel cadangan diset: <code>${escapeHtml(argB.split(/\s+/)[0])}</code>\n<i>Pastikan bot jadi admin di channel itu.</i>`);
+        return res.status(200).json({ ok: true });
+      }
+
       if (rawText.startsWith("/setcadangan")) {
         if (!isAdmin) return res.status(200).json({ ok: true });
         const arg = rawText.replace(/^\/setcadangan\s*/i, "").trim();
@@ -13139,7 +13413,7 @@ module.exports = async function handler(req, res) {
             await sendT("Format: <code>/setcadangan hapus 5</code> atau <code>/setcadangan hapus 1-5</code>");
             return res.status(200).json({ ok: true });
           }
-          for (const n of nosDel) delete katalogCad[n - 1].cadangan;
+          for (const n of nosDel) { delete katalogCad[n - 1].cadangan; delete katalogCad[n - 1].cadangan_extra; }
           await saveKatalog(katalogCad);
           const syncDel = await syncSummaryText(token, nosDel.map((n) => ({ no: n, item: katalogCad[n - 1] })));
           await sendT(`🗑 Link cadangan dihapus dari ${nosDel.length} set.${syncDel}`);
@@ -13404,7 +13678,7 @@ module.exports = async function handler(req, res) {
           const r = recs[String(k.id)];
           if (r) {
             tercatat++;
-            if ((r.cad || "") === (k.cadangan || "")) {
+            if ((r.cad || "") === cadanganKey(k)) {
               if (k.cadangan) sudahCad++;
             } else perluEdit++;
           } else belum.push(i + 1);
@@ -13433,7 +13707,7 @@ module.exports = async function handler(req, res) {
         if (!argU || /^semua$/i.test(argU)) {
           katalogUp.forEach((k, i) => {
             const r = recsU[String(k.id)];
-            if (r && (r.cad || "") !== (k.cadangan || "")) entries.push({ no: i + 1, item: k });
+            if (r && (r.cad || "") !== cadanganKey(k)) entries.push({ no: i + 1, item: k });
           });
         } else {
           entries = cadNos(argU)
