@@ -220,7 +220,7 @@ const rp = (n) => "Rp " + Number(n || 0).toLocaleString("id-ID");
 const rb = (n) => n >= 1000000 ? (n / 1000000).toFixed(1) + "jt" : n >= 1000 ? Math.round(n / 1000) + "rb" : String(n);
 
 function showLogin(msg) {
-  sessionStorage.removeItem("dashKey");
+  localStorage.removeItem("dashKey");
   $("dashView").classList.add("hidden");
   $("loginView").classList.remove("hidden");
   $("loginErr").textContent = msg || "";
@@ -233,7 +233,7 @@ function setStat(id, text) {
 }
 
 async function load() {
-  const key = sessionStorage.getItem("dashKey");
+  const key = localStorage.getItem("dashKey");
   if (!key) return showLogin();
 
   $("updated").textContent = "Memuat data...";
@@ -305,7 +305,7 @@ async function load() {
 $("loginBtn").onclick = () => {
   const pw = $("pw").value;
   if (!pw) return;
-  sessionStorage.setItem("dashKey", pw);
+  localStorage.setItem("dashKey", pw);
   $("loginErr").textContent = "";
   load();
 };
