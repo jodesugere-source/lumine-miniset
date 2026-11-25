@@ -1371,6 +1371,27 @@ async function buildBuyerStatsBlock(buyerId) {
   return line;
 }
 
+async function getBuyerRejectCount(buyerId) {
+  return parseInt(await redisCommand(["HGET", REDIS_BUYER_REJECT_KEY, String(buyerId)]), 10) || 0;
+}
+
+const REDIS_OMSET_CREATOR_PREFIX = "lumine_main_omset_cr_"; // HASH per hari (WIB): nama creator -> total Rp lunas
+
+async function recordOmsetPerCreator(order) {
+  try {
+    const { dayKey } = getWibPeriods();
+    const katalogNow = await getKatalog();
+    const it = katalogNow.find((k) => String(k.id) === String(order.item_id));
+    const creatorName = ((it && it.creator) || "").trim() || "Tanpa creator";
+    const nominal = Number(order.final_base_nominal || order.base_nominal) || 0;
+    const key = `${REDIS_OMSET_CREATOR_PREFIX}${dayKey}`;
+    await redisCommand(["HINCRBY", key, creatorName, nominal]);
+    await redisCommand(["EXPIRE", key, "1209600"]);
+  } catch (e) {
+    console.error("Omset creator error:", e);
+  }
+}
+
 async function recordPurchaseToLeaderboard(order) {
   const { dayKey, weekKey, monthKey } = getWibPeriods();
   const memberId = String(order.buyer_id);
@@ -2412,6 +2433,7 @@ async function processPreorderPaid(token, order) {
 
   // Omset, leaderboard & hitungan terjual dihitung saat pembayaran lunas
   await recordPurchaseToLeaderboard(order);
+  if (!order.is_deposit) await recordOmsetPerCreator(order);
   await addStoreOmset(order.total_nominal);
   if (await isReseller(order.buyer_id)) {
     await addResellerOmset(order.buyer_id, order.total_nominal);
@@ -2671,6 +2693,7 @@ async function processAccOrderCore(token, order) {
   const buyerIsReseller = await isReseller(order.buyer_id);
   const omsetTasks = [
     recordPurchaseToLeaderboard(order),
+    order.is_deposit ? Promise.resolve() : recordOmsetPerCreator(order),
     isDupeSaldo ? Promise.resolve() : addKoleksi(order.buyer_id, deliveredName, deliveredLinks[0] || ""),
     addStoreOmset(order.total_nominal),
   ];
@@ -9328,7 +9351,28 @@ async function sendDailyReport(token) {
     `• Belum punya preview: <b>${noPrev}</b>\n` +
     `• Postingan CH utama belum tercatat: <b>${belumTercatat}</b>\n` +
     `• Link cadangan baru (24 jam): <b>${baruHariIni}</b>`;
-  await tgRequest(token, "sendMessage", { chat_id: to, text: pesan, parse_mode: "HTML" });
+  const { dayKey } = getWibPeriods();
+  const omsetRaw = (await redisCommand(["HGETALL", `${REDIS_OMSET_CREATOR_PREFIX}${dayKey}`])) || [];
+  let omsetTxt = "\n\n💰 <b>Omset hari ini per creator:</b>";
+  if (omsetRaw.length === 0) omsetTxt += "\n<i>Belum ada penjualan.</i>";
+  else {
+    const rows = [];
+    for (let i = 0; i < omsetRaw.length; i += 2) rows.push([String(omsetRaw[i]), Number(omsetRaw[i + 1]) || 0]);
+    rows.sort((a, b) => b[1] - a[1]);
+    const total = rows.reduce((acc, r) => acc + r[1], 0);
+    for (const [name, val] of rows) omsetTxt += `\n• ${escapeHtml(name)}: <b>${formatRupiah(val)}</b>`;
+    omsetTxt += `\n<b>Total: ${formatRupiah(total)}</b>`;
+  }
+  await tgRequest(token, "sendMessage", { chat_id: to, text: pesan + omsetTxt, parse_mode: "HTML" });
+
+  const backupPayload = JSON.stringify({ exported_at: getWibTimestamp(), total: katalog.length, katalog }, null, 2);
+  await sendJsonDocument(
+    token,
+    to,
+    `backup-katalog-${getWibFileStamp()}.json`,
+    backupPayload,
+    `📦 <b>Backup katalog harian</b> (${katalog.length} set). Simpan baik-baik. Kalau katalog rusak, upload file ini dengan caption /restore.`
+  );
 }
 
 // Proses satu postingan dari channel cadangan (atau yang di-forward admin dari sana).
@@ -10371,8 +10415,9 @@ module.exports = async function handler(req, res) {
             : `🔔 <b>PESANAN MASUK #${order.id}</b>`;
 
           const buyerStats = await buildBuyerStatsBlock(order.buyer_id);
+          const warnPembeli = (await getBuyerRejectCount(order.buyer_id)) >= 2 ? "⚠️ " : "";
           const adminNotifText =
-            `${titleLabel}\n\n` +
+            `${warnPembeli}${titleLabel}\n\n` +
             `👤 <b>Pembeli:</b> ${escapeHtml(order.buyer_name)} (${escapeHtml(order.buyer_username)})\n` +
             `🏷️ <a href="tg://user?id=${escapeHtml(String(order.buyer_id))}">Chat pembeli</a>\n` +
             `${buyerStats}\n` +
@@ -10854,6 +10899,29 @@ module.exports = async function handler(req, res) {
             "<b>⚡ Promo & harga</b>\n" +
             "• <code>/flashsale NO | HARGA | MENIT</code> | <code>/stopflashsale</code>\n" +
             "• <code>/hargamassal</code> — edit harga banyak set\n\n" +
+            "<b>🔗 Link cadangan (otomatis)</b>\n" +
+            "• Posting <code>Nama Set Persis https://link</code> di CH cadangan, bisa banyak baris\n" +
+            "• Link cocok otomatis masuk ke set, lalu teks \"Beli di Link Cadangan\" ditulis di postingan CH utama\n" +
+            "• Nama mirip akan diberi saran perintah yang bisa langsung dikirim\n" +
+            "• Kalau set sudah punya link, bot tanya dulu: ➕ Tambah / 🔁 Ganti / ❌ Abaikan\n" +
+            "• <code>/setcadangan hapus NO</code> atau <code>hapus 1-5</code> untuk menghapus link\n" +
+            "• <code>/riwayatcad</code> — 15 perubahan link terakhir\n" +
+            "• <code>/cekdeadlink</code> — cek link cadangan yang tidak bisa dibuka (jalankan ulang kalau belum selesai)\n\n" +
+            "<b>📦 Katalog & postingan</b>\n" +
+            "• <code>/tambah</code> — set baru, satu baris satu set. Nama yang hampir sama dengan set lain akan dilewati\n" +
+            "• <code>/edit NO | Nama | Isi | Harga | Link</code> — kosongkan kolom yang tidak mau diubah\n" +
+            "• <code>/cekpost</code> — postingan CH utama yang sudah tercatat bot\n" +
+            "• Postingan lama: teruskan dari CH ke bot supaya bisa diedit\n\n" +
+            "<b>🖼 Preview</b>\n" +
+            "• <code>/cekpreview NO</code> | kirim foto dengan caption <code>/setpreview NO</code>\n" +
+            "• <code>/previewmassal</code> — kirim foto tanpa caption satu per satu, dipasang ke set yang belum punya preview\n\n" +
+            "<b>🛒 Pesanan & pembeli</b>\n" +
+            "• <code>/pending</code> — pesanan yang belum di-ACC, urut dari yang paling lama\n" +
+            "• Notif pesanan masuk menampilkan riwayat pembeli, tombol chat, dan ⚠️ kalau pernah ditolak 2 kali atau lebih\n" +
+            "• <code>/hapuslb ID atau NAMA</code> — hapus akun dari klasemen (riwayat order tidak ikut terhapus)\n\n" +
+            "<b>📊 Laporan harian (09:00 WIB)</b>\n" +
+            "• Jumlah set, yang belum punya link cadangan atau preview, postingan belum tercatat, link baru 24 jam terakhir\n" +
+            "• Omset hari ini per creator, plus file backup katalog\n\n" +
             "<b>🧾 Admin lain</b>\n" +
             "• <code>/logadmin</code> — 20 perintah admin terakhir\n" +
             "• <code>/omset</code> | <code>/error</code> | <code>/broadcast</code>\n" +
@@ -12448,6 +12516,75 @@ module.exports = async function handler(req, res) {
             "<i>Ubah nominal di LB_REWARD_SALDO pada kode.</i>",
           parse_mode: "HTML",
         });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 5B4. ADMIN: /pending — daftar pesanan yang belum di-ACC (menunggu verifikasi / belum dibayar)
+      if (/^\/pending(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const flat = (await redisCommand(["HGETALL", REDIS_PENDING_MAP_KEY])) || [];
+        const rows = [];
+        for (let i = 0; i < flat.length; i += 2) {
+          const ord = await getOrder(String(flat[i]));
+          if (!ord || (ord.status !== "pending" && ord.status !== "waiting_acc")) continue;
+          const menit = ord.created_ms ? Math.floor((Date.now() - ord.created_ms) / 60000) : null;
+          rows.push({ ord, menit });
+        }
+        if (!rows.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "✅ Tidak ada pesanan yang menunggu ACC." });
+          return res.status(200).json({ ok: true });
+        }
+        rows.sort((a, b) => (b.menit || 0) - (a.menit || 0));
+        const waiting = rows.filter((r) => r.ord.status === "waiting_acc").length;
+        let txt = `🕓 <b>Pesanan belum di-ACC: ${rows.length}</b> (sudah konfirmasi bayar: ${waiting})\n\n`;
+        for (const { ord, menit } of rows.slice(0, 25)) {
+          const label = ord.status === "waiting_acc" ? "🕓 sudah konfirmasi" : "⏳ belum bayar";
+          const umur = menit === null ? "" : menit < 60 ? ` • ${menit} mnt lalu` : ` • ${Math.floor(menit / 60)} jam lalu`;
+          txt += `#${ord.id} ${label}${umur}\n   ${escapeHtml(ord.buyer_name || "Pembeli")} (${escapeHtml(ord.buyer_username || "-")}) • ${formatRupiah(ord.total_nominal)}\n`;
+        }
+        if (rows.length > 25) txt += `\n… dan ${rows.length - 25} pesanan lain`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: txt, parse_mode: "HTML" });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 5B3. ADMIN: /cekdeadlink — cek link cadangan yang tidak bisa dibuka (dibatasi waktu, aman untuk Vercel)
+      if (/^\/cekdeadlink(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const start = Date.now();
+        const katalogCek = await getKatalog();
+        const urls = [];
+        for (const k of katalogCek) {
+          for (const u of getCadanganList(k)) urls.push({ no: katalogCek.indexOf(k) + 1, nama: k.nama, url: u });
+        }
+        const bad = [];
+        let checked = 0;
+        const TIME_BUDGET_MS = 7000;
+        for (let i = 0; i < urls.length && Date.now() - start < TIME_BUDGET_MS; i += 8) {
+          const batch = urls.slice(i, i + 8);
+          await Promise.all(batch.map(async (x) => {
+            const ctl = new AbortController();
+            const t = setTimeout(() => ctl.abort(), 4000);
+            try {
+              const r = await fetch(x.url, { method: "GET", redirect: "follow", signal: ctl.signal });
+              if (!r.ok) bad.push({ ...x, status: r.status });
+            } catch (e) {
+              bad.push({ ...x, status: "gagal dibuka" });
+            } finally {
+              clearTimeout(t);
+            }
+          }));
+          checked += batch.length;
+        }
+        const sisa = urls.length - checked;
+        let txt = `🔎 <b>Cek link cadangan</b>\nDiperiksa: ${checked} dari ${urls.length} link.\n`;
+        if (!bad.length) txt += "✅ Semua link yang diperiksa bisa dibuka.";
+        else {
+          txt += `❌ <b>${bad.length} link bermasalah:</b>\n`;
+          for (const b of bad.slice(0, 20)) txt += `• #${b.no} ${escapeHtml(b.nama)} (${escapeHtml(String(b.status))})\n`;
+          if (bad.length > 20) txt += `… dan ${bad.length - 20} lainnya\n`;
+        }
+        if (sisa > 0) txt += `\n<i>Masih ada ${sisa} link belum diperiksa. Jalankan /cekdeadlink lagi nanti untuk melanjutkan. Catatan: link undangan Telegram kadang tetap terbuka walau sudah tidak valid.</i>`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: txt, parse_mode: "HTML", disable_web_page_preview: true });
         return res.status(200).json({ ok: true });
       }
 
