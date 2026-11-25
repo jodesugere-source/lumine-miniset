@@ -8545,6 +8545,8 @@ async function getMacroLogChatId() {
 // ==========================================
 // AUTO-POST SET BARU KE CHANNEL (pakai link bot, BUKAN link file asli -> anti bocor)
 // ==========================================
+const REDIS_BACKUP_LINK_KEY = "lumine_main_backup_store_link"; // link toko cadangan (mis. move2link) untuk pengumuman
+const REDIS_ANNOUNCE_LAST_KEY = "lumine_main_announce_last"; // JSON: { chat_id, message_id, ts } pengumuman terakhir di channel
 const REDIS_POST_CHANNEL_KEY = "lumine_main_post_channel"; // chat_id (-100...) atau @username channel tujuan auto-post set baru
 
 async function getPostChannel() {
@@ -8593,7 +8595,7 @@ async function postOneSetToChannel(token, item, channel, botUname, requirePhoto 
     (item.isi ? `📂 Isi: ${escapeHtml(item.isi)}\n` : "") +
     `💰 Harga: <b>${escapeHtml(String(item.harga))}</b>\n\n` +
     `Klik tombol di bawah untuk lihat & beli lewat bot 👇`;
-  const replyMarkup = { inline_keyboard: [[{ text: "🛒 Lihat & Beli", url: deepLink }]] };
+  const replyMarkup = buildPostMarkup(item, botUname);
 
   const r = item.photo_id
     ? await tgRequest(token, "sendPhoto", {
@@ -8609,6 +8611,10 @@ async function postOneSetToChannel(token, item, channel, botUname, requirePhoto 
         parse_mode: "HTML",
         reply_markup: replyMarkup,
       });
+  if (r && r.ok) {
+    const mid = r.result && r.result.message_id;
+    if (mid) await recordPostMsg(item.id, (r.result.chat && r.result.chat.id) || channel, mid, item.cadangan || "");
+  }
   return Boolean(r && r.ok);
 }
 
@@ -8857,6 +8863,135 @@ async function runPostSetBatch(token) {
   return { ran: true, posted, failed, skipped, sisa };
 }
 
+// ---- TOMBOL "LINK CADANGAN" PADA POSTINGAN CHANNEL (diedit langsung, tanpa posting ulang) ----
+const REDIS_POSTMSG_KEY = "lumine_main_post_msgs"; // hash: id set -> JSON { chat_id, message_id, cad } (postingan channel milik set itu)
+
+// Tombol postingan: tombol beli ke bot + (kalau set punya link cadangan) tombol "Link Cadangan"
+function buildPostMarkup(item, botUname) {
+  const rows = [[{ text: "🛒 Lihat & Beli", url: `https://t.me/${botUname}?start=buy_${item.id}` }]];
+  if (item.cadangan) rows.push([{ text: "🔗 Beli di Link Cadangan", url: String(item.cadangan) }]);
+  return { inline_keyboard: rows };
+}
+
+async function recordPostMsg(itemId, chatId, messageId, cad) {
+  await redisCommand(["HSET", REDIS_POSTMSG_KEY, String(itemId), JSON.stringify({ chat_id: chatId, message_id: messageId, cad: cad || "" })]);
+}
+
+async function getPostMsg(itemId) {
+  try {
+    const raw = await redisCommand(["HGET", REDIS_POSTMSG_KEY, String(itemId)]);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getAllPostMsgs() {
+  const flat = (await redisCommand(["HGETALL", REDIS_POSTMSG_KEY])) || [];
+  const out = {};
+  for (let i = 0; i + 1 < flat.length; i += 2) {
+    try {
+      out[flat[i]] = JSON.parse(flat[i + 1]);
+    } catch {}
+  }
+  return out;
+}
+
+// Edit tombol satu postingan channel supaya sesuai link cadangan set saat ini.
+async function editPostButtons(token, item, botUname) {
+  const rec = await getPostMsg(item.id);
+  if (!rec) return { ok: false, reason: "belum tercatat" };
+  const want = item.cadangan || "";
+  if ((rec.cad || "") === want) return { ok: true, skipped: true };
+  const r = await tgRequest(token, "editMessageReplyMarkup", {
+    chat_id: rec.chat_id,
+    message_id: rec.message_id,
+    reply_markup: buildPostMarkup(item, botUname),
+  });
+  if (r && (r.ok || /not modified/i.test(r.description || ""))) {
+    rec.cad = want;
+    await redisCommand(["HSET", REDIS_POSTMSG_KEY, String(item.id), JSON.stringify(rec)]);
+    return { ok: true };
+  }
+  return { ok: false, reason: (r && r.description) || "unknown", retryAfter: r && r.parameters && r.parameters.retry_after };
+}
+
+// entries: [{ no, item }]. Maksimal maxN edit per proses (anti timeout & anti flood Telegram).
+async function syncPostButtons(token, entries, maxN) {
+  const botUname = await getBotUsername(token);
+  const res = { edited: 0, skipped: 0, notRecorded: [], failed: [], left: 0 };
+  if (!botUname) {
+    res.failed.push({ no: 0, reason: "username bot tidak terbaca" });
+    return res;
+  }
+  let stop = false;
+  for (const e of entries) {
+    if (stop || res.edited >= maxN) {
+      res.left++;
+      continue;
+    }
+    const r = await editPostButtons(token, e.item, botUname);
+    if (r.ok && r.skipped) res.skipped++;
+    else if (r.ok) {
+      res.edited++;
+      await new Promise((rs) => setTimeout(rs, 700));
+    } else if (r.reason === "belum tercatat") res.notRecorded.push(e.no);
+    else {
+      res.failed.push({ no: e.no, reason: r.reason });
+      if (r.retryAfter) {
+        stop = true;
+        res.left++;
+      }
+    }
+  }
+  return res;
+}
+
+async function syncSummaryText(token, entries) {
+  if (!entries.length) return "";
+  const sy = await syncPostButtons(token, entries, 25);
+  let t = "";
+  if (sy.edited) t += `\n✏️ ${sy.edited} postingan di channel sudah diedit otomatis (tanpa posting ulang).`;
+  if (sy.notRecorded.length)
+    t +=
+      `\n📭 Postingan belum tercatat untuk nomor: ${sy.notRecorded.slice(0, 25).join(", ")}${sy.notRecorded.length > 25 ? " dst" : ""}.` +
+      `\nTeruskan (forward) postingan set itu dari channel ke bot ini, nanti otomatis tercatat dan diedit.`;
+  if (sy.failed.length) t += `\n⚠️ Gagal edit: ${sy.failed.slice(0, 5).map((f) => `#${f.no} (${escapeHtml(String(f.reason).slice(0, 60))})`).join(", ")}`;
+  if (sy.left) t += `\n⏳ ${sy.left} postingan belum diproses, kirim /updatepost untuk lanjut.`;
+  return t ? "\n" + t : "";
+}
+
+// Kenali set dari postingan channel yang di-forward admin: pakai tombol (start=buy_ID), kalau tidak ada pakai nama di teks.
+function parsePostedSet(m, katalog) {
+  const kb = (m.reply_markup && m.reply_markup.inline_keyboard) || [];
+  for (const row of kb) {
+    for (const b of row) {
+      const mm = /[?&]start=buy_(\d+)/.exec((b && b.url) || "");
+      if (mm) {
+        const it = katalog.find((k) => String(k.id) === mm[1]);
+        if (it) return { item: it };
+      }
+    }
+  }
+  const text = String(m.caption || m.text || "");
+  let nama = "";
+  for (const raw of text.split(/\r?\n/)) {
+    const ln = raw.trim();
+    const mm = /^(?:✨|📦|🧩)\s*(.+)$/.exec(ln);
+    if (!mm) continue;
+    const cand = mm[1].trim();
+    if (/^(full|mini)\s*set$/i.test(cand)) continue;
+    nama = cand;
+    break;
+  }
+  if (!nama) return { item: null, why: "nama set tidak terbaca di postingan" };
+  const norm = (x) => String(x || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const hits = katalog.filter((k) => norm(k.nama) === norm(nama));
+  if (hits.length === 1) return { item: hits[0] };
+  if (hits.length > 1) return { item: null, why: `ada ${hits.length} set bernama "${nama}"` };
+  return { item: null, why: `tidak ada set bernama "${nama}"` };
+}
+
 async function postNewSetToChannel(token, item) {
   try {
     const targetChannel = await getPostChannel();
@@ -8875,7 +9010,7 @@ async function postNewSetToChannel(token, item) {
       `💰 Harga: <b>${escapeHtml(item.harga)}</b>\n\n` +
       `Klik tombol di bawah buat lihat & beli langsung lewat bot 👇`;
 
-    const replyMarkup = { inline_keyboard: [[{ text: "🛒 Lihat & Beli", url: deepLink }]] };
+    const replyMarkup = buildPostMarkup(item, botUname);
 
     const rNew = item.photo_id
       ? await tgRequest(token, "sendPhoto", {
@@ -8892,7 +9027,12 @@ async function postNewSetToChannel(token, item) {
           reply_markup: replyMarkup,
         });
     // set yang sudah diposting otomatis ikut ditandai, supaya /postsemua & /postset tidak memposting dobel
-    if (rNew && rNew.ok) await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, String(item.id), "1"]);
+    if (rNew && rNew.ok) {
+      await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, String(item.id), "1"]);
+      // catat id pesan channel supaya tombol bisa diedit nanti (tombol Link Cadangan) tanpa posting ulang
+      const mid = rNew.result && rNew.result.message_id;
+      if (mid) await recordPostMsg(item.id, (rNew.result.chat && rNew.result.chat.id) || targetChannel, mid, item.cadangan || "");
+    }
   } catch (e) {
     console.error("Auto-post set ke channel gagal:", e && e.message);
   }
@@ -10044,6 +10184,49 @@ module.exports = async function handler(req, res) {
       const senderUsername = (msg.from && msg.from.username) || "";
       const isAdmin = await isAdminUser(msg.from);
 
+      // ADMIN: teruskan (forward) postingan CHANNEL UTAMA ke bot -> bot mencatat id pesannya per set,
+      // lalu otomatis mengedit tombolnya (tambah "Link Cadangan") kalau set itu sudah punya link cadangan.
+      if (isAdmin && msg.chat.type === "private" && (msg.forward_origin || msg.forward_from_chat)) {
+        const origin = msg.forward_origin || {};
+        const fchat = origin.chat || msg.forward_from_chat || null;
+        const fmid = origin.message_id || msg.forward_from_message_id || 0;
+        const pcF = String((await getPostChannel()) || "");
+        const sameCh =
+          fchat &&
+          fmid &&
+          pcF &&
+          (pcF === String(fchat.id) || (pcF.startsWith("@") && fchat.username && pcF.toLowerCase() === "@" + String(fchat.username).toLowerCase()));
+        if (sameCh) {
+          const sendF = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML", disable_web_page_preview: true });
+          const katalogF = await getKatalog();
+          const found = parsePostedSet(msg, katalogF);
+          const cntF = Number(await redisCommand(["INCR", "lumine_main_fwd_cnt"])) || 1;
+          if (cntF === 1) await redisCommand(["EXPIRE", "lumine_main_fwd_cnt", "120"]);
+          if (!found.item) {
+            await sendF(`⚠️ Postingan ini tidak dikenali: ${escapeHtml(found.why || "set tidak ditemukan")}.`);
+            return res.status(200).json({ ok: true });
+          }
+          const it = found.item;
+          const old = await getPostMsg(it.id);
+          const keepCad = old && String(old.message_id) === String(fmid) ? old.cad || "" : "";
+          await recordPostMsg(it.id, fchat.id, fmid, keepCad);
+          let note = "";
+          if (it.cadangan) {
+            const botUnameF = await getBotUsername(token);
+            const er = await editPostButtons(token, it, botUnameF);
+            note = er.ok ? " • tombol Link Cadangan sudah dipasang ✏️" : ` • ⚠️ gagal edit: ${escapeHtml(String(er.reason).slice(0, 60))} (coba /updatepost nanti)`;
+          } else {
+            note = " • belum punya link cadangan (isi lewat /setcadangan, nanti otomatis diedit)";
+          }
+          const gagal = note.includes("gagal edit");
+          if (cntF === 1 || cntF % 10 === 0 || gagal) {
+            const no = katalogF.findIndex((k) => String(k.id) === String(it.id)) + 1;
+            await sendF(`📌 #${no} ${escapeHtml(it.nama)} tercatat${note}${cntF > 1 ? `\n(${cntF} postingan diproses dalam 2 menit terakhir)` : ""}`);
+          }
+          return res.status(200).json({ ok: true });
+        }
+      }
+
       // BLACKLIST & RATE LIMIT (admin dikecualikan)
       if (!isAdmin && senderId) {
         if (await isBanned(senderId)) return res.status(200).json({ ok: true });
@@ -10202,6 +10385,7 @@ module.exports = async function handler(req, res) {
             "<b>🧾 Admin lain</b>\n" +
             "• <code>/logadmin</code> — 20 perintah admin terakhir\n" +
             "• <code>/omset</code> | <code>/error</code> | <code>/broadcast</code>\n" +
+            "• <code>/setcadangan NO LINK</code> | <code>/cekcadangan</code> | <code>/cekpost</code> | <code>/updatepost</code> | <code>/pengumuman 1,2,3</code> — link cadangan per set (postingan channel diedit otomatis)\n" +
             "• <code>/addsaldo ID NOMINAL</code> | <code>/ceksaldo ID</code>\n" +
             "• <code>/listwd</code> | <code>/listbot</code> | <code>/backup</code> | <code>/restore</code>",
         });
@@ -12899,6 +13083,376 @@ module.exports = async function handler(req, res) {
           chat_id: chatId,
           text: `✅ Channel auto-post diset ke: <code>${escapeHtml(arg)}</code>\n<i>Pastikan bot sudah jadi admin di channel itu ya.</i>`,
           parse_mode: "HTML",
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 10A5. ADMIN: /setcadangan, /cekcadangan, /pengumuman, /hapuspengumuman
+      // Tiap set bisa punya link CADANGAN sendiri (mis. move2link) di field item.cadangan.
+      // Pengumuman "belum paham cara beli di bot? beli lewat Lumine cadangan" diposting ke CHANNEL UTAMA
+      // (channel yang sama dengan auto-post set baru, diatur lewat /setpostchannel).
+      const cadNos = (str) => {
+        const out = new Set();
+        for (const tok of String(str).split(/[\s,]+/).filter(Boolean)) {
+          const rg = /^(\d+)-(\d+)$/.exec(tok);
+          if (rg) {
+            const a = parseInt(rg[1], 10);
+            const b = parseInt(rg[2], 10);
+            for (let n = Math.min(a, b); n <= Math.max(a, b) && out.size <= 1000; n++) out.add(n);
+          } else if (/^\d+$/.test(tok)) out.add(parseInt(tok, 10));
+        }
+        return [...out].sort((x, y) => x - y);
+      };
+      const cadUrlOk = (u) => /^https?:\/\/[^\s<>"]+\.[^\s<>"]+$/i.test(u);
+
+      if (rawText.startsWith("/setcadangan")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const arg = rawText.replace(/^\/setcadangan\s*/i, "").trim();
+        const sendT = (t) =>
+          tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML", disable_web_page_preview: true });
+        const katalogCad = await getKatalog();
+
+        if (!arg) {
+          const cur = await redisCommand(["GET", REDIS_BACKUP_LINK_KEY]);
+          const punya = katalogCad.filter((k) => k.cadangan).length;
+          await sendT(
+            `🛟 <b>Link Cadangan</b>\n\n` +
+              `Set yang sudah punya link cadangan: <b>${punya}</b> dari ${katalogCad.length}\n` +
+              `Link umum (toko cadangan): ${cur ? `<code>${escapeHtml(String(cur))}</code>` : "<i>belum diset</i>"}\n\n` +
+              `<b>Per set (satu-satu):</b>\n<code>/setcadangan 5 https://move2link.com/xxxx</code>\n\n` +
+              `<b>Banyak set sekaligus</b> (1 baris = 1 set):\n<code>/setcadangan\n1 https://move2link.com/aaa\n2 https://move2link.com/bbb\n3 https://move2link.com/ccc</code>\n\n` +
+              `<b>Beberapa set, link sama:</b> <code>/setcadangan 1-5 https://link</code>\n` +
+              `<b>Hapus:</b> <code>/setcadangan hapus 5</code> (atau <code>hapus 1-5</code>)\n` +
+              `<b>Link umum:</b> <code>/setcadangan https://link</code> | <code>/setcadangan off</code>\n\n` +
+              `Cek: /cekcadangan • Pengumuman: <code>/pengumuman tes 1,2,3</code>`
+          );
+          return res.status(200).json({ ok: true });
+        }
+        if (arg.toLowerCase() === "off") {
+          await redisCommand(["DEL", REDIS_BACKUP_LINK_KEY]);
+          await sendT("✅ Link umum cadangan dihapus (link per set tidak ikut terhapus).");
+          return res.status(200).json({ ok: true });
+        }
+        if (/^hapus(\s|$)/i.test(arg)) {
+          const nosDel = cadNos(arg.replace(/^hapus/i, "")).filter((n) => n >= 1 && n <= katalogCad.length);
+          if (!nosDel.length) {
+            await sendT("Format: <code>/setcadangan hapus 5</code> atau <code>/setcadangan hapus 1-5</code>");
+            return res.status(200).json({ ok: true });
+          }
+          for (const n of nosDel) delete katalogCad[n - 1].cadangan;
+          await saveKatalog(katalogCad);
+          const syncDel = await syncSummaryText(token, nosDel.map((n) => ({ no: n, item: katalogCad[n - 1] })));
+          await sendT(`🗑 Link cadangan dihapus dari ${nosDel.length} set.${syncDel}`);
+          return res.status(200).json({ ok: true });
+        }
+
+        const firstTok = arg.split(/\s+/)[0];
+        if (!/^[\d,\-]+$/.test(firstTok)) {
+          // bukan nomor -> link umum toko cadangan
+          const urlCad = normalizeUrl(firstTok);
+          if (!cadUrlOk(urlCad)) {
+            await sendT("⚠️ Format salah. Per set: <code>/setcadangan 5 https://link</code> • Link umum: <code>/setcadangan https://link</code>");
+            return res.status(200).json({ ok: true });
+          }
+          await redisCommand(["SET", REDIS_BACKUP_LINK_KEY, urlCad]);
+          await sendT(`✅ Link umum cadangan disimpan:\n<code>${escapeHtml(urlCad)}</code>\n\nCek tampilannya: <code>/pengumuman tes</code>`);
+          return res.status(200).json({ ok: true });
+        }
+
+        // per set: tiap baris "NOMOR LINK" atau "NOMOR | LINK" (NOMOR boleh 1,2,3 atau 1-5)
+        let okCount = 0;
+        const affected = new Set();
+        const bad = [];
+        const outOfRange = [];
+        for (const rawLine of arg.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          const m = /^([\d,\s\-]+?)\s*[|\s]\s*(\S+)$/.exec(line);
+          const urlLine = m ? normalizeUrl(m[2]) : "";
+          if (!m || !cadUrlOk(urlLine)) {
+            bad.push(line.slice(0, 50));
+            continue;
+          }
+          for (const n of cadNos(m[1])) {
+            if (n < 1 || n > katalogCad.length) {
+              outOfRange.push(n);
+              continue;
+            }
+            katalogCad[n - 1].cadangan = urlLine;
+            affected.add(n);
+            okCount++;
+          }
+        }
+        if (okCount > 0) await saveKatalog(katalogCad);
+        const syncTxt = okCount > 0 ? await syncSummaryText(token, [...affected].map((n) => ({ no: n, item: katalogCad[n - 1] }))) : "";
+        await sendT(
+          (okCount > 0 ? `✅ <b>${okCount} set</b> diperbarui link cadangannya.` : "⚠️ Tidak ada baris yang valid.") +
+            (outOfRange.length ? `\n⚠️ Nomor tidak ada: ${[...new Set(outOfRange)].slice(0, 15).join(", ")}` : "") +
+            (bad.length ? `\n⚠️ Baris dilewati: ${bad.slice(0, 8).map((b) => `<code>${escapeHtml(b)}</code>`).join(", ")}` : "") +
+            syncTxt +
+            (okCount > 0 ? `\n\nCek: /cekcadangan • /cekpost` : `\n\nFormat tiap baris: <code>NOMOR https://link</code>`)
+        );
+        return res.status(200).json({ ok: true });
+      }
+
+      if (rawText.startsWith("/cekcadangan")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const katalogCek = await getKatalog();
+        const argC = rawText.replace(/^\/cekcadangan\s*/i, "").trim().toLowerCase();
+        const lines = [];
+        let punya = 0;
+        katalogCek.forEach((k, i) => {
+          if (k.cadangan) punya++;
+          if (argC === "semua" || (argC === "" && !k.cadangan) || (argC === "ada" && k.cadangan)) {
+            lines.push(`${i + 1}. ${k.cadangan ? "✅" : "❌"} ${escapeHtml(k.nama)}${k.cadangan ? ` → ${escapeHtml(k.cadangan)}` : ""}`);
+          }
+        });
+        const head = `🛟 Link cadangan: <b>${punya}</b> dari ${katalogCek.length} set\n(${argC === "" ? "yang BELUM punya" : argC === "ada" ? "yang sudah punya" : "semua set"})\n`;
+        let buf = head;
+        for (const l of lines) {
+          if (buf.length + l.length + 1 > 3800) {
+            await tgRequest(token, "sendMessage", { chat_id: chatId, text: buf, parse_mode: "HTML", disable_web_page_preview: true });
+            buf = "";
+          }
+          buf += (buf ? "\n" : "") + l;
+        }
+        if (!lines.length) buf += "\n<i>Tidak ada.</i>";
+        buf += `\n\n<i>/cekcadangan ada • /cekcadangan semua</i>`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: buf, parse_mode: "HTML", disable_web_page_preview: true });
+        return res.status(200).json({ ok: true });
+      }
+
+      if (rawText.startsWith("/pengumuman")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const sendT = (t) =>
+          tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML", disable_web_page_preview: true });
+        let argP = rawText.replace(/^\/pengumuman\s*/i, "").trim();
+        const pinIt = /(^|\s)--pin(\s|$)/i.test(argP);
+        argP = argP.replace(/(^|\s)--pin(?=\s|$)/gi, " ").trim();
+        let isTes = false;
+        if (/^tes(\s|$)/i.test(argP)) {
+          isTes = true;
+          argP = argP.replace(/^tes\s*/i, "").trim();
+        }
+
+        // Mode per set: /pengumuman 1,2,3 [teks]  atau  /pengumuman semua [teks]
+        const katalogPeng = await getKatalog();
+        let setNos = [];
+        const tokP = argP.split(/\s+/)[0] || "";
+        if (/^[\d,\-]+$/.test(tokP)) {
+          setNos = cadNos(tokP);
+          argP = argP.slice(tokP.length).trim();
+        } else if (/^semua$/i.test(tokP)) {
+          setNos = katalogPeng.map((k, i) => (k.cadangan ? i + 1 : 0)).filter(Boolean);
+          argP = argP.slice(tokP.length).trim();
+        }
+        const perSet = setNos.length > 0 || /^[\d,\-]+$|^semua$/i.test(tokP);
+
+        const chPeng = isTes ? String(chatId) : await getPostChannel();
+        if (!chPeng) {
+          await sendT("⚠️ Channel utama belum diset. Atur dulu: <code>/setpostchannel @username_channel</code>");
+          return res.status(200).json({ ok: true });
+        }
+        const botUnamePeng = await getBotUsername(token);
+        const photoPeng = msg.photo && msg.photo.length > 0 ? msg.photo[msg.photo.length - 1].file_id : "";
+        const extraTxt = argP ? `${escapeHtml(argP)}\n\n` : "";
+
+        // susun daftar pesan (tiap pesan = caption + tombol)
+        const posts = [];
+        if (perSet) {
+          const valid = setNos.filter((n) => n >= 1 && n <= katalogPeng.length);
+          const tanpaLink = valid.filter((n) => !katalogPeng[n - 1].cadangan);
+          const punya = valid.filter((n) => katalogPeng[n - 1].cadangan);
+          if (!punya.length) {
+            await sendT(
+              "⚠️ Tidak ada set yang punya link cadangan dari nomor itu." +
+                (tanpaLink.length ? `\nBelum ada link: ${tanpaLink.slice(0, 20).join(", ")}` : "") +
+                "\nAtur dulu: <code>/setcadangan 5 https://link</code>"
+            );
+            return res.status(200).json({ ok: true });
+          }
+          const CHUNK = 15;
+          const MAXPOST = 5;
+          for (let i = 0; i < punya.length && posts.length < MAXPOST; i += CHUNK) {
+            const grp = punya.slice(i, i + CHUNK);
+            const names = grp.map((n) => `${n}. ${escapeHtml(katalogPeng[n - 1].nama)}`).join("\n");
+            const rows = grp.map((n) => [{ text: `🔗 #${n} ${katalogPeng[n - 1].nama}`.slice(0, 60), url: katalogPeng[n - 1].cadangan }]);
+            if (botUnamePeng) rows.push([{ text: "🤖 Beli di Bot Utama", url: `https://t.me/${botUnamePeng}` }]);
+            posts.push({
+              caption:
+                `📢 <b>PENGUMUMAN</b>\n\n` +
+                `Bingung atau belum tahu cara beli di bot? Set di bawah ini juga bisa dibeli lewat <b>Link Cadangan</b> 👇\n\n` +
+                `${names}\n\n${extraTxt}Klik tombol set yang kamu mau.`,
+              rows,
+            });
+          }
+          var sisaPeng = Math.max(0, punya.length - posts.length * CHUNK);
+          var tanpaLinkPeng = tanpaLink;
+        } else {
+          const backupLink = await redisCommand(["GET", REDIS_BACKUP_LINK_KEY]);
+          if (!backupLink) {
+            await sendT(
+              "⚠️ Belum ada link cadangan.\n• Per set: <code>/setcadangan 5 https://link</code> lalu <code>/pengumuman 5</code>\n• Atau link umum: <code>/setcadangan https://link</code> lalu <code>/pengumuman</code>"
+            );
+            return res.status(200).json({ ok: true });
+          }
+          const rows = [[{ text: "🔗 Beli di Link Cadangan", url: String(backupLink) }]];
+          if (botUnamePeng) rows.push([{ text: "🤖 Beli di Bot Utama", url: `https://t.me/${botUnamePeng}` }]);
+          posts.push({
+            caption:
+              `📢 <b>PENGUMUMAN</b>\n\n` +
+              `Bingung atau belum tahu cara beli di bot? Tenang, kamu juga bisa beli lewat <b>Link Cadangan</b> 👇\n\n` +
+              `${extraTxt}Klik tombol di bawah untuk lanjut belanja.`,
+            rows,
+          });
+        }
+
+        if (photoPeng && posts.some((x) => x.caption.length > 1000)) {
+          await sendT("⚠️ Teks terlalu panjang untuk caption foto (maks sekitar 1000 karakter). Kirim tanpa foto, atau kurangi jumlah set/teksnya.");
+          return res.status(200).json({ ok: true });
+        }
+
+        const sentIds = [];
+        let errPeng = "";
+        for (let i = 0; i < posts.length; i++) {
+          const pst = posts[i];
+          const usePhoto = photoPeng && i === 0;
+          const r = usePhoto
+            ? await tgRequest(token, "sendPhoto", {
+                chat_id: chPeng,
+                photo: photoPeng,
+                caption: pst.caption,
+                parse_mode: "HTML",
+                reply_markup: { inline_keyboard: pst.rows },
+              })
+            : await tgRequest(token, "sendMessage", {
+                chat_id: chPeng,
+                text: pst.caption,
+                parse_mode: "HTML",
+                disable_web_page_preview: true,
+                reply_markup: { inline_keyboard: pst.rows },
+              });
+          if (!r || !r.ok) {
+            errPeng = (r && r.description) || "unknown";
+            break;
+          }
+          if (r.result && r.result.message_id) sentIds.push(r.result.message_id);
+          if (i < posts.length - 1) await new Promise((rs) => setTimeout(rs, 1000));
+        }
+        if (errPeng) {
+          await sendT(
+            `❌ Gagal ${isTes ? "mengirim contoh" : "posting ke channel"}: ${escapeHtml(errPeng)}\n` +
+              (isTes ? "" : "<i>Pastikan bot jadi admin di channel dan <code>/setpostchannel</code> sudah benar.</i>") +
+              (sentIds.length ? `\n(${sentIds.length} pesan sempat terkirim, hapus dengan /hapuspengumuman)` : "")
+          );
+          if (!isTes && sentIds.length) {
+            await redisCommand(["SET", REDIS_ANNOUNCE_LAST_KEY, JSON.stringify({ chat_id: chPeng, ids: sentIds, ts: Date.now() })]);
+          }
+          return res.status(200).json({ ok: true });
+        }
+        const notes =
+          (perSet && tanpaLinkPeng && tanpaLinkPeng.length ? `\n⚠️ Dilewati (belum punya link cadangan): ${tanpaLinkPeng.slice(0, 20).join(", ")}` : "") +
+          (perSet && sisaPeng ? `\n⚠️ ${sisaPeng} set belum ikut (maks 5 pesan per perintah). Kirim lagi dengan nomor sisanya.` : "");
+        if (isTes) {
+          await sendT(`👆 Itu contohnya (${posts.length} pesan). Kalau sudah pas, kirim tanpa kata <code>tes</code> (boleh tambah foto atau <code>--pin</code>).${notes}`);
+          return res.status(200).json({ ok: true });
+        }
+        await redisCommand(["SET", REDIS_ANNOUNCE_LAST_KEY, JSON.stringify({ chat_id: chPeng, ids: sentIds, ts: Date.now() })]);
+        let pinNote = "";
+        if (pinIt && sentIds.length) {
+          const rPin = await tgRequest(token, "pinChatMessage", { chat_id: chPeng, message_id: sentIds[0], disable_notification: true });
+          pinNote = rPin && rPin.ok ? " dan pesan pertama di-pin" : " (gagal pin, pastikan bot punya izin pin pesan)";
+        }
+        await sendT(`✅ Pengumuman terkirim ke channel utama (${posts.length} pesan)${pinNote}.${notes}\nHapus lagi: <code>/hapuspengumuman</code>`);
+        return res.status(200).json({ ok: true });
+      }
+
+      if (rawText.startsWith("/hapuspengumuman")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const sendT = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, text: t, parse_mode: "HTML" });
+        let last = null;
+        try {
+          last = JSON.parse((await redisCommand(["GET", REDIS_ANNOUNCE_LAST_KEY])) || "null");
+        } catch (_) {}
+        const ids = last ? last.ids || (last.message_id ? [last.message_id] : []) : [];
+        if (!last || !ids.length) {
+          await sendT("Belum ada pengumuman yang tercatat untuk dihapus.");
+          return res.status(200).json({ ok: true });
+        }
+        let okDel = 0;
+        let errDel = "";
+        for (const mid of ids) {
+          const rDel = await tgRequest(token, "deleteMessage", { chat_id: last.chat_id, message_id: mid });
+          if (rDel && rDel.ok) okDel++;
+          else errDel = (rDel && rDel.description) || "unknown";
+        }
+        if (okDel === ids.length) await redisCommand(["DEL", REDIS_ANNOUNCE_LAST_KEY]);
+        await sendT(okDel === ids.length ? `🗑 Pengumuman terakhir dihapus dari channel (${okDel} pesan).` : `⚠️ ${okDel}/${ids.length} pesan terhapus. Error: ${escapeHtml(errDel)}`);
+        return res.status(200).json({ ok: true });
+      }
+
+      // 10A6. ADMIN: /cekpost & /updatepost — edit tombol postingan channel yang sudah ada (tanpa posting ulang)
+      if (rawText.startsWith("/cekpost")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const katalogCp = await getKatalog();
+        const recs = await getAllPostMsgs();
+        const belum = [];
+        let tercatat = 0;
+        let sudahCad = 0;
+        let perluEdit = 0;
+        katalogCp.forEach((k, i) => {
+          const r = recs[String(k.id)];
+          if (r) {
+            tercatat++;
+            if ((r.cad || "") === (k.cadangan || "")) {
+              if (k.cadangan) sudahCad++;
+            } else perluEdit++;
+          } else belum.push(i + 1);
+        });
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `📌 <b>Postingan channel yang tercatat</b>\n\n` +
+            `Tercatat: <b>${tercatat}</b> dari ${katalogCp.length} set\n` +
+            `✅ Tombol Link Cadangan sudah terpasang: <b>${sudahCad}</b>\n` +
+            `✏️ Perlu diedit (kirim /updatepost): <b>${perluEdit}</b>\n` +
+            `📭 Belum tercatat: <b>${belum.length}</b>` +
+            (belum.length && belum.length <= 40 ? `\nNomor: ${belum.join(", ")}` : "") +
+            `\n\n<i>Postingan baru yang diposting bot otomatis tercatat. Postingan lama: teruskan (forward) dari channel ke bot ini (bisa banyak sekaligus).</i>`,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      if (rawText.startsWith("/updatepost")) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const argU = rawText.replace(/^\/updatepost\s*/i, "").trim();
+        const katalogUp = await getKatalog();
+        const recsU = await getAllPostMsgs();
+        let entries = [];
+        if (!argU || /^semua$/i.test(argU)) {
+          katalogUp.forEach((k, i) => {
+            const r = recsU[String(k.id)];
+            if (r && (r.cad || "") !== (k.cadangan || "")) entries.push({ no: i + 1, item: k });
+          });
+        } else {
+          entries = cadNos(argU)
+            .filter((n) => n >= 1 && n <= katalogUp.length)
+            .map((n) => ({ no: n, item: katalogUp[n - 1] }));
+        }
+        if (!entries.length) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            parse_mode: "HTML",
+            text: "Tidak ada postingan yang perlu diedit. Cek dulu: /cekpost\n<i>Isi link cadangan: /setcadangan • lalu <code>/updatepost</code> atau <code>/updatepost 1,2,3</code></i>",
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const syncU = await syncSummaryText(token, entries);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: `✅ Selesai memproses ${entries.length} set.${syncU || "\nTidak ada perubahan."}`,
         });
         return res.status(200).json({ ok: true });
       }
