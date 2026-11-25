@@ -926,6 +926,90 @@ async function chargeFundForMargin(token, margin, ownerName) {
   }
 }
 
+// ---- PAPAN SKOR UNDANG TEMAN MINGGUAN (hanya dihitung saat teman yang diajak sudah belanja) ----
+const REDIS_REFLB_PREFIX = "lumine_main_reflb_"; // hash per minggu WIB: id pengundang -> jumlah teman yang sudah belanja
+const REDIS_REFLB_PAID_KEY = "lumine_main_reflb_paid"; // minggu terakhir yang hadiahnya sudah dibagikan
+const REFLB_HADIAH = [20000, 10000, 5000]; // juara 1, 2, 3 (saldo gratis)
+const REFLB_MEDALI = ["🥇", "🥈", "🥉"];
+const REFLB_MIN_PESERTA = 3; // minimal jumlah pengundang yang aktif dalam seminggu agar hadiah dibagikan
+
+async function addReferralLeaderboardPoint(referrerId) {
+  const { weekKey } = getWibPeriods();
+  const key = `${REDIS_REFLB_PREFIX}${weekKey}`;
+  await redisCommand(["HINCRBY", key, String(referrerId), 1]);
+  await redisCommand(["EXPIRE", key, String(60 * 60 * 24 * 21)]);
+}
+
+async function getReferralWeekRows(weekKey) {
+  const flat = (await redisCommand(["HGETALL", `${REDIS_REFLB_PREFIX}${weekKey}`])) || [];
+  const rows = [];
+  for (let i = 0; i < flat.length; i += 2) rows.push({ id: String(flat[i]), n: Number(flat[i + 1]) || 0 });
+  return rows.sort((a, b) => b.n - a.n);
+}
+
+async function nameOf(ids) {
+  if (!ids.length) return [];
+  const names = (await redisCommand(["HMGET", REDIS_LB_NAMES_KEY, ...ids])) || [];
+  return ids.map((id, i) => (names[i] ? String(names[i]) : `Pembeli ${id.slice(-4)}`));
+}
+
+// Dipanggil sekali per hari dari ringkasan harian. Saat minggu berganti, bagikan hadiah minggu sebelumnya.
+async function settleReferralWeek(token) {
+  const { weekKey } = getWibPeriods();
+  const last = await redisCommand(["GET", REDIS_REFLB_PAID_KEY]);
+  if (!last) {
+    await redisCommand(["SET", REDIS_REFLB_PAID_KEY, weekKey]);
+    return;
+  }
+  if (String(last) === weekKey) return;
+  const lock = await redisCommand(["SET", `${REDIS_REFLB_PAID_KEY}_lock_${last}`, "1", "NX", "EX", "604800"]);
+  if (lock !== "OK") return; // minggu ini sudah dibagikan
+
+  const rows = (await getReferralWeekRows(String(last))).filter((r) => r.n > 0);
+  if (rows.length < REFLB_MIN_PESERTA) {
+    // Peserta belum cukup: hadiah tidak dibagikan supaya tidak ada satu orang yang menang sendirian
+    const channelId = await getPostChannel();
+    if (channelId) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: channelId,
+        parse_mode: "HTML",
+        text:
+          `🏆 <b>Papan Skor Undang Teman minggu lalu</b>\n\n` +
+          `Peserta belum cukup (minimal ${REFLB_MIN_PESERTA} pengundang aktif), jadi hadiah minggu ini belum dibagikan. ` +
+          `Minggu baru, kesempatan baru: ajak temanmu lewat menu 👥 Undang Teman!`,
+      });
+    }
+    await redisCommand(["SET", REDIS_REFLB_PAID_KEY, weekKey]);
+    return;
+  }
+
+  const top = rows.slice(0, REFLB_HADIAH.length);
+  const names = await nameOf(top.map((r) => r.id));
+  const lines = [];
+  for (let i = 0; i < top.length; i++) {
+    const r = top[i];
+    await addUserSaldo(r.id, REFLB_HADIAH[i], "gratis");
+    lines.push(`${REFLB_MEDALI[i]} ${escapeHtml(names[i])} — ${r.n} teman, hadiah ${formatRupiah(REFLB_HADIAH[i])}`);
+    await tgRequest(token, "sendMessage", {
+      chat_id: r.id,
+      parse_mode: "HTML",
+      text:
+        `🏆 <b>Juara ${i + 1} Papan Skor Undang Teman!</b>\n` +
+        `Kamu mengajak ${r.n} teman yang sudah belanja minggu lalu.\n` +
+        `💰 Saldo masuk: <b>+${formatRupiah(REFLB_HADIAH[i])}</b>`,
+    });
+  }
+  const channelId = await getPostChannel();
+  if (channelId && lines.length) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: channelId,
+      parse_mode: "HTML",
+      text: `🏆 <b>JUARA UNDANG TEMAN MINGGU LALU</b>\n\n${lines.join("\n")}\n\nMau ikut? Ajak temanmu lewat menu 👥 Undang Teman.`,
+    });
+  }
+  await redisCommand(["SET", REDIS_REFLB_PAID_KEY, weekKey]);
+}
+
 async function maybeRewardReferral(token, order) {
   if (!REFERRAL_ENABLED || !order || order.rbot_owner) return;
   // Hanya pembayaran uang asli (QRIS): deposit, atau pembelian yang bukan pakai saldo
@@ -937,6 +1021,11 @@ async function maybeRewardReferral(token, order) {
   const inviteeId = String(order.buyer_id);
   const referrerId = await redisCommand(["HGET", REDIS_REF_BY_KEY, inviteeId]);
   if (!referrerId) return;
+
+  // ANTI CURANG: akun yang diblacklist, atau pengundang & teman yang saling mengundang (loop), tidak dihitung
+  if ((await isBanned(referrerId)) || (await isBanned(inviteeId))) return;
+  const reverse = await redisCommand(["HGET", REDIS_REF_BY_KEY, String(referrerId)]);
+  if (reverse && String(reverse) === inviteeId) return;
 
   // Klaim satu kali per teman (aman walau ACC terpanggil dua kali)
   const claimed = await redisCommand(["HSETNX", REDIS_REF_REWARDED_KEY, inviteeId, "1"]);
@@ -998,6 +1087,11 @@ async function maybeRewardReferral(token, order) {
     throw addErr;
   }
   await redisCommand(["HINCRBY", REDIS_REF_TOTAL_KEY, String(referrerId), 1]);
+  try {
+    await addReferralLeaderboardPoint(referrerId);
+  } catch (lbErr) {
+    console.error("Papan skor undang teman error:", lbErr);
+  }
   await tgRequest(token, "sendMessage", {
     chat_id: referrerId,
     text:
@@ -7839,6 +7933,11 @@ async function getDailyOmset(dayKey) {
 
 // Ringkasan harian untuk admin: dikirim sekali sehari, berisi data kemarin dan antrean hari ini
 async function maybeSendDailySummary(token) {
+  try {
+    await settleReferralWeek(token);
+  } catch (stlErr) {
+    console.error("Bagi hadiah undang teman error:", stlErr);
+  }
   if (!SUMMARY_ENABLED) return;
   const now = Date.now();
   const wib = new Date(now + 7 * 3600 * 1000);
@@ -11677,6 +11776,24 @@ module.exports = async function handler(req, res) {
 
       if (rawText.startsWith("/saldo")) {
         await sendSaldoMenu(token, chatId, senderId);
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0C. USER: /undangskor (papan skor undang teman minggu ini)
+      if (/^\/undangskor(\s|$)/i.test(rawText)) {
+        const { weekKey } = getWibPeriods();
+        const rows = await getReferralWeekRows(weekKey);
+        const top = rows.slice(0, 10);
+        const names = await nameOf(top.map((r) => r.id));
+        const myIdx = rows.findIndex((r) => r.id === String(msg.from && msg.from.id));
+        let teks = "🏆 <b>Papan Skor Undang Teman Minggu Ini</b>\n\n";
+        if (!top.length) teks += "Belum ada yang belanja dari ajakan minggu ini. Jadilah yang pertama!\n";
+        top.forEach((r, i) => {
+          teks += `${i + 1}. ${escapeHtml(names[i])} — ${r.n} teman\n`;
+        });
+        teks += myIdx === -1 ? "\nKamu belum masuk papan skor minggu ini." : `\nKamu di posisi <b>${myIdx + 1}</b> dengan ${rows[myIdx].n} teman.`;
+        teks += `\n\n<i>Hadiah juara dibagikan setiap awal minggu jika peserta minimal ${REFLB_MIN_PESERTA} pengundang.</i>`;
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: teks, parse_mode: "HTML" });
         return res.status(200).json({ ok: true });
       }
 
