@@ -8613,7 +8613,10 @@ async function postOneSetToChannel(token, item, channel, botUname, requirePhoto 
       });
   if (r && r.ok) {
     const mid = r.result && r.result.message_id;
-    if (mid) await recordPostMsg(item.id, (r.result.chat && r.result.chat.id) || channel, mid, cadanganKey(item));
+    if (mid) {
+      await recordPostMsg(item.id, (r.result.chat && r.result.chat.id) || channel, mid, "", msgToHtml(r.result), Boolean(r.result.photo));
+      if (getCadanganList(item).length) await editPostButtons(token, item, botUname);
+    }
   }
   return Boolean(r && r.ok);
 }
@@ -8883,14 +8886,63 @@ function cadanganKey(item) {
 // Tombol postingan: tombol beli ke bot + tombol untuk tiap link cadangan set
 function buildPostMarkup(item, botUname) {
   const rows = [[{ text: "🛒 Lihat & Beli", url: `https://t.me/${botUname}?start=buy_${item.id}` }]];
-  getCadanganList(item).forEach((u, i) => {
-    rows.push([{ text: i === 0 ? "🔗 Beli di Link Cadangan" : `🔗 Link Cadangan ${i + 1}`, url: u }]);
-  });
   return { inline_keyboard: rows };
 }
 
-async function recordPostMsg(itemId, chatId, messageId, cad) {
-  await redisCommand(["HSET", REDIS_POSTMSG_KEY, String(itemId), JSON.stringify({ chat_id: chatId, message_id: messageId, cad: cad || "" })]);
+async function recordPostMsg(itemId, chatId, messageId, cad, base, isPhoto) {
+  await redisCommand([
+    "HSET",
+    REDIS_POSTMSG_KEY,
+    String(itemId),
+    JSON.stringify({ chat_id: chatId, message_id: messageId, cad: cad || "", base: base || "", photo: Boolean(isPhoto) }),
+  ]);
+}
+
+// Ubah teks + entity pesan Telegram jadi HTML (supaya teks asli tetap utuh saat link cadangan ditambahkan)
+function msgToHtml(m) {
+  const src = String((m && (m.text || m.caption)) || "");
+  const ents = ((m && (m.entities || m.caption_entities)) || []).filter((e) => e && e.type && e.length > 0);
+  if (!ents.length) return escapeHtml(src);
+  const tagOf = (e) => {
+    if (e.type === "bold") return ["<b>", "</b>"];
+    if (e.type === "italic") return ["<i>", "</i>"];
+    if (e.type === "underline") return ["<u>", "</u>"];
+    if (e.type === "strikethrough") return ["<s>", "</s>"];
+    if (e.type === "code") return ["<code>", "</code>"];
+    if (e.type === "pre") return ["<pre>", "</pre>"];
+    if (e.type === "text_link" && e.url) return [`<a href="${escapeHtml(e.url)}">`, "</a>"];
+    return null;
+  };
+  const sorted = ents.slice().sort((a, b) => a.offset - b.offset || b.length - a.length);
+  let out = "";
+  const stack = [];
+  let idx = 0;
+  for (let i = 0; i <= src.length; i++) {
+    // tutup tag yang berakhir di posisi ini (urutan LIFO)
+    while (stack.length && stack[stack.length - 1].end === i) {
+      out += stack.pop().close;
+    }
+    // buka tag yang mulai di posisi ini
+    while (idx < sorted.length && sorted[idx].offset === i) {
+      const e = sorted[idx++];
+      const t = tagOf(e);
+      if (t) {
+        out += t[0];
+        stack.push({ end: e.offset + e.length, close: t[1] });
+      }
+    }
+    if (i < src.length) out += escapeHtml(src[i]);
+  }
+  while (stack.length) out += stack.pop().close;
+  return out;
+}
+
+// Blok teks link cadangan yang ditambahkan di bawah teks asli postingan
+function cadanganBlock(item) {
+  const list = getCadanganList(item);
+  if (!list.length) return "";
+  const lines = list.map((u, i) => (list.length > 1 ? `${i + 1}. ${escapeHtml(u)}` : escapeHtml(u)));
+  return "\n\n🛍️ <b>Beli di Link Cadangan:</b>\n" + lines.join("\n");
 }
 
 async function getPostMsg(itemId) {
@@ -8917,13 +8969,14 @@ async function getAllPostMsgs() {
 async function editPostButtons(token, item, botUname) {
   const rec = await getPostMsg(item.id);
   if (!rec) return { ok: false, reason: "belum tercatat" };
+  if (!rec.base) return { ok: false, reason: "teks asli belum tercatat, teruskan ulang postingan ini ke bot" };
   const want = cadanganKey(item);
   if ((rec.cad || "") === want) return { ok: true, skipped: true };
-  const r = await tgRequest(token, "editMessageReplyMarkup", {
-    chat_id: rec.chat_id,
-    message_id: rec.message_id,
-    reply_markup: buildPostMarkup(item, botUname),
-  });
+  const fullText = rec.base + cadanganBlock(item);
+  const payload = rec.photo
+    ? { chat_id: rec.chat_id, message_id: rec.message_id, caption: fullText, parse_mode: "HTML", reply_markup: buildPostMarkup(item, botUname) }
+    : { chat_id: rec.chat_id, message_id: rec.message_id, text: fullText, parse_mode: "HTML", disable_web_page_preview: true, reply_markup: buildPostMarkup(item, botUname) };
+  const r = await tgRequest(token, rec.photo ? "editMessageCaption" : "editMessageText", payload);
   if (r && (r.ok || /not modified/i.test(r.description || ""))) {
     rec.cad = want;
     await redisCommand(["HSET", REDIS_POSTMSG_KEY, String(item.id), JSON.stringify(rec)]);
@@ -9234,7 +9287,10 @@ async function postNewSetToChannel(token, item) {
       await redisCommand(["HSET", REDIS_POSTALL_DONE_KEY, String(item.id), "1"]);
       // catat id pesan channel supaya tombol bisa diedit nanti (tombol Link Cadangan) tanpa posting ulang
       const mid = rNew.result && rNew.result.message_id;
-      if (mid) await recordPostMsg(item.id, (rNew.result.chat && rNew.result.chat.id) || targetChannel, mid, cadanganKey(item));
+      if (mid) {
+        await recordPostMsg(item.id, (rNew.result.chat && rNew.result.chat.id) || targetChannel, mid, "", msgToHtml(rNew.result), Boolean(rNew.result.photo));
+        if (getCadanganList(item).length) await editPostButtons(token, item, botUname);
+      }
     }
   } catch (e) {
     console.error("Auto-post set ke channel gagal:", e && e.message);
@@ -10452,7 +10508,7 @@ module.exports = async function handler(req, res) {
           const it = found.item;
           const old = await getPostMsg(it.id);
           const keepCad = old && String(old.message_id) === String(fmid) ? old.cad || "" : "";
-          await recordPostMsg(it.id, fchat.id, fmid, keepCad);
+          await recordPostMsg(it.id, fchat.id, fmid, keepCad, msgToHtml(msg), Boolean(msg.photo));
           let note = "";
           if (it.cadangan) {
             const botUnameF = await getBotUsername(token);
@@ -13689,7 +13745,7 @@ module.exports = async function handler(req, res) {
           text:
             `📌 <b>Postingan channel yang tercatat</b>\n\n` +
             `Tercatat: <b>${tercatat}</b> dari ${katalogCp.length} set\n` +
-            `✅ Tombol Link Cadangan sudah terpasang: <b>${sudahCad}</b>\n` +
+            `✅ Link cadangan sudah tertulis di postingan: <b>${sudahCad}</b>\n` +
             `✏️ Perlu diedit (kirim /updatepost): <b>${perluEdit}</b>\n` +
             `📭 Belum tercatat: <b>${belum.length}</b>` +
             (belum.length && belum.length <= 40 ? `\nNomor: ${belum.join(", ")}` : "") +
