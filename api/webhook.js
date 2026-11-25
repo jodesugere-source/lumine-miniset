@@ -157,6 +157,10 @@ const REDIS_ORDER_PREFIX = "lumine_main_order_";
 const REDIS_PENDING_MAP_KEY = "lumine_main_pending_orders";
 const REDIS_LB_PREFIX = "lumine_main_lb_";
 const REDIS_LB_NAMES_KEY = "lumine_main_lb_names";
+const REDIS_BUYER_SPEND_KEY = "lumine_main_buyer_spend"; // HASH id pembeli -> total Rp order lunas (sejak fitur ini aktif)
+const REDIS_BUYER_FIRST_KEY = "lumine_main_buyer_first"; // HASH id pembeli -> epoch detik pembelian pertama
+const REDIS_BUYER_LAST_KEY = "lumine_main_buyer_last"; // HASH id pembeli -> epoch detik pembelian terakhir
+const REDIS_BUYER_REJECT_KEY = "lumine_main_buyer_reject"; // HASH id pembeli -> jumlah order ditolak
 const REDIS_LB_ALLCNT_KEY = "lumine_main_lb_allcnt";
 const REDIS_USERS_KEY = "lumine_main_users";
 // ---- HARGA KHUSUS USER BARU BERBATAS WAKTU + PESAN SAMBUTAN ----
@@ -1340,6 +1344,32 @@ function getWibPeriods() {
   return { dayKey, weekKey, monthKey };
 }
 
+// Ringkasan riwayat pembeli untuk notif admin (dipakai saat cek nominal yang tidak sesuai)
+async function buildBuyerStatsBlock(buyerId) {
+  const id = String(buyerId);
+  const [cnt, spend, last, rej] = await Promise.all([
+    redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, id]),
+    redisCommand(["HGET", REDIS_BUYER_SPEND_KEY, id]),
+    redisCommand(["HGET", REDIS_BUYER_LAST_KEY, id]),
+    redisCommand(["HGET", REDIS_BUYER_REJECT_KEY, id]),
+  ]);
+  const n = parseInt(cnt, 10) || 0;
+  const total = parseInt(spend, 10) || 0;
+  const rejected = parseInt(rej, 10) || 0;
+  const lastSec = parseInt(last, 10) || 0;
+  if (!n) return "📊 <b>Pembeli baru</b> (belum pernah ACC)";
+  let lastTxt = "-";
+  if (lastSec) {
+    const hari = Math.floor((Date.now() / 1000 - lastSec) / 86400);
+    lastTxt = hari <= 0 ? "hari ini" : `${hari} hari lalu`;
+  }
+  let line = `📊 <b>Riwayat:</b> ${n}x beli`;
+  if (total > 0) line += ` • total ${formatRupiah(total)}`;
+  line += ` • terakhir ${lastTxt}`;
+  if (rejected) line += ` • ❌ ditolak ${rejected}x`;
+  return line;
+}
+
 async function recordPurchaseToLeaderboard(order) {
   const { dayKey, weekKey, monthKey } = getWibPeriods();
   const memberId = String(order.buyer_id);
@@ -1356,6 +1386,9 @@ async function recordPurchaseToLeaderboard(order) {
   await Promise.all([
     redisCommand(["HSET", REDIS_LB_NAMES_KEY, memberId, displayName]),
     redisCommand(["HINCRBY", REDIS_LB_ALLCNT_KEY, memberId, 1]),
+    redisCommand(["HINCRBY", REDIS_BUYER_SPEND_KEY, memberId, nominal]),
+    redisCommand(["HSETNX", REDIS_BUYER_FIRST_KEY, memberId, String(Math.floor(Date.now() / 1000))]),
+    redisCommand(["HSET", REDIS_BUYER_LAST_KEY, memberId, String(Math.floor(Date.now() / 1000))]),
     redisCommand(["ZINCRBY", kDayRp, nominal, memberId]),
     redisCommand(["ZINCRBY", kDayCnt, 1, memberId]),
     redisCommand(["ZINCRBY", kWeekRp, nominal, memberId]),
@@ -10224,9 +10257,12 @@ module.exports = async function handler(req, res) {
             ? `🔔 <b>DEPOSIT SALDO MASUK #${order.id}</b>`
             : `🔔 <b>PESANAN MASUK #${order.id}</b>`;
 
+          const buyerStats = await buildBuyerStatsBlock(order.buyer_id);
           const adminNotifText =
             `${titleLabel}\n\n` +
             `👤 <b>Pembeli:</b> ${escapeHtml(order.buyer_name)} (${escapeHtml(order.buyer_username)})\n` +
+            `🏷️ <a href="tg://user?id=${escapeHtml(String(order.buyer_id))}">Chat pembeli</a>\n` +
+            `${buyerStats}\n` +
             `📦 <b>Item:</b> ${escapeHtml(order.item_nama)}${voucherInfo}\n` +
             `💰 <b>Nominal Wajib Masuk:</b> <code>${formatRupiah(order.total_nominal)}</code>\n\n` +
             `⚡ <i>Jika Auto-ACC Makro aktif, otomatis lunas saat notif HP masuk (atau klik ACC manual di bawah):</i>`;
@@ -10331,6 +10367,7 @@ module.exports = async function handler(req, res) {
 
         order.status = "rejected";
         await saveOrder(orderId, order);
+        await redisCommand(["HINCRBY", REDIS_BUYER_REJECT_KEY, String(order.buyer_id), 1]);
 
         await tgRequest(await getOrderBotToken(token, order), "sendMessage", {
           chat_id: order.buyer_id,
