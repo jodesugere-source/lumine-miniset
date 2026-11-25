@@ -9997,6 +9997,7 @@ async function finalizeBarter(token, b) {
 
   b.status = "selesai";
   await saveBarter(b);
+  if (b.drive_id) await redisCommand(["SET", `${REDIS_BARTER_DRIVE_PREFIX}${b.drive_id}`, b.uid, "EX", String(60 * 60 * 24 * 90)]);
   const links = Array.isArray(b.tuju_links) && b.tuju_links.length ? b.tuju_links : b.tuju_link ? [b.tuju_link] : [];
   await addKoleksi(b.uid, b.tuju_nama, links[0] || "");
   await redisCommand(["SET", `${REDIS_BARTER_CD_PREFIX}${b.uid}_${b.tuju_id}`, "1", "EX", String(BARTER_COOLDOWN_DETIK)]);
@@ -10187,7 +10188,7 @@ async function handleBarterDraftMessage(token, msg, draft, uid) {
     draft.preview = msg.photo[msg.photo.length - 1].file_id;
     draft.step = "link";
     await setBarterDraft(uid, draft);
-    await ask("🔗 Kirim <b>link Google Drive</b> isi produkmu (file atau folder, akses: Siapa saja yang memiliki link).\n🔒 Link disembunyikan dari admin sampai dia menyetujui barter.");
+    await ask("🔗 Kirim <b>link Google Drive</b> isi produkmu (file atau folder, akses: Siapa saja yang memiliki link).\nLink ini akan dilihat admin untuk dinilai sebelum barter disetujui.");
     return true;
   }
   if (draft.step === "link") {
@@ -10520,7 +10521,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
         await tgRequest(token, "sendMessage", { chat_id: chatId, text: "❌ Link itu sama dengan produk yang dijual di katalog. Kirim link isi milikmu sendiri." });
         return null;
       }
-      const pakai = await redisCommand(["SET", `${REDIS_BARTER_DRIVE_PREFIX}${driveId}`, uid, "NX", "EX", String(60 * 60 * 24 * 90)]);
+      const pakai = await redisCommand(["SET", `${REDIS_BARTER_DRIVE_PREFIX}${driveId}`, uid, "NX", "EX", "259200"]);
       if (pakai !== "OK") {
         await tgRequest(token, "sendMessage", { chat_id: chatId, text: "❌ Link Drive itu sudah pernah dipakai untuk barter. Pakai link yang belum pernah dipakai." });
         return null;
@@ -10551,7 +10552,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
   await saveBarter(b);
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
-    text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.\n🔒 Link isimu aman: admin hanya melihat foto preview & jumlah foto, link baru dibuka setelah dia ACC.`,
+    text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.`,
   });
   const adminId = await getNotifyAdminId();
   if (adminId) {
@@ -10560,7 +10561,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
         `Pembeli: <code>${escapeHtml(uid)}</code>\n` +
         `Tukar: <b>${escapeHtml(oldNama)}</b>${hargaLama > 0 ? ` (harga ${formatRupiah(hargaLama)})` : " (produk di luar koleksi)"}\n` +
         `Ke: <b>${escapeHtml(b.tuju_nama)}</b> (harga ${formatRupiah(hargaTuju)})\n` +
-        `${bukti ? `🔒 Link isi: <b>disembunyikan</b> (host: ${escapeHtml(barterLinkHost(bukti.link))}, ${statusLink === "alive" ? "✅ aktif saat dicek bot" : "⚠️ aktif tidak bisa dipastikan bot"}). Link baru dikirim ke kamu setelah ACC.\n🖼️ Total foto: <b>${bukti.total}</b>\n` : ""}` +
+        `${bukti ? `📦 Link isi: ${escapeHtml(bukti.link)} (${statusLink === "alive" ? "✅ aktif saat dicek bot" : "⚠️ aktif tidak bisa dipastikan bot"})\n🖼️ Total foto: <b>${bukti.total}</b>\n` : ""}` +
         `${bukti ? barterReport(bukti) : ""}` +
         `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`;
     const markup = {
@@ -10569,8 +10570,11 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
         { text: "❌ Tolak", callback_data: `barter_tolak_${b.id}` },
       ]],
     };
-    if (bukti && bukti.preview) {
+    if (bukti && bukti.preview && teksAdmin.length <= 1000) {
       await tgRequest(token, "sendPhoto", { chat_id: adminId, photo: bukti.preview, caption: teksAdmin, parse_mode: "HTML", reply_markup: markup });
+    } else if (bukti && bukti.preview) {
+      await tgRequest(token, "sendPhoto", { chat_id: adminId, photo: bukti.preview });
+      await tgRequest(token, "sendMessage", { chat_id: adminId, parse_mode: "HTML", text: teksAdmin, reply_markup: markup });
     } else {
       await tgRequest(token, "sendMessage", { chat_id: adminId, parse_mode: "HTML", text: teksAdmin, reply_markup: markup });
     }
@@ -11307,7 +11311,7 @@ module.exports = async function handler(req, res) {
         }
         if (!isAcc) {
           b.status = "ditolak";
-          if (b.bukti) b.bukti.link = ""; // link tidak pernah dibuka ke admin
+          if (b.bukti) b.bukti.link = ""; // hapus link dari Redis setelah ditolak
           if (b.drive_id) await redisCommand(["DEL", `${REDIS_BARTER_DRIVE_PREFIX}${b.drive_id}`]);
           await saveBarter(b);
           await tgRequest(token, "sendMessage", { chat_id: b.uid, text: `❌ Pengajuan barter ke ${b.tuju_nama} ditolak admin.` });
