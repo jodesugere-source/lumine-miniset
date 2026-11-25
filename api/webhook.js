@@ -9985,6 +9985,7 @@ async function finalizeBarter(token, b) {
     const removed = await removeKoleksiEntry(b.uid, b.old_nama, b.old_link);
     if (!removed) {
       b.status = "gagal";
+      if (b.drive_id) await redisCommand(["DEL", `${REDIS_BARTER_DRIVE_PREFIX}${b.drive_id}`]);
       await saveBarter(b);
       await tgRequest(token, "sendMessage", {
         chat_id: b.uid,
@@ -10010,7 +10011,9 @@ async function finalizeBarter(token, b) {
         parse_mode: "HTML",
         text:
           `🔓 <b>Link barter ${escapeHtml(b.id)}</b> (${escapeHtml(b.old_nama)})\n` +
-          `🔗 ${escapeHtml(b.bukti.link)}\n🖼️ Total foto: <b>${b.bukti.total}</b>`,
+          `🔗 ${escapeHtml(b.bukti.link)}\n🖼️ Total foto: <b>${b.bukti.total}</b>\n` +
+          barterReport(b.bukti),
+        reply_markup: { inline_keyboard: [[{ text: "🚩 Link ampas / curang", callback_data: `barter_lapor_${b.id}` }]] },
       });
     }
   }
@@ -10214,6 +10217,30 @@ async function handleBarterDraftMessage(token, msg, draft, uid) {
   if (draft.step === "total") {
     const n = parseInt(text, 10);
     if (!(n >= 1 && n <= 500)) { await ask("🖼️ Ketik angka total foto, misalnya <code>12</code>."); return true; }
+    let insp = null;
+    const drvT = parseDriveLink(draft.link);
+    if (drvT) {
+      insp = await driveInspect(drvT);
+      if (insp && insp.error === 404) {
+        draft.step = "link";
+        await setBarterDraft(uid, draft);
+        await ask("❌ Isi Drive-mu tidak bisa dibaca (dihapus atau belum publik). Kirim ulang link Drive yang aksesnya <b>Siapa saja yang memiliki link</b>.");
+        return true;
+      }
+      if (insp && insp.error) insp = null; // API bermasalah, lanjut tanpa verifikasi
+      if (insp) {
+        if (insp.media === 0 && insp.archives === 0) {
+          draft.step = "link";
+          await setBarterDraft(uid, draft);
+          await ask("❌ Link Drive itu tidak berisi foto atau video. Kirim link Drive yang benar.");
+          return true;
+        }
+        if (!insp.archives && !insp.truncated && n > Math.ceil(insp.media * 1.2)) {
+          await ask(`⚠️ Link Drive-mu hanya berisi <b>${insp.media}</b> foto/video, tapi kamu menulis ${n}. Ketik total foto yang benar.`);
+          return true;
+        }
+      }
+    }
     await delBarterDraft(uid);
     const offer = {
       mode: draft.mode,
@@ -10225,6 +10252,7 @@ async function handleBarterDraftMessage(token, msg, draft, uid) {
       old_harga: Number(draft.old_harga) || 0,
       old_link: draft.old_link || "",
       link_status: draft.link_status || "unknown",
+      inspect: insp,
     };
     await setBarterOffer(uid, offer);
     await delBarterSearch(uid);
@@ -10332,6 +10360,98 @@ async function checkDriveLink(url) {
   return "unknown";
 }
 
+// ---- ANTI-CURANG: verifikasi isi Drive lewat Drive API (butuh env DRIVE_API_KEY), link daur ulang, blokir barter ----
+const REDIS_BARTER_DRIVE_PREFIX = "lumine_main_barter_driveid_"; // 1 link Drive hanya boleh dipakai 1 kali
+const REDIS_BARTER_BAN_PREFIX = "lumine_main_barter_ban_";
+async function isBarterBanned(uid) {
+  return Boolean(await redisCommand(["GET", `${REDIS_BARTER_BAN_PREFIX}${uid}`]));
+}
+function formatBytesBarter(n) {
+  const b = Number(n) || 0;
+  if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(1) + " GB";
+  if (b >= 1024 ** 2) return (b / 1024 ** 2).toFixed(1) + " MB";
+  return Math.round(b / 1024) + " KB";
+}
+
+// Hasil: null (API key belum diset) | {error: kode} | {media, images, videos, archives, others, bytes, folders, truncated}
+async function driveInspect(drv) {
+  const key = process.env.DRIVE_API_KEY;
+  if (!key) return null;
+  const api = async (path, params) => {
+    const qs = new URLSearchParams({ ...params, key });
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 10000);
+    try {
+      const r = await fetch(`https://www.googleapis.com/drive/v3/${path}?${qs}`, { signal: ctl.signal });
+      if (!r.ok) return { error: r.status };
+      return await r.json();
+    } catch {
+      return { error: 0 };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const out = { media: 0, images: 0, videos: 0, archives: 0, others: 0, bytes: 0, folders: 0, truncated: false };
+  const tally = (f) => {
+    const m = String(f.mimeType || "");
+    if (m.startsWith("image/")) { out.images++; out.media++; }
+    else if (m.startsWith("video/")) { out.videos++; out.media++; }
+    else if (/zip|rar|7z|x-tar|gzip/i.test(m)) out.archives++;
+    else out.others++;
+    out.bytes += Number(f.size) || 0;
+  };
+  const FOLDER = "application/vnd.google-apps.folder";
+  let isFolder = drv.isFolder;
+  if (!isFolder) {
+    const f = await api(`files/${drv.id}`, { fields: "mimeType,size", supportsAllDrives: "true" });
+    if (f.error) return { error: f.error };
+    if (f.mimeType !== FOLDER) { tally(f); return out; }
+  }
+  const queue = [drv.id];
+  let calls = 0;
+  while (queue.length) {
+    const fid = queue.shift();
+    let pageToken = "";
+    for (let page = 0; page < 5; page++) {
+      if (++calls > 20) { out.truncated = true; return out; }
+      const params = {
+        q: `'${fid}' in parents and trashed=false`,
+        fields: "nextPageToken,files(id,mimeType,size)",
+        pageSize: "1000",
+        supportsAllDrives: "true",
+        includeItemsFromAllDrives: "true",
+      };
+      if (pageToken) params.pageToken = pageToken;
+      const r = await api("files", params);
+      if (r.error) {
+        if (calls === 1) return { error: r.error };
+        out.truncated = true;
+        return out;
+      }
+      for (const f of r.files || []) {
+        if (f.mimeType === FOLDER) { out.folders++; if (queue.length < 30) queue.push(f.id); }
+        else tally(f);
+      }
+      if (!r.nextPageToken) break;
+      pageToken = r.nextPageToken;
+      if (page === 4) out.truncated = true;
+    }
+  }
+  return out;
+}
+
+function barterReport(bukti) {
+  const i = bukti && bukti.inspect;
+  if (!i) return "🔍 Verifikasi isi: <b>belum bisa</b> (DRIVE_API_KEY belum diset atau API gagal), nilai dari preview saja.\n";
+  let t =
+    `🔍 <b>Diverifikasi bot:</b> ${i.images} foto, ${i.videos} video` +
+    `${i.archives ? `, ${i.archives} arsip` : ""}${i.others ? `, ${i.others} file lain` : ""}` +
+    ` • ${formatBytesBarter(i.bytes)}${i.folders ? ` • ${i.folders} subfolder` : ""}${i.truncated ? " (terpotong, hitungan minimal)" : ""}\n`;
+  if (i.media > 0 && i.bytes / i.media < 30 * 1024) t += "⚠️ Rata-rata file sangat kecil (&lt;30 KB), curiga thumbnail/ampas.\n";
+  if (!i.archives && !i.truncated && Number(bukti.total) > Math.ceil(i.media * 1.2)) t += `⚠️ Klaim ${bukti.total} foto, terverifikasi cuma ${i.media}.\n`;
+  return t;
+}
+
 function barterLinkHost(u) {
   try { return new URL(String(u)).hostname.replace(/^www\./, ""); } catch { return "?"; }
 }
@@ -10339,6 +10459,10 @@ function barterLinkHost(u) {
 const BARTER_MAKS_SELISIH = 0.3; // selisih harga di atas 30% ditolak otomatis oleh bot
 
 async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItemId, tuju, oldHarga, bukti) {
+  if (await isBarterBanned(uid)) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "🚫 Kamu tidak bisa memakai fitur barter lagi." });
+    return null;
+  }
   const hargaTuju = parseNominal(tuju.harga);
   const hargaLama = Number(oldHarga) || 0;
   if (hargaLama > 0 && hargaTuju > 0) {
@@ -10379,9 +10503,34 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
       return null;
     }
   }
+  // link tidak boleh daur ulang: bukan link produk katalog, dan hanya boleh dipakai sekali
+  let driveId = "";
+  if (bukti && bukti.link) {
+    const drvD = parseDriveLink(bukti.link);
+    driveId = drvD ? drvD.id : "";
+    if (driveId) {
+      const katalogSemua = await getKatalog();
+      const dariKatalog = katalogSemua.some((k) =>
+        (Array.isArray(k.links) && k.links.length ? k.links : k.link ? [k.link] : []).some((l) => {
+          const d = parseDriveLink(l) || parseDriveLink(normalizeUrl(l));
+          return d && d.id === driveId;
+        })
+      );
+      if (dariKatalog) {
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: "❌ Link itu sama dengan produk yang dijual di katalog. Kirim link isi milikmu sendiri." });
+        return null;
+      }
+      const pakai = await redisCommand(["SET", `${REDIS_BARTER_DRIVE_PREFIX}${driveId}`, uid, "NX", "EX", String(60 * 60 * 24 * 90)]);
+      if (pakai !== "OK") {
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: "❌ Link Drive itu sudah pernah dipakai untuk barter. Pakai link yang belum pernah dipakai." });
+        return null;
+      }
+    }
+  }
   // klaim penawaran: DEL mengembalikan 1 hanya untuk request pertama, jadi tap ganda tidak bikin pengajuan dobel
   const claimed = Number(await redisCommand(["DEL", `${REDIS_BARTER_OFFER_PREFIX}${uid}`]));
   if (claimed !== 1) {
+    if (driveId) await redisCommand(["DEL", `${REDIS_BARTER_DRIVE_PREFIX}${driveId}`]);
     await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Penawaran sudah diproses atau kedaluwarsa. Ulangi lewat /barter." });
     return null;
   }
@@ -10396,6 +10545,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
     tuju_nama: tuju.nama,
     tuju_link: tujuLinks[0] || "",
     tuju_links: tujuLinks,
+    drive_id: driveId,
     status: "menunggu_acc",
   };
   await saveBarter(b);
@@ -10411,6 +10561,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
         `Tukar: <b>${escapeHtml(oldNama)}</b>${hargaLama > 0 ? ` (harga ${formatRupiah(hargaLama)})` : " (produk di luar koleksi)"}\n` +
         `Ke: <b>${escapeHtml(b.tuju_nama)}</b> (harga ${formatRupiah(hargaTuju)})\n` +
         `${bukti ? `🔒 Link isi: <b>disembunyikan</b> (host: ${escapeHtml(barterLinkHost(bukti.link))}, ${statusLink === "alive" ? "✅ aktif saat dicek bot" : "⚠️ aktif tidak bisa dipastikan bot"}). Link baru dikirim ke kamu setelah ACC.\n🖼️ Total foto: <b>${bukti.total}</b>\n` : ""}` +
+        `${bukti ? barterReport(bukti) : ""}` +
         `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`;
     const markup = {
       inline_keyboard: [[
@@ -11135,6 +11286,17 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
         await createBarterRequest(token, chatId, uid, offer.nama, offer.old_link || "", offer.old_item_id, tuju, offer.old_harga, offer);
+      } else if (data.startsWith("barter_lapor_")) {
+        if (!(await isAdminUser(call.from))) return res.status(200).json({ ok: true });
+        const b = await getBarter(data.replace("barter_lapor_", ""));
+        if (!b) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Data barter sudah kedaluwarsa." });
+          return res.status(200).json({ ok: true });
+        }
+        await redisCommand(["SET", `${REDIS_BARTER_BAN_PREFIX}${b.uid}`, "1"]);
+        b.status = "dilaporkan";
+        await saveBarter(b);
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: `🚩 User ${b.uid} diblokir dari fitur barter.` });
       } else if (data.startsWith("barter_acc_") || data.startsWith("barter_tolak_")) {
         if (!(await isAdminUser(call.from))) return res.status(200).json({ ok: true });
         const isAcc = data.startsWith("barter_acc_");
@@ -11146,6 +11308,7 @@ module.exports = async function handler(req, res) {
         if (!isAcc) {
           b.status = "ditolak";
           if (b.bukti) b.bukti.link = ""; // link tidak pernah dibuka ke admin
+          if (b.drive_id) await redisCommand(["DEL", `${REDIS_BARTER_DRIVE_PREFIX}${b.drive_id}`]);
           await saveBarter(b);
           await tgRequest(token, "sendMessage", { chat_id: b.uid, text: `❌ Pengajuan barter ke ${b.tuju_nama} ditolak admin.` });
           return res.status(200).json({ ok: true });
@@ -12713,6 +12876,10 @@ module.exports = async function handler(req, res) {
       // 0E. USER: /barter (barter produk di koleksi ke admin, tanpa pembayaran)
       if (/^\/barter(\s|$)/i.test(rawText)) {
         const uid = String(msg.from && msg.from.id);
+        if (await isBarterBanned(uid)) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "🚫 Kamu tidak bisa memakai fitur barter lagi." });
+          return res.status(200).json({ ok: true });
+        }
         const list = (await getKoleksi(uid)).slice(0, 6);
         await tgRequest(token, "sendMessage", {
           chat_id: chatId,
