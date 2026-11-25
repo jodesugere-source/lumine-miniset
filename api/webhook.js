@@ -9978,20 +9978,51 @@ async function barterSourceAt(uid, i) {
 
 async function finalizeBarter(token, b) {
   const lock = await redisCommand(["SET", `${REDIS_BARTER_LOCK_PREFIX}${b.id}`, "1", "NX", "EX", "604800"]);
-  if (lock !== "OK") return;
+  if (lock !== "OK") return { ok: false, reason: "lock" };
+
+  // Mode koleksi: produk lama HARUS berhasil dihapus dulu. Kalau tidak (sudah dihapus/ditukar di pengajuan lain), batalkan.
+  if (b.old_item_id) {
+    const removed = await removeKoleksiEntry(b.uid, b.old_nama, b.old_link);
+    if (!removed) {
+      b.status = "gagal";
+      await saveBarter(b);
+      await tgRequest(token, "sendMessage", {
+        chat_id: b.uid,
+        text: `⚠️ Barter ${b.old_nama} → ${b.tuju_nama} dibatalkan karena ${b.old_nama} sudah tidak ada di koleksimu.`,
+      });
+      return { ok: false, reason: "old_missing" };
+    }
+  }
+
   b.status = "selesai";
   await saveBarter(b);
-  await removeKoleksiEntry(b.uid, b.old_nama, b.old_link);
-  await addKoleksi(b.uid, b.tuju_nama, b.tuju_link);
+  const links = Array.isArray(b.tuju_links) && b.tuju_links.length ? b.tuju_links : b.tuju_link ? [b.tuju_link] : [];
+  await addKoleksi(b.uid, b.tuju_nama, links[0] || "");
   await redisCommand(["SET", `${REDIS_BARTER_CD_PREFIX}${b.uid}_${b.tuju_id}`, "1", "EX", String(BARTER_COOLDOWN_DETIK)]);
+  const linksBlock = links.length
+    ? links.map((l) => `🔗 ${escapeHtml(normalizeUrl(l))}`).join("\n")
+    : "<i>File akan dikirim admin lewat chat.</i>";
+  if (b.bukti && b.bukti.link) {
+    const adminId = await getNotifyAdminId();
+    if (adminId) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: adminId,
+        parse_mode: "HTML",
+        text:
+          `🔓 <b>Link barter ${escapeHtml(b.id)}</b> (${escapeHtml(b.old_nama)})\n` +
+          `🔗 ${escapeHtml(b.bukti.link)}\n🖼️ Total foto: <b>${b.bukti.total}</b>`,
+      });
+    }
+  }
   await tgRequest(token, "sendMessage", {
     chat_id: b.uid,
     parse_mode: "HTML",
     text:
       `🔁 <b>BARTER BERHASIL!</b>\n` +
       `<b>${escapeHtml(b.old_nama)}</b> sudah ditukar dengan <b>${escapeHtml(b.tuju_nama)}</b>.\n` +
-      `🔗 ${escapeHtml(normalizeUrl(b.tuju_link || "(file dikirim admin)"))}`,
+      linksBlock,
   });
+  return { ok: true };
 }
 
 // ---- BARTER DENGAN PRODUK DI LUAR KOLEKSI (pembeli mengetik sendiri produk yang mau ditawarkan) ----
@@ -9999,7 +10030,17 @@ const REDIS_BARTER_WAIT_PREFIX = "lumine_main_barter_wait_"; // flag: user sedan
 
 // Daftar produk tujuan dari katalog, dibagi halaman (8 per halaman) supaya semua produk bisa dipilih
 const BARTER_TUJU_PER_HALAMAN = 8;
-async function sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, pembuka, hargaRef = 0) {
+const REDIS_BARTER_SEARCH_PREFIX = "lumine_main_barter_cari_"; // kata kunci pencarian aktif per user (TTL 15 menit)
+async function getBarterSearch(uid) {
+  return (await redisCommand(["GET", `${REDIS_BARTER_SEARCH_PREFIX}${uid}`])) || "";
+}
+async function setBarterSearch(uid, kw) {
+  await redisCommand(["SET", `${REDIS_BARTER_SEARCH_PREFIX}${uid}`, String(kw).slice(0, 60), "EX", "900"]);
+}
+async function delBarterSearch(uid) {
+  await redisCommand(["DEL", `${REDIS_BARTER_SEARCH_PREFIX}${uid}`]);
+}
+async function sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, pembuka, hargaRef = 0, keyword = "") {
   const katalogList = await getKatalog();
   let semua = katalogList.filter((k) => parseNominal(k.harga) > 0 && (!excludeNama || k.nama !== excludeNama));
   if (hargaRef > 0) {
@@ -10014,10 +10055,24 @@ async function sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, pem
     // tanpa harga pembanding, yang termurah tampil dulu
     semua.sort((a, b) => parseNominal(a.harga) - parseNominal(b.harga));
   }
+  const kw = String(keyword || "").trim();
+  if (kw) {
+    const kata = kw.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 5);
+    semua = semua.filter((k) => {
+      const hay = `${k.nama || ""} ${k.isi || ""} ${k.creator || ""} ${k.kategori || ""}`.toLowerCase();
+      return kata.every((w) => hay.includes(w));
+    });
+  }
+  const barisCari = [{ text: kw ? "🔎 Cari lagi" : "🔎 Cari produk", callback_data: `barter_cari_${modeKey}` }];
+  if (kw) barisCari.push({ text: "✖️ Hapus pencarian", callback_data: `barter_cariclear_${modeKey}` });
   if (!semua.length) {
     await tgRequest(token, "sendMessage", {
       chat_id: chatId,
-      text: "Belum ada produk dengan harga yang cukup mirip untuk ditukar. Coba barang lain atau pilih dari daftar yang dibutuhkan admin.",
+      parse_mode: "HTML",
+      text: kw
+        ? `🔎 Tidak ada produk untuk <b>${escapeHtml(kw)}</b>${hargaRef > 0 ? " dengan harga yang cukup mirip" : ""}. Coba kata kunci lain.`
+        : "Belum ada produk dengan harga yang cukup mirip untuk ditukar. Coba barang lain atau pilih dari daftar yang dibutuhkan admin.",
+      reply_markup: { inline_keyboard: [barisCari] },
     });
     return;
   }
@@ -10041,11 +10096,12 @@ async function sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, pem
   if (hal > 0) nav.push({ text: "⬅️ Sebelumnya", callback_data: `barter_halaman_${modeKey}_${hal - 1}` });
   if (hal < totalHalaman - 1) nav.push({ text: "Berikutnya ➡️", callback_data: `barter_halaman_${modeKey}_${hal + 1}` });
   if (nav.length) rows.push(nav);
+  rows.push(barisCari);
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
     parse_mode: "HTML",
     text:
-      `${pembuka || "Pilih produk tujuan dari katalog:"}\n\n${daftarTeks}\n\n` +
+      `${pembuka || "Pilih produk tujuan dari katalog:"}${kw ? `\n🔎 Hasil cari: <b>${escapeHtml(kw)}</b>` : ""}\n\n${daftarTeks}\n\n` +
       `<i>Halaman ${hal + 1}/${totalHalaman} • ${semua.length} produk${hargaRef > 0 ? " (harga mirip)" : ""}</i>`,
     reply_markup: { inline_keyboard: rows },
   });
@@ -10105,6 +10161,16 @@ async function handleBarterDraftMessage(token, msg, draft, uid) {
   const chatId = msg.chat.id;
   const ask = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: t });
 
+  if (draft.step === "cari") {
+    if (!text) { await ask("🔎 Ketik kata kunci sebagai teks."); return true; }
+    const offer = await getBarterOffer(uid);
+    await delBarterDraft(uid);
+    if (!offer) { await ask("⚠️ Penawaran sudah kedaluwarsa. Ulangi lewat /barter."); return true; }
+    await setBarterSearch(uid, text);
+    const isK = String(offer.mode || "").startsWith("k");
+    await sendBarterTujuPage(token, chatId, isK ? offer.mode : "lain", 0, isK ? offer.nama : null, "Pilih produk tujuan dari katalog:", isK ? offer.old_harga : 0, text);
+    return true;
+  }
   if (draft.step === "nama") {
     if (!text) { await ask("✍️ Ketik nama produknya sebagai teks."); return true; }
     draft.nama = text.slice(0, 200);
@@ -10118,13 +10184,28 @@ async function handleBarterDraftMessage(token, msg, draft, uid) {
     draft.preview = msg.photo[msg.photo.length - 1].file_id;
     draft.step = "link";
     await setBarterDraft(uid, draft);
-    await ask("🔗 Kirim <b>link isi produkmu</b> (link file atau folder).");
+    await ask("🔗 Kirim <b>link Google Drive</b> isi produkmu (file atau folder, akses: Siapa saja yang memiliki link).\n🔒 Link disembunyikan dari admin sampai dia menyetujui barter.");
     return true;
   }
   if (draft.step === "link") {
     const cocok = text.match(/https?:\/\/\S+/i);
-    if (!cocok) { await ask("🔗 Kirim link yang diawali https://"); return true; }
-    draft.link = cocok[0];
+    if (!cocok) { await ask("🔗 Kirim link Google Drive yang diawali https://"); return true; }
+    const drv = parseDriveLink(cocok[0]);
+    if (!drv) {
+      await ask("❌ Hanya link <b>Google Drive</b> (drive.google.com) yang diterima. Kirim link file atau folder Drive-mu.");
+      return true;
+    }
+    const hidup = await checkDriveLink(drv.url);
+    if (hidup === "dead") {
+      await ask("❌ Link Drive itu tidak ditemukan atau sudah dihapus. Kirim link lain.");
+      return true;
+    }
+    if (hidup === "private") {
+      await ask("🔒 Link Drive itu belum publik. Ubah aksesnya ke <b>Siapa saja yang memiliki link</b> (Viewer), lalu kirim ulang.");
+      return true;
+    }
+    draft.link = drv.url;
+    draft.link_status = hidup;
     draft.step = "total";
     await setBarterDraft(uid, draft);
     await ask("🖼️ Berapa <b>total foto</b> di produk itu? Ketik angkanya.");
@@ -10142,8 +10223,11 @@ async function handleBarterDraftMessage(token, msg, draft, uid) {
       preview: draft.preview,
       old_item_id: draft.old_item_id || "",
       old_harga: Number(draft.old_harga) || 0,
+      old_link: draft.old_link || "",
+      link_status: draft.link_status || "unknown",
     };
     await setBarterOffer(uid, offer);
+    await delBarterSearch(uid);
     await ask(`✅ Penawaran diterima: <b>${escapeHtml(offer.nama)}</b> (${n} foto).\nSekarang pilih produk tujuan dari katalog:`);
     const isKoleksi = String(offer.mode || "").startsWith("k");
     await sendBarterTujuPage(
@@ -10155,6 +10239,101 @@ async function handleBarterDraftMessage(token, msg, draft, uid) {
     return true;
   }
   return false;
+}
+
+// Cek link produk masih hidup. Hasil: "alive" | "dead" | "unknown" (tidak bisa dipastikan, mis. diblok/timeout/halaman JS seperti Mega)
+function barterHostAman(hostname) {
+  const h = String(hostname || "").toLowerCase();
+  if (!h || h === "localhost" || h.endsWith(".local") || h.endsWith(".internal")) return false;
+  if (h.includes(":") || h.startsWith("[")) return false; // IPv6 literal
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h)) return false; // IP langsung (cegah SSRF ke jaringan internal)
+  return h.includes(".");
+}
+async function checkLinkAlive(rawUrl) {
+  let url = String(rawUrl || "");
+  for (let hop = 0; hop < 4; hop++) {
+    let u;
+    try { u = new URL(url); } catch { return "dead"; }
+    if (!/^https?:$/.test(u.protocol) || !barterHostAman(u.hostname)) return "dead";
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    try {
+      let r = await fetch(url, { method: "HEAD", redirect: "manual", signal: ctl.signal });
+      if (r.status === 405 || r.status === 501) {
+        r = await fetch(url, { method: "GET", redirect: "manual", headers: { Range: "bytes=0-0" }, signal: ctl.signal });
+      }
+      if (r.status >= 300 && r.status < 400) {
+        const loc = r.headers.get("location");
+        if (!loc) return "unknown";
+        url = new URL(loc, url).toString();
+        continue;
+      }
+      if (r.status === 404 || r.status === 410) return "dead";
+      if (r.status >= 200 && r.status < 300) return "alive";
+      return "unknown"; // 401/403/429/5xx: server ada tapi tidak bisa dipastikan
+    } catch {
+      return "unknown";
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return "unknown";
+}
+
+// ---- Khusus Google Drive: hanya link Drive yang diterima, dinormalisasi lalu dicek publik/tidak ----
+function parseDriveLink(raw) {
+  let u;
+  try { u = new URL(String(raw || "").trim()); } catch { return null; }
+  if (u.protocol !== "https:" || u.hostname.toLowerCase() !== "drive.google.com") return null;
+  const m = u.pathname.match(/\/(file\/d|folders)\/([A-Za-z0-9_-]{10,})/);
+  const id = m ? m[2] : u.searchParams.get("id");
+  if (!id || !/^[A-Za-z0-9_-]{10,}$/.test(id)) return null;
+  const isFolder = (m && m[1] === "folders") || /folderview/.test(u.pathname);
+  const rk = u.searchParams.get("resourcekey");
+  const base = isFolder
+    ? `https://drive.google.com/drive/folders/${id}`
+    : `https://drive.google.com/file/d/${id}/view`;
+  return { id, isFolder, url: rk ? `${base}?resourcekey=${encodeURIComponent(rk)}` : base };
+}
+
+// Hasil: "alive" | "dead" | "private" | "unknown"
+async function checkDriveLink(url) {
+  let cur = url;
+  for (let hop = 0; hop < 4; hop++) {
+    const u = new URL(cur);
+    const ok = ["drive.google.com", "docs.google.com", "drive.usercontent.google.com"].includes(u.hostname);
+    if (u.hostname === "accounts.google.com") return "private"; // dilempar ke login = tidak publik
+    if (!ok) return "unknown";
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    try {
+      const r = await fetch(cur, { method: "GET", redirect: "manual", headers: { "Accept-Language": "en-US,en;q=0.9" }, signal: ctl.signal });
+      if (r.status >= 300 && r.status < 400) {
+        const loc = r.headers.get("location");
+        if (!loc) return "unknown";
+        cur = new URL(loc, cur).toString();
+        continue;
+      }
+      if (r.status === 404 || r.status === 410) return "dead";
+      if (r.status === 401 || r.status === 403) return "private";
+      if (r.status >= 200 && r.status < 300) {
+        const body = (await r.text()).slice(0, 300000);
+        if (/You need access|Request access|You need permission|Minta akses|memerlukan akses/i.test(body)) return "private";
+        if (/Sorry, the file you have requested does not exist|file you requested has been deleted|Not Found/i.test(body) && !/"og:title"/.test(body)) return "dead";
+        return "alive";
+      }
+      return "unknown";
+    } catch {
+      return "unknown";
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return "unknown";
+}
+
+function barterLinkHost(u) {
+  try { return new URL(String(u)).hostname.replace(/^www\./, ""); } catch { return "?"; }
 }
 
 const BARTER_MAKS_SELISIH = 0.3; // selisih harga di atas 30% ditolak otomatis oleh bot
@@ -10178,22 +10357,51 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
   }
   const tujuLinks =
     Array.isArray(tuju.links) && tuju.links.length > 0 ? tuju.links : tuju.link ? [tuju.link] : [];
+  // jangan izinkan menukar ke produk yang sudah dimiliki
+  const koleksiSekarang = await getKoleksi(uid);
+  if (koleksiSekarang.some((e) => e.nama === tuju.nama)) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: `⚠️ Kamu sudah punya ${tuju.nama} di koleksi. Pilih produk tujuan yang lain.`,
+    });
+    return null;
+  }
+  // cek ulang link sebelum diteruskan ke admin (bisa mati sejak diketik)
+  let statusLink = bukti ? bukti.link_status || "unknown" : "alive";
+  if (bukti && bukti.link) {
+    const drvUlang = parseDriveLink(bukti.link);
+    statusLink = drvUlang ? await checkDriveLink(drvUlang.url) : "dead";
+    if (statusLink === "dead" || statusLink === "private") {
+      await tgRequest(token, "sendMessage", {
+        chat_id: chatId,
+        text: "❌ Link Drive isi produkmu sudah tidak aktif atau tidak publik, pengajuan tidak dikirim. Ulangi lewat /barter dengan link Drive yang aksesnya publik.",
+      });
+      return null;
+    }
+  }
+  // klaim penawaran: DEL mengembalikan 1 hanya untuk request pertama, jadi tap ganda tidak bikin pengajuan dobel
+  const claimed = Number(await redisCommand(["DEL", `${REDIS_BARTER_OFFER_PREFIX}${uid}`]));
+  if (claimed !== 1) {
+    await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Penawaran sudah diproses atau kedaluwarsa. Ulangi lewat /barter." });
+    return null;
+  }
   const b = {
     id: Date.now().toString(36),
     uid,
     old_nama: oldNama,
     old_link: oldLink || "",
     old_item_id: oldItemId || "",
-    bukti: bukti || null,
+    bukti: bukti ? { ...bukti, link_status: statusLink } : null,
     tuju_id: String(tuju.id),
     tuju_nama: tuju.nama,
     tuju_link: tujuLinks[0] || "",
+    tuju_links: tujuLinks,
     status: "menunggu_acc",
   };
   await saveBarter(b);
   await tgRequest(token, "sendMessage", {
     chat_id: chatId,
-    text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.`,
+    text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.\n🔒 Link isimu aman: admin hanya melihat foto preview & jumlah foto, link baru dibuka setelah dia ACC.`,
   });
   const adminId = await getNotifyAdminId();
   if (adminId) {
@@ -10202,7 +10410,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
         `Pembeli: <code>${escapeHtml(uid)}</code>\n` +
         `Tukar: <b>${escapeHtml(oldNama)}</b>${hargaLama > 0 ? ` (harga ${formatRupiah(hargaLama)})` : " (produk di luar koleksi)"}\n` +
         `Ke: <b>${escapeHtml(b.tuju_nama)}</b> (harga ${formatRupiah(hargaTuju)})\n` +
-        `${bukti ? `📦 Isi link: ${escapeHtml(bukti.link)}\n🖼️ Total foto: <b>${bukti.total}</b>\n` : ""}` +
+        `${bukti ? `🔒 Link isi: <b>disembunyikan</b> (host: ${escapeHtml(barterLinkHost(bukti.link))}, ${statusLink === "alive" ? "✅ aktif saat dicek bot" : "⚠️ aktif tidak bisa dipastikan bot"}). Link baru dikirim ke kamu setelah ACC.\n🖼️ Total foto: <b>${bukti.total}</b>\n` : ""}` +
         `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`;
     const markup = {
       inline_keyboard: [[
@@ -10824,7 +11032,29 @@ module.exports = async function handler(req, res) {
           excludeNama = src.ok ? src.item.nama : null;
           hargaRef = src.ok ? parseNominal(src.item.harga) : 0;
         }
-        await sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, "Pilih produk tujuan dari katalog:", hargaRef);
+        const kwAktif = await getBarterSearch(String(call.from.id));
+        await sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, "Pilih produk tujuan dari katalog:", hargaRef, kwAktif);
+      } else if (data.startsWith("barter_cari_") || data.startsWith("barter_cariclear_")) {
+        const uid = String(call.from.id);
+        const isClear = data.startsWith("barter_cariclear_");
+        const modeKey = data.replace(/^barter_cari(clear)?_/, "");
+        const offer = await getBarterOffer(uid);
+        if (!offer) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Penawaran sudah kedaluwarsa. Ulangi lewat /barter." });
+          return res.status(200).json({ ok: true });
+        }
+        if (isClear) {
+          await delBarterSearch(uid);
+          const isK = String(offer.mode || "").startsWith("k");
+          await sendBarterTujuPage(token, chatId, isK ? offer.mode : "lain", 0, isK ? offer.nama : null, "Pilih produk tujuan dari katalog:", isK ? offer.old_harga : 0, "");
+        } else {
+          await setBarterDraft(uid, { step: "cari", modeKey });
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            parse_mode: "HTML",
+            text: "🔎 Ketik kata kunci produk yang kamu cari (nama, isi, atau creator). Contoh: <code>anime</code>",
+          });
+        }
       } else if (data === "barter_butuh") {
         const list = await getButuh();
         if (!list.length) {
@@ -10867,7 +11097,7 @@ module.exports = async function handler(req, res) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Penawaran sudah kedaluwarsa. Ulangi lewat /barter." });
           return res.status(200).json({ ok: true });
         }
-        await createBarterRequest(token, chatId, uid, offer.nama, offer.link, "", tuju, 0, offer);
+        await createBarterRequest(token, chatId, uid, offer.nama, "", "", tuju, 0, offer);
       } else if (data.startsWith("barter_pilih_")) {
         const i = parseInt(data.replace("barter_pilih_", ""), 10);
         const src = await barterSourceAt(String(call.from.id), i);
@@ -10881,6 +11111,7 @@ module.exports = async function handler(req, res) {
           link: src.entry.link || "",
           old_item_id: String(src.item.id),
           old_harga: parseNominal(src.item.harga),
+          old_link: src.entry.link || "",
         });
       } else if (data.startsWith("barter_tuju_")) {
         const tujuId = data.split("_")[3];
@@ -10903,7 +11134,7 @@ module.exports = async function handler(req, res) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Produk tujuan sudah tidak ada." });
           return res.status(200).json({ ok: true });
         }
-        await createBarterRequest(token, chatId, uid, offer.nama, offer.link, offer.old_item_id, tuju, offer.old_harga, offer);
+        await createBarterRequest(token, chatId, uid, offer.nama, offer.old_link || "", offer.old_item_id, tuju, offer.old_harga, offer);
       } else if (data.startsWith("barter_acc_") || data.startsWith("barter_tolak_")) {
         if (!(await isAdminUser(call.from))) return res.status(200).json({ ok: true });
         const isAcc = data.startsWith("barter_acc_");
@@ -10914,12 +11145,18 @@ module.exports = async function handler(req, res) {
         }
         if (!isAcc) {
           b.status = "ditolak";
+          if (b.bukti) b.bukti.link = ""; // link tidak pernah dibuka ke admin
           await saveBarter(b);
           await tgRequest(token, "sendMessage", { chat_id: b.uid, text: `❌ Pengajuan barter ke ${b.tuju_nama} ditolak admin.` });
           return res.status(200).json({ ok: true });
         }
-        await finalizeBarter(token, b);
-        await tgRequest(token, "sendMessage", { chat_id: chatId, text: `✅ Barter ${b.id} di-ACC.` });
+        const hasil = await finalizeBarter(token, b);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: hasil && hasil.ok
+            ? `✅ Barter ${b.id} di-ACC.`
+            : `⚠️ Barter ${b.id} gagal diproses (${(hasil && hasil.reason) || "unknown"}). Produk lama pembeli sudah tidak ada di koleksinya, jadi tidak ada yang ditukar.`,
+        });
       } else if (data.startsWith("patungan_ambil_")) {
         const p = await getPatungan();
         if (!p || p.status !== "aktif" || Date.now() > p.end_ts) {
@@ -12477,19 +12714,17 @@ module.exports = async function handler(req, res) {
       if (/^\/barter(\s|$)/i.test(rawText)) {
         const uid = String(msg.from && msg.from.id);
         const list = (await getKoleksi(uid)).slice(0, 6);
-        if (!list.length) {
-          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Koleksimu masih kosong, belum ada yang bisa ditukar." });
-          return res.status(200).json({ ok: true });
-        }
         await tgRequest(token, "sendMessage", {
           chat_id: chatId,
           parse_mode: "HTML",
-          text: "🔁 <b>Barter ke Admin</b>\nPilih produk dari koleksimu yang mau ditukar. Admin yang menilai dan menyetujui tukarannya.",
+          text: list.length
+            ? "🔁 <b>Barter ke Admin</b>\nPilih produk dari koleksimu yang mau ditukar. Admin yang menilai dan menyetujui tukarannya."
+            : "🔁 <b>Barter ke Admin</b>\nKoleksimu masih kosong, tapi kamu tetap bisa menawarkan produk lain atau melihat barang yang dibutuhkan admin.",
           reply_markup: {
             inline_keyboard: [
               ...list.map((e, i) => [{ text: e.nama.slice(0, 40), callback_data: `barter_pilih_${i}` }]),
               [{ text: "➕ Produk lain (ketik sendiri)", callback_data: "barter_lain" }],
-              ...((await getButuh()).length ? [[{ text: "📌 Dibutuhkan admin", callback_data: "barter_butuh" }]] : []),
+              [{ text: "📌 Dibutuhkan admin", callback_data: "barter_butuh" }],
             ],
           },
         });
