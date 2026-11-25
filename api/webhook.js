@@ -2699,6 +2699,11 @@ async function processAccOrderCore(token, order) {
     return await processPreorderPaid(token, order);
   }
 
+  // KHUSUS PATUNGAN: bagian dicatat, produk dikirim saat terkumpul penuh
+  if (order.is_patungan) {
+    return await processPatunganPaid(token, order);
+  }
+
   const katalogList = await getKatalog();
   let deliveredName = order.item_nama;
   let deliveredLinks =
@@ -7938,6 +7943,11 @@ async function maybeSendDailySummary(token) {
   } catch (stlErr) {
     console.error("Bagi hadiah undang teman error:", stlErr);
   }
+  try {
+    await settlePatunganExpiry(token);
+  } catch (ptErr) {
+    console.error("Patungan kedaluwarsa error:", ptErr);
+  }
   if (!SUMMARY_ENABLED) return;
   const now = Date.now();
   const wib = new Date(now + 7 * 3600 * 1000);
@@ -9779,6 +9789,257 @@ async function completeCommunityTarget(token, t) {
   });
 }
 
+// ---- PATUNGAN PRODUK MAHAL (beberapa pembeli urunan satu produk, dikirim saat terkumpul penuh) ----
+const REDIS_PATUNGAN_KEY = "lumine_main_patungan"; // JSON: {id, item_id, item_nama, bagian, share_price, end_ts, status, terjual, channel_id, pinned_msg_id}
+const REDIS_PATUNGAN_BUYERS_KEY = "lumine_main_patungan_buyers"; // HASH: id pembeli -> jumlah bagian yang sudah lunas
+const REDIS_PATUNGAN_LOCK_KEY = "lumine_main_patungan_lock"; // kunci penyelesaian, anti dobel
+const PATUNGAN_MIN_BAGIAN = 10000; // harga minimal satu bagian (Rp)
+
+async function getPatungan() {
+  const raw = await redisCommand(["GET", REDIS_PATUNGAN_KEY]);
+  return raw ? JSON.parse(raw) : null;
+}
+async function savePatungan(p) {
+  await redisCommand(["SET", REDIS_PATUNGAN_KEY, JSON.stringify(p)]);
+}
+
+async function refreshPatunganMessage(token, p) {
+  const filled = Math.min(10, Math.floor((p.terjual / p.bagian) * 10));
+  const bar = "▓".repeat(filled) + "░".repeat(10 - filled);
+  const sisa = Math.max(0, p.bagian - p.terjual);
+  const text =
+    `🤝 <b>PATUNGAN: ${escapeHtml(p.item_nama)}</b>\n` +
+    `${bar} ${p.terjual}/${p.bagian} bagian\n` +
+    `1 bagian: <b>${formatRupiah(p.share_price)}</b> • sisa ${sisa} bagian\n` +
+    `Begitu terkumpul penuh, produk dikirim ke semua peserta urunan.`;
+  const markup = {
+    inline_keyboard: [[{ text: "🤝 Ambil bagian", callback_data: `patungan_ambil_${p.id}` }]],
+  };
+  if (p.pinned_msg_id) {
+    const r = await tgRequest(token, "editMessageText", {
+      chat_id: p.channel_id,
+      message_id: p.pinned_msg_id,
+      text,
+      parse_mode: "HTML",
+      reply_markup: markup,
+    });
+    if (r && r.ok) return;
+  }
+  const sent = await tgRequest(token, "sendMessage", {
+    chat_id: p.channel_id,
+    text,
+    parse_mode: "HTML",
+    reply_markup: markup,
+  });
+  if (sent && sent.ok) {
+    p.pinned_msg_id = sent.result.message_id;
+    await tgRequest(token, "pinChatMessage", { chat_id: p.channel_id, message_id: p.pinned_msg_id });
+    await savePatungan(p);
+  }
+}
+
+// Kembalikan uang peserta ke saldo deposit (uang asli, bisa dipakai belanja)
+async function refundPatunganBuyer(token, uid, nominal, alasan) {
+  if (!(nominal > 0)) return;
+  await addUserSaldo(uid, nominal, "deposit");
+  await tgRequest(token, "sendMessage", {
+    chat_id: uid,
+    parse_mode: "HTML",
+    text:
+      `↩️ <b>Urunan dikembalikan</b>\n` +
+      `${escapeHtml(alasan)}\n` +
+      `💰 <b>${formatRupiah(nominal)}</b> sudah masuk ke saldo deposit kamu.`,
+  });
+}
+
+async function completePatungan(token, p) {
+  const lock = await redisCommand(["SET", REDIS_PATUNGAN_LOCK_KEY, "1", "NX", "EX", "604800"]);
+  if (lock !== "OK") return;
+  p.status = "terkumpul";
+  await savePatungan(p);
+
+  const katalogList = await getKatalog();
+  const item = katalogList.find((k) => String(k.id) === String(p.item_id));
+  const links =
+    item && Array.isArray(item.links) && item.links.length > 0 ? item.links : item && item.link ? [item.link] : [];
+  const linksBlock = links.length
+    ? links.map((l) => `🔗 ${escapeHtml(normalizeUrl(l))}`).join("\n")
+    : "<i>File akan dikirim admin lewat chat.</i>";
+
+  const buyers = (await redisCommand(["HKEYS", REDIS_PATUNGAN_BUYERS_KEY])) || [];
+  for (const uid of buyers) {
+    try {
+      await addKoleksi(uid, p.item_nama, links[0] || "");
+      await tgRequest(token, "sendMessage", {
+        chat_id: uid,
+        parse_mode: "HTML",
+        text:
+          `🎉 <b>PATUNGAN TERKUMPUL!</b>\n` +
+          `Terima kasih sudah urunan <b>${escapeHtml(p.item_nama)}</b>. Berikut aksesnya:\n` +
+          `${linksBlock}\n\n<i>Tersimpan juga di 🎒 Koleksi Saya.</i>`,
+      });
+    } catch (e) {
+      console.error("Kirim patungan error:", uid, e);
+    }
+  }
+  const channelId = p.channel_id;
+  await tgRequest(token, "sendMessage", {
+    chat_id: channelId,
+    parse_mode: "HTML",
+    text: `🎉 <b>PATUNGAN ${escapeHtml(p.item_nama)} TERKUMPUL!</b>\nProduk sudah dikirim ke ${buyers.length} peserta urunan.`,
+  });
+}
+
+async function processPatunganPaid(token, order) {
+  const uid = String(order.buyer_id);
+  const amount = Number(order.final_base_nominal || order.base_nominal) || 0;
+  const p = await getPatungan();
+  if (!p || p.status !== "aktif" || Date.now() > p.end_ts) {
+    await refundPatunganBuyer(token, uid, amount, "Patungan sudah tidak aktif saat pembayaranmu masuk.");
+    return { deliveredName: order.item_nama, deliveredLink: "" };
+  }
+  if (p.terjual >= p.bagian) {
+    await refundPatunganBuyer(token, uid, amount, "Bagian patungan sudah habis terisi duluan.");
+    return { deliveredName: order.item_nama, deliveredLink: "" };
+  }
+
+  await redisCommand(["HINCRBY", REDIS_PATUNGAN_BUYERS_KEY, uid, 1]);
+  p.terjual += 1;
+  await savePatungan(p);
+  await tgRequest(token, "sendMessage", {
+    chat_id: uid,
+    parse_mode: "HTML",
+    text: `🤝 Bagian urunanmu untuk <b>${escapeHtml(p.item_nama)}</b> sudah tercatat (${p.terjual}/${p.bagian}).`,
+  });
+  if (p.terjual % 5 === 0 || p.terjual >= p.bagian) await refreshPatunganMessage(token, p);
+  if (p.terjual >= p.bagian) await completePatungan(token, p);
+  return { deliveredName: order.item_nama, deliveredLink: "" };
+}
+
+// Dipanggil sekali per hari dari ringkasan harian: patungan yang lewat batas waktu dinyatakan gagal dan uangnya dikembalikan
+async function settlePatunganExpiry(token) {
+  const p = await getPatungan();
+  if (!p || p.status !== "aktif" || Date.now() <= p.end_ts) return;
+  p.status = "gagal";
+  await savePatungan(p);
+  const buyers = (await redisCommand(["HGETALL", REDIS_PATUNGAN_BUYERS_KEY])) || [];
+  for (let i = 0; i < buyers.length; i += 2) {
+    const uid = String(buyers[i]);
+    const bagianUid = Number(buyers[i + 1]) || 0;
+    try {
+      await refundPatunganBuyer(token, uid, bagianUid * p.share_price, `Patungan ${p.item_nama} belum terkumpul sampai batas waktu.`);
+    } catch (e) {
+      console.error("Refund patungan error:", uid, e);
+    }
+  }
+  await tgRequest(token, "sendMessage", {
+    chat_id: p.channel_id,
+    parse_mode: "HTML",
+    text: `⌛ Patungan <b>${escapeHtml(p.item_nama)}</b> belum terkumpul sampai batas waktu. Uang peserta sudah dikembalikan ke saldo deposit.`,
+  });
+  await redisCommand(["DEL", REDIS_PATUNGAN_BUYERS_KEY]);
+}
+
+// ---- BARTER KE ADMIN (tukar produk di koleksi dengan produk katalog, tanpa pembayaran, admin yang ACC) ----
+const REDIS_BARTER_PREFIX = "lumine_main_barter_"; // JSON per pengajuan: {id, uid, old_nama, old_link, old_item_id, tuju_id, tuju_nama, tuju_link, status}
+const REDIS_BARTER_LOCK_PREFIX = "lumine_main_barter_lock_";
+const REDIS_BARTER_CD_PREFIX = "lumine_main_barter_cd_"; // cooldown: produk hasil tukar tidak bisa ditukar lagi
+const BARTER_COOLDOWN_DETIK = 60 * 60 * 24 * 30;
+
+async function removeKoleksiEntry(uid, nama, link) {
+  const list = await getKoleksi(uid);
+  const idx = list.findIndex((e) => e.nama === nama && (e.link || "") === (link || ""));
+  if (idx < 0) return false;
+  list.splice(idx, 1);
+  await redisCommand(["SET", `${REDIS_KOLEKSI_PREFIX}${uid}`, JSON.stringify(list)]);
+  return true;
+}
+
+async function getBarter(id) {
+  const raw = await redisCommand(["GET", `${REDIS_BARTER_PREFIX}${id}`]);
+  return raw ? JSON.parse(raw) : null;
+}
+async function saveBarter(b) {
+  await redisCommand(["SET", `${REDIS_BARTER_PREFIX}${b.id}`, JSON.stringify(b), "EX", "259200"]);
+}
+
+// Ambil entry koleksi ke-i beserta produk katalog dan nilai tukarnya
+async function barterSourceAt(uid, i) {
+  const list = await getKoleksi(uid);
+  const entry = list[i];
+  if (!entry) return { ok: false, error: "Produk tidak ditemukan di koleksimu." };
+  const katalogList = await getKatalog();
+  const item = katalogList.find((k) => k.nama === entry.nama);
+  if (!item) return { ok: false, error: "Produk ini sudah tidak ada di katalog, jadi tidak bisa ditukar." };
+  const cd = await redisCommand(["GET", `${REDIS_BARTER_CD_PREFIX}${uid}_${item.id}`]);
+  if (cd) return { ok: false, error: "Produk hasil tukar belum bisa ditukar lagi (tunggu 30 hari)." };
+  return { ok: true, entry, item };
+}
+
+async function finalizeBarter(token, b) {
+  const lock = await redisCommand(["SET", `${REDIS_BARTER_LOCK_PREFIX}${b.id}`, "1", "NX", "EX", "604800"]);
+  if (lock !== "OK") return;
+  b.status = "selesai";
+  await saveBarter(b);
+  await removeKoleksiEntry(b.uid, b.old_nama, b.old_link);
+  await addKoleksi(b.uid, b.tuju_nama, b.tuju_link);
+  await redisCommand(["SET", `${REDIS_BARTER_CD_PREFIX}${b.uid}_${b.tuju_id}`, "1", "EX", String(BARTER_COOLDOWN_DETIK)]);
+  await tgRequest(token, "sendMessage", {
+    chat_id: b.uid,
+    parse_mode: "HTML",
+    text:
+      `🔁 <b>BARTER BERHASIL!</b>\n` +
+      `<b>${escapeHtml(b.old_nama)}</b> sudah ditukar dengan <b>${escapeHtml(b.tuju_nama)}</b>.\n` +
+      `🔗 ${escapeHtml(normalizeUrl(b.tuju_link || "(file dikirim admin)"))}`,
+  });
+}
+
+// ---- BARTER DENGAN PRODUK DI LUAR KOLEKSI (pembeli mengetik sendiri produk yang mau ditawarkan) ----
+const REDIS_BARTER_WAIT_PREFIX = "lumine_main_barter_wait_"; // flag: user sedang diminta mengetik produk
+const REDIS_BARTER_OFFER_PREFIX = "lumine_main_barter_offer_"; // teks penawaran produk lain
+
+async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItemId, tuju, oldHargaText) {
+  const hargaTuju = parseNominal(tuju.harga);
+  const tujuLinks =
+    Array.isArray(tuju.links) && tuju.links.length > 0 ? tuju.links : tuju.link ? [tuju.link] : [];
+  const b = {
+    id: Date.now().toString(36),
+    uid,
+    old_nama: oldNama,
+    old_link: oldLink || "",
+    old_item_id: oldItemId || "",
+    tuju_id: String(tuju.id),
+    tuju_nama: tuju.nama,
+    tuju_link: tujuLinks[0] || "",
+    status: "menunggu_acc",
+  };
+  await saveBarter(b);
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.`,
+  });
+  const adminId = await getNotifyAdminId();
+  if (adminId) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: adminId,
+      parse_mode: "HTML",
+      text:
+        `🔁 <b>PENGAJUAN BARTER</b>\n` +
+        `Pembeli: <code>${escapeHtml(uid)}</code>\n` +
+        `Tukar: <b>${escapeHtml(oldNama)}</b>${oldHargaText ? ` (harga ${escapeHtml(oldHargaText)})` : " (produk di luar koleksi)"}\n` +
+        `Ke: <b>${escapeHtml(b.tuju_nama)}</b> (harga ${formatRupiah(hargaTuju)})\n` +
+        `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`,
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ ACC", callback_data: `barter_acc_${b.id}` },
+          { text: "❌ Tolak", callback_data: `barter_tolak_${b.id}` },
+        ]],
+      },
+    });
+  }
+  return b;
+}
+
 async function trackCommunityTarget(token, order) {
   if (order.is_deposit) return; // isi saldo bukan pembelian produk
   const t = await getTarget();
@@ -10371,6 +10632,147 @@ module.exports = async function handler(req, res) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: target.error });
           return res.status(200).json({ ok: true });
         }
+        await sendQrisInvoiceForTarget(token, chatId, call.from, target);
+      } else if (data === "barter_lain") {
+        await redisCommand(["SET", `${REDIS_BARTER_WAIT_PREFIX}${call.from.id}`, "1", "EX", "600"]);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: "✍️ Ketik nama produk yang mau kamu tawarkan untuk ditukar (bukan dari koleksimu). Sertakan detail singkat kalau perlu.",
+        });
+      } else if (data.startsWith("barter_lainpilih_")) {
+        const tujuId = data.replace("barter_lainpilih_", "");
+        const uid = String(call.from.id);
+        const offer = await redisCommand(["GET", `${REDIS_BARTER_OFFER_PREFIX}${uid}`]);
+        const katalogList = await getKatalog();
+        const tuju = katalogList.find((k) => String(k.id) === String(tujuId));
+        if (!offer || !tuju) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Penawaran sudah kedaluwarsa. Ulangi lewat /barter." });
+          return res.status(200).json({ ok: true });
+        }
+        await createBarterRequest(token, chatId, uid, String(offer), "", "", tuju, "");
+      } else if (data.startsWith("barter_pilih_")) {
+        const i = parseInt(data.replace("barter_pilih_", ""), 10);
+        const src = await barterSourceAt(String(call.from.id), i);
+        if (!src.ok) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: `⚠️ ${src.error}` });
+          return res.status(200).json({ ok: true });
+        }
+        const katalogList = await getKatalog();
+        const tujuan = katalogList
+          .filter((k) => k.nama !== src.item.nama && parseNominal(k.harga) > 0)
+          .slice(0, 8);
+        if (!tujuan.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Belum ada produk lain di katalog untuk ditukar." });
+          return res.status(200).json({ ok: true });
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            `Kamu mau menukar <b>${escapeHtml(src.item.nama)}</b>.\n` +
+            `Pilih produk tujuan dari katalog:`,
+          reply_markup: {
+            inline_keyboard: tujuan.map((k) => [
+              { text: `${k.nama.slice(0, 30)} (${formatRupiah(parseNominal(k.harga))})`, callback_data: `barter_tuju_${i}_${k.id}` },
+            ]),
+          },
+        });
+      } else if (data.startsWith("barter_tuju_")) {
+        const [, , idxRaw, tujuId] = data.split("_");
+        const uid = String(call.from.id);
+        const src = await barterSourceAt(uid, parseInt(idxRaw, 10));
+        if (!src.ok) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: `⚠️ ${src.error}` });
+          return res.status(200).json({ ok: true });
+        }
+        const katalogList = await getKatalog();
+        const tuju = katalogList.find((k) => String(k.id) === String(tujuId));
+        if (!tuju) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Produk tujuan sudah tidak ada." });
+          return res.status(200).json({ ok: true });
+        }
+        const hargaTuju = parseNominal(tuju.harga);
+        const tujuLinks =
+          Array.isArray(tuju.links) && tuju.links.length > 0 ? tuju.links : tuju.link ? [tuju.link] : [];
+        const b = {
+          id: Date.now().toString(36),
+          uid,
+          old_nama: src.entry.nama,
+          old_link: src.entry.link || "",
+          old_item_id: String(src.item.id),
+          tuju_id: String(tuju.id),
+          tuju_nama: tuju.nama,
+          tuju_link: tujuLinks[0] || "",
+          status: "menunggu_acc",
+        };
+        await saveBarter(b);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.`,
+        });
+        const adminId = await getNotifyAdminId();
+        if (adminId) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: adminId,
+            parse_mode: "HTML",
+            text:
+              `🔁 <b>PENGAJUAN BARTER</b>
+` +
+              `Pembeli: <code>${escapeHtml(uid)}</code>
+` +
+              `Tukar: <b>${escapeHtml(b.old_nama)}</b> (harga ${formatRupiah(parseNominal(src.item.harga))})
+` +
+              `Ke: <b>${escapeHtml(b.tuju_nama)}</b> (harga ${formatRupiah(hargaTuju)})
+` +
+              `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`,
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "✅ ACC", callback_data: `barter_acc_${b.id}` },
+                { text: "❌ Tolak", callback_data: `barter_tolak_${b.id}` },
+              ]],
+            },
+          });
+        }
+      } else if (data.startsWith("barter_acc_") || data.startsWith("barter_tolak_")) {
+        if (!(await isAdminUser(call.from))) return res.status(200).json({ ok: true });
+        const isAcc = data.startsWith("barter_acc_");
+        const b = await getBarter(data.replace(/^barter_(acc|tolak)_/, ""));
+        if (!b || b.status !== "menunggu_acc") {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Pengajuan ini sudah diproses atau kedaluwarsa." });
+          return res.status(200).json({ ok: true });
+        }
+        if (!isAcc) {
+          b.status = "ditolak";
+          await saveBarter(b);
+          await tgRequest(token, "sendMessage", { chat_id: b.uid, text: `❌ Pengajuan barter ke ${b.tuju_nama} ditolak admin.` });
+          return res.status(200).json({ ok: true });
+        }
+        await finalizeBarter(token, b);
+        await tgRequest(token, "sendMessage", { chat_id: chatId, text: `✅ Barter ${b.id} di-ACC.` });
+      } else if (data.startsWith("patungan_ambil_")) {
+        const p = await getPatungan();
+        if (!p || p.status !== "aktif" || Date.now() > p.end_ts) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Patungan ini sudah tidak aktif." });
+          return res.status(200).json({ ok: true });
+        }
+        if (p.terjual >= p.bagian) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "🎉 Semua bagian sudah terisi." });
+          return res.status(200).json({ ok: true });
+        }
+        const target = {
+          ok: true,
+          itemId: p.item_id,
+          itemNama: `Patungan ${p.item_nama}`,
+          baseNominal: p.share_price,
+          tierLabel: "",
+          targetLink: "",
+          targetLinks: [],
+          targetFiles: [],
+          isMystery: false,
+          extra: { is_patungan: true, skip_discount_lookup: true },
+        };
         await sendQrisInvoiceForTarget(token, chatId, call.from, target);
       } else if (data.startsWith("paysaldo_")) {
         const targetKey = data.replace("paysaldo_", "");
@@ -11018,6 +11420,29 @@ module.exports = async function handler(req, res) {
       }
 
       const rawText = (msg.text || msg.caption || "").trim();
+
+      // BARTER LAIN: user sedang diminta mengetik nama produk penawaran
+      if (msg.text && !rawText.startsWith("/") && msg.chat && msg.chat.type === "private") {
+        const uidWait = String(msg.from && msg.from.id);
+        const waiting = await redisCommand(["GET", `${REDIS_BARTER_WAIT_PREFIX}${uidWait}`]);
+        if (waiting) {
+          await redisCommand(["DEL", `${REDIS_BARTER_WAIT_PREFIX}${uidWait}`]);
+          await redisCommand(["SET", `${REDIS_BARTER_OFFER_PREFIX}${uidWait}`, rawText.slice(0, 200), "EX", "900"]);
+          const katalogList = await getKatalog();
+          const pilihan = katalogList.filter((k) => parseNominal(k.harga) > 0).slice(0, 8);
+          await tgRequest(token, "sendMessage", {
+            chat_id: msg.chat.id,
+            parse_mode: "HTML",
+            text: `Penawaranmu: <b>${escapeHtml(rawText.slice(0, 200))}</b>\nSekarang pilih produk tujuan dari katalog:`,
+            reply_markup: {
+              inline_keyboard: pilihan.map((k) => [
+                { text: `${k.nama.slice(0, 30)} (${formatRupiah(parseNominal(k.harga))})`, callback_data: `barter_lainpilih_${k.id}` },
+              ]),
+            },
+          });
+          return res.status(200).json({ ok: true });
+        }
+      }
       const lowerText = rawText.toLowerCase();
 
       // Catat setiap perintah admin, lalu tampilkan log bila diminta
@@ -11794,6 +12219,90 @@ module.exports = async function handler(req, res) {
         teks += myIdx === -1 ? "\nKamu belum masuk papan skor minggu ini." : `\nKamu di posisi <b>${myIdx + 1}</b> dengan ${rows[myIdx].n} teman.`;
         teks += `\n\n<i>Hadiah juara dibagikan setiap awal minggu jika peserta minimal ${REFLB_MIN_PESERTA} pengundang.</i>`;
         await tgRequest(token, "sendMessage", { chat_id: chatId, text: teks, parse_mode: "HTML" });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0D. ADMIN: /patungan ID_PRODUK HARGA BAGIAN HARI
+      if (/^\/patungan(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        if (!msg.chat || msg.chat.type !== "private") return res.status(200).json({ ok: true });
+        const args = rawText.trim().split(/\s+/).slice(1);
+        const itemId = String(args[0] || "");
+        const harga = parseInt(args[1], 10);
+        const bagian = parseInt(args[2], 10);
+        const hari = parseInt(args[3], 10);
+        const fmt = "Format: <code>/patungan ID_PRODUK HARGA BAGIAN HARI</code>\nContoh: <code>/patungan 12 300000 10 7</code>";
+        if (!itemId || !harga || !bagian || !hari || bagian < 2 || hari < 1) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: fmt });
+          return res.status(200).json({ ok: true });
+        }
+        const existing = await getPatungan();
+        if (existing && existing.status === "aktif" && Date.now() <= existing.end_ts) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Masih ada patungan yang berjalan. Tunggu selesai dulu." });
+          return res.status(200).json({ ok: true });
+        }
+        const katalogList = await getKatalog();
+        const item = katalogList.find((k) => String(k.id) === itemId);
+        if (!item) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ ID produk tidak ditemukan di katalog." });
+          return res.status(200).json({ ok: true });
+        }
+        const sharePrice = Math.ceil(harga / bagian);
+        if (sharePrice < PATUNGAN_MIN_BAGIAN) {
+          await tgRequest(token, "sendMessage", {
+            chat_id: chatId,
+            text: `⚠️ Harga satu bagian minimal ${formatRupiah(PATUNGAN_MIN_BAGIAN)}. Kurangi jumlah bagian.`,
+          });
+          return res.status(200).json({ ok: true });
+        }
+        const channelId = await getPostChannel();
+        if (!channelId) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Channel posting belum diatur." });
+          return res.status(200).json({ ok: true });
+        }
+        const p = {
+          id: String(Date.now()),
+          item_id: String(item.id),
+          item_nama: item.nama,
+          bagian,
+          share_price: sharePrice,
+          end_ts: Date.now() + hari * 86400000,
+          status: "aktif",
+          terjual: 0,
+          channel_id: channelId,
+          pinned_msg_id: null,
+        };
+        await redisCommand(["DEL", REDIS_PATUNGAN_BUYERS_KEY]);
+        await redisCommand(["DEL", REDIS_PATUNGAN_LOCK_KEY]);
+        await savePatungan(p);
+        await refreshPatunganMessage(token, p);
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: `✅ Patungan <b>${escapeHtml(p.item_nama)}</b> dibuka: ${bagian} bagian @ ${formatRupiah(sharePrice)}, berlaku ${hari} hari.`,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
+      // 0E. USER: /barter (barter produk di koleksi ke admin, tanpa pembayaran)
+      if (/^\/barter(\s|$)/i.test(rawText)) {
+        const uid = String(msg.from && msg.from.id);
+        const list = (await getKoleksi(uid)).slice(0, 6);
+        if (!list.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Koleksimu masih kosong, belum ada yang bisa ditukar." });
+          return res.status(200).json({ ok: true });
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: "🔁 <b>Barter ke Admin</b>\nPilih produk dari koleksimu yang mau ditukar. Admin yang menilai dan menyetujui tukarannya.",
+          reply_markup: {
+            inline_keyboard: [
+              ...list.map((e, i) => [{ text: e.nama.slice(0, 40), callback_data: `barter_pilih_${i}` }]),
+              [{ text: "➕ Produk lain (ketik sendiri)", callback_data: "barter_lain" }],
+            ],
+          },
+        });
         return res.status(200).json({ ok: true });
       }
 
