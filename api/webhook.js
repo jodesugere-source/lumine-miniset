@@ -157,6 +157,7 @@ const REDIS_ORDER_PREFIX = "lumine_main_order_";
 const REDIS_PENDING_MAP_KEY = "lumine_main_pending_orders";
 const REDIS_LB_PREFIX = "lumine_main_lb_";
 const REDIS_LB_NAMES_KEY = "lumine_main_lb_names";
+const REDIS_CAD_LOG_KEY = "lumine_main_cad_log"; // LIST riwayat perubahan link cadangan (terbaru di depan)
 const REDIS_BUYER_SPEND_KEY = "lumine_main_buyer_spend"; // HASH id pembeli -> total Rp order lunas (sejak fitur ini aktif)
 const REDIS_BUYER_FIRST_KEY = "lumine_main_buyer_first"; // HASH id pembeli -> epoch detik pembelian pertama
 const REDIS_BUYER_LAST_KEY = "lumine_main_buyer_last"; // HASH id pembeli -> epoch detik pembelian terakhir
@@ -9116,6 +9117,30 @@ async function getNotifyAdminId() {
 }
 
 const normCore = (x) => String(x || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+// Jarak ejaan (Levenshtein) untuk menebak nama set yang salah ketik
+function editDistance(a, b) {
+  const m = a.length, n = b.length;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+// Cari set di katalog yang namanya paling mirip (dipakai untuk saran "maksudnya ...?")
+function bestNameGuess(text, katalog, maxDist = 4) {
+  const t = normCore(text);
+  if (!t) return null;
+  let best = null, bd = Infinity;
+  for (const k of katalog) {
+    const d = editDistance(t, normCore(k.nama));
+    if (d < bd) { bd = d; best = k; }
+  }
+  return best && bd <= maxDist ? { item: best, no: katalog.indexOf(best) + 1, dist: bd } : null;
+}
 
 // Cari nama set di dalam sebuah teks (nama terpanjang yang menang; kembar/ambigu dilaporkan).
 function findSetInText(text, katalog) {
@@ -9219,6 +9244,7 @@ async function applyBackupPairs(pairs) {
   try {
     const list = await getKatalog();
     const changed = [];
+    const conflicts = [];
     let unchanged = 0;
     for (const p of pairs) {
       const idx = list.findIndex((k) => String(k.id) === String(p.item.id));
@@ -9228,19 +9254,81 @@ async function applyBackupPairs(pairs) {
         unchanged++;
         continue;
       }
-      if (!old) {
-        list[idx].cadangan = p.url;
-      } else {
-        if (!Array.isArray(list[idx].cadangan_extra)) list[idx].cadangan_extra = [];
-        list[idx].cadangan_extra.push(p.url);
+      if (old) {
+        // set sudah punya link cadangan: tanya admin dulu (tambah / ganti / abaikan)
+        conflicts.push({ item: list[idx], url: p.url });
+        continue;
       }
-      if (!changed.some((c) => c.no === idx + 1)) changed.push({ no: idx + 1, item: list[idx], old, added: Boolean(old) });
+      list[idx].cadangan = p.url;
+      if (!changed.some((c) => c.no === idx + 1)) changed.push({ no: idx + 1, item: list[idx], old, added: false });
     }
-    if (changed.length) await saveKatalog(list);
-    return { changed, unchanged };
+    if (changed.length) {
+      await saveKatalog(list);
+      const nowTs = Date.now();
+      for (const c of changed) {
+        await redisCommand(["LPUSH", REDIS_CAD_LOG_KEY, JSON.stringify({ t: nowTs, nama: c.item.nama, lama: c.old || "", baru: c.item.cadangan || (c.item.cadangan_extra || []).slice(-1)[0] || "", via: "auto" })]);
+      }
+      await redisCommand(["LTRIM", REDIS_CAD_LOG_KEY, "0", "499"]);
+    }
+    return { changed, unchanged, conflicts };
   } finally {
     if (locked) await redisCommand(["DEL", REDIS_KATALOG_LOCK_KEY]);
   }
+}
+
+// Terapkan pilihan admin dari tombol konfirmasi (tambah atau ganti link cadangan)
+async function applyCadanganChoice(token, itemId, url, mode) {
+  const got = await redisCommand(["SET", REDIS_KATALOG_LOCK_KEY, "1", "NX", "EX", "15"]);
+  if (got !== "OK") return { ok: false, reason: "katalog sedang dipakai, coba lagi" };
+  try {
+    const list = await getKatalog();
+    const idx = list.findIndex((k) => String(k.id) === String(itemId));
+    if (idx < 0) return { ok: false, reason: "set tidak ditemukan" };
+    const item = list[idx];
+    if (mode === "rep") {
+      item.cadangan = url;
+      item.cadangan_extra = [];
+    } else {
+      if (!item.cadangan) item.cadangan = url;
+      else {
+        if (!Array.isArray(item.cadangan_extra)) item.cadangan_extra = [];
+        if (!getCadanganList(item).includes(url)) item.cadangan_extra.push(url);
+      }
+    }
+    await saveKatalog(list);
+    await redisCommand(["LPUSH", REDIS_CAD_LOG_KEY, JSON.stringify({ t: Date.now(), nama: item.nama, lama: "", baru: url, via: mode === "rep" ? "konfirmasi ganti" : "konfirmasi tambah" })]);
+    await redisCommand(["LTRIM", REDIS_CAD_LOG_KEY, "0", "499"]);
+    await syncSummaryText(token, [{ no: idx + 1, item }]);
+    return { ok: true };
+  } finally {
+    await redisCommand(["DEL", REDIS_KATALOG_LOCK_KEY]);
+  }
+}
+
+// Laporan harian ringkas untuk admin (dipanggil oleh Vercel Cron)
+async function sendDailyReport(token) {
+  const to = await getNotifyAdminId();
+  if (!to) return;
+  const katalog = await getKatalog();
+  const noCad = katalog.filter((k) => getCadanganList(k).length === 0).length;
+  const noPrev = katalog.filter((k) => !k.photo_id).length;
+  const flat = (await redisCommand(["HGETALL", REDIS_POSTMSG_KEY])) || [];
+  const tercatat = new Set();
+  for (let i = 0; i < flat.length; i += 2) tercatat.add(String(flat[i]));
+  const belumTercatat = katalog.filter((k) => !tercatat.has(String(k.id))).length;
+  const logs = (await redisCommand(["LRANGE", REDIS_CAD_LOG_KEY, "0", "499"])) || [];
+  const dayAgo = Date.now() - 86400000;
+  const baruHariIni = logs
+    .map((r) => { try { return JSON.parse(r); } catch { return null; } })
+    .filter((e) => e && e.t >= dayAgo).length;
+  const pesan =
+    "🗓 <b>Laporan harian</b>\n" +
+    `• Set di katalog: <b>${katalog.length}</b>\n` +
+    `• Belum punya link cadangan: <b>${noCad}</b>\n` +
+    `• Belum punya preview: <b>${noPrev}</b>\n` +
+    `• Postingan CH utama belum tercatat: <b>${belumTercatat}</b>\n` +
+    `• Link cadangan baru (24 jam): <b>${baruHariIni}</b>`;
+  await tgRequest(token, "sendMessage", { chat_id: to, text: pesan, parse_mode: "HTML" });
 }
 
 // Proses satu postingan dari channel cadangan (atau yang di-forward admin dari sana).
@@ -9254,7 +9342,26 @@ async function handleBackupPost(token, m, reportChatId, alwaysNotify) {
     if (alwaysNotify) await say("⚠️ Tidak ada link di postingan ini.");
     return;
   }
-  const ap = ex.pairs.length ? await applyBackupPairs(ex.pairs) : { changed: [], unchanged: 0 };
+  const ap = ex.pairs.length ? await applyBackupPairs(ex.pairs) : { changed: [], unchanged: 0, conflicts: [] };
+  for (const cf of ap.conflicts || []) {
+    const pid = Math.random().toString(36).slice(2, 10);
+    await redisCommand(["SET", `lumine_main_cad_pend_${pid}`, JSON.stringify({ itemId: String(cf.item.id), url: cf.url }), "EX", "86400"]);
+    if (to) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: to,
+        text: `⚠️ <b>${escapeHtml(cf.item.nama)}</b> sudah punya link cadangan.\nLink baru: ${escapeHtml(cf.url)}\nMau diapakan?`,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "➕ Tambah", callback_data: `cadpick_${pid}_add` },
+            { text: "🔁 Ganti", callback_data: `cadpick_${pid}_rep` },
+            { text: "❌ Abaikan", callback_data: `cadpick_${pid}_skip` },
+          ]],
+        },
+      });
+    }
+  }
   const syncTxt = ap.changed.length ? await syncSummaryText(token, ap.changed.map((c) => ({ no: c.no, item: c.item }))) : "";
 
   const problem = ex.unmatched.length > 0 || ex.ambiguous.length > 0;
@@ -9271,7 +9378,9 @@ async function handleBackupPost(token, m, reportChatId, alwaysNotify) {
   if (ap.changed.length > 15) lines.push(`… dan ${ap.changed.length - 15} set lain`);
   if (!ap.changed.length && ap.unchanged) lines.push(`✅ ${ap.unchanged} set sudah punya link yang sama, tidak ada perubahan.`);
   for (const u of ex.unmatched.slice(0, 5)) {
-    lines.push(`❓ Link tidak cocok dengan set manapun: ${escapeHtml(short(u.url))}${u.label ? ` (teks: "${escapeHtml(u.label)}")` : ""}`);
+    const g = u.label ? bestNameGuess(u.label, katalog) : null;
+    const saran = g ? `\n   💡 Maksudnya <b>${escapeHtml(g.item.nama)}</b>? Kirim: <code>/setcadangan ${g.no} ${escapeHtml(u.url)}</code>` : "";
+    lines.push(`❓ Link tidak cocok dengan set manapun: ${escapeHtml(short(u.url))}${u.label ? ` (teks: "${escapeHtml(u.label)}")` : ""}${saran}`);
   }
   for (const a of ex.ambiguous.slice(0, 3)) {
     lines.push(`⚠️ Nama kembar, dilewati: ${escapeHtml(a.names.slice(0, 3).join(" / "))} → ${escapeHtml(short(a.url))}`);
@@ -9603,6 +9712,10 @@ module.exports = async function handler(req, res) {
   }
 
   if (req.method === "GET") {
+    if (process.env.CRON_SECRET && req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`) {
+      await sendDailyReport(token);
+      return res.status(200).json({ ok: true, report: "sent" });
+    }
     if (req.query.setup === "true") {
       const webhookUrl = `https://${req.headers.host}/api/webhook`;
       const result = await tgRequest(token, "setWebhook", {
@@ -10356,6 +10469,24 @@ module.exports = async function handler(req, res) {
             adminFooter,
           parse_mode: "HTML",
         });
+      } else if (data.startsWith("cadpick_")) {
+        if (!isCallerAdmin) return res.status(200).json({ ok: true });
+        const [, pid, act] = data.split("_");
+        const key = `lumine_main_cad_pend_${pid}`;
+        const raw = await redisCommand(["GET", key]);
+        await redisCommand(["DEL", key]);
+        if (!raw) {
+          await tgRequest(token, "editMessageText", { chat_id: chatId, message_id: messageId, text: "⏰ Pilihan ini sudah tidak berlaku." });
+          return res.status(200).json({ ok: true });
+        }
+        const pend = JSON.parse(raw);
+        let hasil = "❌ Diabaikan, link lama tetap dipakai.";
+        if (act === "add" || act === "rep") {
+          const r = await applyCadanganChoice(token, pend.itemId, pend.url, act);
+          hasil = r.ok ? (act === "rep" ? "🔁 Link cadangan diganti." : "➕ Link cadangan ditambahkan.") : `⚠️ Gagal: ${r.reason}`;
+        }
+        await tgRequest(token, "editMessageText", { chat_id: chatId, message_id: messageId, text: hasil });
+        return res.status(200).json({ ok: true });
       } else if (data.startsWith("reject_")) {
         if (!isCallerAdmin) return res.status(200).json({ ok: true });
         const orderId = data.replace("reject_", "");
@@ -12320,6 +12451,29 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 5B2. ADMIN: /riwayatcad — 15 perubahan link cadangan terakhir (hasil auto-detect)
+      if (/^\/riwayatcad(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        const raw = (await redisCommand(["LRANGE", REDIS_CAD_LOG_KEY, "0", "14"])) || [];
+        if (!raw.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Belum ada riwayat perubahan link cadangan." });
+          return res.status(200).json({ ok: true });
+        }
+        const lines = raw.map((r) => {
+          const e = JSON.parse(r);
+          const tgl = new Date(e.t + 7 * 3600 * 1000).toISOString().slice(0, 16).replace("T", " ");
+          const lama = e.lama ? `${escapeHtml(e.lama)} → ` : "";
+          return `• ${tgl} <b>${escapeHtml(e.nama)}</b>: ${lama}${escapeHtml(e.baru)} <i>(${escapeHtml(e.via)})</i>`;
+        });
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          text: `🕓 <b>Riwayat link cadangan (terbaru)</b>\n\n${lines.join("\n")}`,
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 5C. ADMIN: /hapuslb ID_ATAU_NAMA — hapus satu akun dari klasemen (+ hitungan beli & tier)
       if (/^\/hapuslb(\s|$)/i.test(rawText)) {
         if (!isAdmin) return res.status(200).json({ ok: true });
@@ -12657,6 +12811,14 @@ module.exports = async function handler(req, res) {
             return;
           }
 
+          const dupGuess = katalogList.find((k) => {
+            const a = normCore(k.nama), b = normCore(parts[0]);
+            return a !== b && editDistance(a, b) <= 2;
+          });
+          if (dupGuess) {
+            failed.push({ no: i + 1, text: `"${parts[0]}" mirip "${dupGuess.nama}". Kalau memang beda, ubah nama dulu lalu kirim ulang` });
+            return;
+          }
           const linksArr = parts[3]
             .split(/[\n,]+/)
             .map((s) => s.trim())
