@@ -1,1 +1,170 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dashboard Admin</title>
+<style>
+  :root { color-scheme: light dark; --bg:#f5f6f8; --card:#fff; --text:#1d2330; --muted:#6b7280; --accent:#4f46e5; --bar:#818cf8; --line:#e5e7eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --card:#1a1d24; --text:#e8eaf0; --muted:#9aa3b2; --accent:#818cf8; --bar:#6366f1; --line:#2a2f3a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); padding:16px; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .wrap { max-width:960px; margin:0 auto; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .label { color:var(--muted); font-size:12px; }
+  .value { font-size:20px; font-weight:700; margin-top:4px; }
+  .section { margin-bottom:16px; }
+  .section h2 { font-size:15px; margin:0 0 10px; }
+  .chart { display:flex; align-items:flex-end; gap:8px; height:160px; }
+  .col { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%; }
+  .bar { width:100%; background:var(--bar); border-radius:6px 6px 0 0; min-height:2px; }
+  .bl { font-size:11px; color:var(--muted); margin-top:6px; }
+  .bv { font-size:11px; margin-bottom:4px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; }
+  .empty { color:var(--muted); font-size:13px; padding:8px 0; }
+  .login { max-width:320px; margin:80px auto; }
+  input { width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); font-size:15px; }
+  button { padding:10px 14px; border-radius:8px; border:0; background:var(--accent); color:#fff; font-size:14px; cursor:pointer; width:100%; margin-top:10px; }
+  .err { color:#ef4444; font-size:13px; margin-top:8px; min-height:18px; }
+  .top { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+  .btn-small { width:auto; margin:0; padding:6px 12px; font-size:13px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="wrap">
 
+  <!-- Layar login -->
+  <div id="loginView" class="login card">
+    <h1>Dashboard Admin</h1>
+    <div class="sub">Masukkan password dashboard.</div>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+    <button id="loginBtn">Masuk</button>
+    <div id="loginErr" class="err"></div>
+  </div>
+
+  <!-- Layar dashboard -->
+  <div id="dashView" class="hidden">
+    <div class="top">
+      <div>
+        <h1>Dashboard Admin</h1>
+        <div class="sub" id="updated">Memuat...</div>
+      </div>
+      <div>
+        <button id="refreshBtn" class="btn-small">Refresh</button>
+        <button id="logoutBtn" class="btn-small" style="background:var(--muted)">Keluar</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="label">Omset hari ini</div><div class="value" id="sOmsetToday">-</div></div>
+      <div class="card"><div class="label">Order hari ini</div><div class="value" id="sOrderToday">-</div></div>
+      <div class="card"><div class="label">Total omset</div><div class="value" id="sOmsetTotal">-</div></div>
+      <div class="card"><div class="label">Total order</div><div class="value" id="sOrderTotal">-</div></div>
+      <div class="card"><div class="label">Set di katalog</div><div class="value" id="sKatalog">-</div></div>
+      <div class="card"><div class="label">Pending</div><div class="value" id="sPending">-</div></div>
+    </div>
+
+    <div class="card section">
+      <h2>Omset 7 hari terakhir (WIB)</h2>
+      <div class="chart" id="chart"></div>
+    </div>
+
+    <div class="card section">
+      <h2>Pesanan pending</h2>
+      <div id="pendingWrap"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const API = "/api/admin-data";
+const $ = (id) => document.getElementById(id);
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function rp(n) { return "Rp " + Number(n || 0).toLocaleString("id-ID"); }
+
+function showLogin(msg) {
+  sessionStorage.removeItem("dashKey");
+  $("dashView").classList.add("hidden");
+  $("loginView").classList.remove("hidden");
+  $("loginErr").textContent = msg || "";
+}
+
+async function load() {
+  const key = sessionStorage.getItem("dashKey");
+  if (!key) return showLogin();
+  $("updated").textContent = "Memuat...";
+  let res;
+  try {
+    res = await fetch(API, { headers: { "x-dash-key": key }, cache: "no-store" });
+  } catch {
+    $("updated").textContent = "Gagal terhubung ke server.";
+    return;
+  }
+  if (res.status === 401) return showLogin("Password salah.");
+  if (!res.ok) { $("updated").textContent = "Gagal memuat data (" + res.status + ")."; return; }
+
+  const d = await res.json();
+  $("loginView").classList.add("hidden");
+  $("dashView").classList.remove("hidden");
+  $("updated").textContent = "Diperbarui: " + new Date(d.generated_at).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" }) + " WIB";
+
+  const s = d.summary;
+  $("sOmsetToday").textContent = rp(s.omset_today);
+  $("sOrderToday").textContent = s.order_today;
+  $("sOmsetTotal").textContent = rp(s.omset_total);
+  $("sOrderTotal").textContent = s.order_total;
+  $("sKatalog").textContent = s.katalog_count;
+  $("sPending").textContent = s.pending_count;
+
+  // Grafik batang sederhana
+  const max = Math.max(1, ...d.chart.map((c) => c.rupiah));
+  $("chart").innerHTML = d.chart.map((c) => {
+    const h = Math.round((c.rupiah / max) * 100);
+    const label = c.day.slice(5).replace("-", "/");
+    return '<div class="col">' +
+      '<div class="bv">' + esc(c.rupiah ? (c.rupiah / 1000).toFixed(0) + "rb" : "0") + "</div>" +
+      '<div class="bar" style="height:' + h + '%" title="' + esc(rp(c.rupiah) + " • " + c.count + " order") + '"></div>' +
+      '<div class="bl">' + esc(label) + "</div></div>";
+  }).join("");
+
+  // Tabel pending
+  if (!d.pending.length) {
+    $("pendingWrap").innerHTML = '<div class="empty">Tidak ada pesanan pending.</div>';
+  } else {
+    $("pendingWrap").innerHTML =
+      '<table><tr><th>ID</th><th>Pembeli</th><th>Set</th><th>Total</th><th>Status</th></tr>' +
+      d.pending.map((p) =>
+        "<tr><td>" + esc(p.id) + "</td><td>" + esc(p.buyer_name) + "</td><td>" + esc(p.item_nama) +
+        "</td><td>" + esc(rp(p.nominal)) + "</td><td>" + esc(p.status) + "</td></tr>"
+      ).join("") + "</table>";
+  }
+}
+
+$("loginBtn").onclick = () => {
+  const pw = $("pw").value;
+  if (!pw) return;
+  sessionStorage.setItem("dashKey", pw);
+  $("loginErr").textContent = "";
+  load();
+};
+$("pw").addEventListener("keydown", (e) => { if (e.key === "Enter") $("loginBtn").click(); });
+$("refreshBtn").onclick = load;
+$("logoutBtn").onclick = () => showLogin();
+
+load();
+</script>
+</body>
+</html>
