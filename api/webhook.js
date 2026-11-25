@@ -9996,10 +9996,186 @@ async function finalizeBarter(token, b) {
 
 // ---- BARTER DENGAN PRODUK DI LUAR KOLEKSI (pembeli mengetik sendiri produk yang mau ditawarkan) ----
 const REDIS_BARTER_WAIT_PREFIX = "lumine_main_barter_wait_"; // flag: user sedang diminta mengetik produk
-const REDIS_BARTER_OFFER_PREFIX = "lumine_main_barter_offer_"; // teks penawaran produk lain
 
-async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItemId, tuju, oldHargaText) {
+// Daftar produk tujuan dari katalog, dibagi halaman (8 per halaman) supaya semua produk bisa dipilih
+const BARTER_TUJU_PER_HALAMAN = 8;
+async function sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, pembuka, hargaRef = 0) {
+  const katalogList = await getKatalog();
+  let semua = katalogList.filter((k) => parseNominal(k.harga) > 0 && (!excludeNama || k.nama !== excludeNama));
+  if (hargaRef > 0) {
+    // hanya tampilkan produk yang lolos batas selisih, supaya tidak ditolak otomatis
+    semua = semua.filter((k) => {
+      const h = parseNominal(k.harga);
+      return Math.abs(h - hargaRef) / Math.max(h, hargaRef) <= BARTER_MAKS_SELISIH;
+    });
+    // yang harganya paling mirip tampil paling atas
+    semua.sort((a, b) => Math.abs(parseNominal(a.harga) - hargaRef) - Math.abs(parseNominal(b.harga) - hargaRef));
+  } else {
+    // tanpa harga pembanding, yang termurah tampil dulu
+    semua.sort((a, b) => parseNominal(a.harga) - parseNominal(b.harga));
+  }
+  if (!semua.length) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: chatId,
+      text: "Belum ada produk dengan harga yang cukup mirip untuk ditukar. Coba barang lain atau pilih dari daftar yang dibutuhkan admin.",
+    });
+    return;
+  }
+  const totalHalaman = Math.ceil(semua.length / BARTER_TUJU_PER_HALAMAN);
+  const hal = Math.min(Math.max(0, page), totalHalaman - 1);
+  const potong = semua.slice(hal * BARTER_TUJU_PER_HALAMAN, (hal + 1) * BARTER_TUJU_PER_HALAMAN);
+  const daftarTeks = potong
+    .map((k, i) => {
+      const nomor = hal * BARTER_TUJU_PER_HALAMAN + i + 1;
+      return `<b>${nomor}. ${escapeHtml(k.nama)}</b> — ${formatRupiah(parseNominal(k.harga))}` +
+        (k.isi ? `\n<i>${escapeHtml(String(k.isi).slice(0, 120))}</i>` : "");
+    })
+    .join("\n\n");
+  const rows = potong.map((k, i) => [{
+    text: `${hal * BARTER_TUJU_PER_HALAMAN + i + 1}. ${k.nama.slice(0, 26)}`,
+    callback_data: modeKey === "lain"
+      ? `barter_lainpilih_${k.id}`
+      : `barter_tuju_${modeKey.slice(1)}_${k.id}`,
+  }]);
+  const nav = [];
+  if (hal > 0) nav.push({ text: "⬅️ Sebelumnya", callback_data: `barter_halaman_${modeKey}_${hal - 1}` });
+  if (hal < totalHalaman - 1) nav.push({ text: "Berikutnya ➡️", callback_data: `barter_halaman_${modeKey}_${hal + 1}` });
+  if (nav.length) rows.push(nav);
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text:
+      `${pembuka || "Pilih produk tujuan dari katalog:"}\n\n${daftarTeks}\n\n` +
+      `<i>Halaman ${hal + 1}/${totalHalaman} • ${semua.length} produk${hargaRef > 0 ? " (harga mirip)" : ""}</i>`,
+    reply_markup: { inline_keyboard: rows },
+  });
+}
+
+// ---- BARANG YANG DIBUTUHKAN ADMIN (daftar pendek yang dipajang di menu barter) ----
+const REDIS_BUTUH_KEY = "lumine_main_butuh"; // JSON array: nama barang yang dibutuhkan admin
+async function getButuh() {
+  const raw = await redisCommand(["GET", REDIS_BUTUH_KEY]);
+  try {
+    const arr = raw ? JSON.parse(raw) : [];
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+async function saveButuh(arr) {
+  await redisCommand(["SET", REDIS_BUTUH_KEY, JSON.stringify(arr.slice(0, 20))]);
+}
+
+// ---- BUKTI PENAWARAN BARTER (nama, foto preview, link isi, total foto) ----
+const REDIS_BARTER_DRAFT_PREFIX = "lumine_main_barter_draft_"; // alur pengisian penawaran yang sedang berjalan
+const REDIS_BARTER_OFFER_PREFIX = "lumine_main_barter_offer_"; // penawaran lengkap yang siap dipilih tujuannya
+
+async function getBarterDraft(uid) {
+  const raw = await redisCommand(["GET", `${REDIS_BARTER_DRAFT_PREFIX}${uid}`]);
+  try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+async function setBarterDraft(uid, d) {
+  await redisCommand(["SET", `${REDIS_BARTER_DRAFT_PREFIX}${uid}`, JSON.stringify(d), "EX", "900"]);
+}
+async function delBarterDraft(uid) {
+  await redisCommand(["DEL", `${REDIS_BARTER_DRAFT_PREFIX}${uid}`]);
+}
+async function getBarterOffer(uid) {
+  const raw = await redisCommand(["GET", `${REDIS_BARTER_OFFER_PREFIX}${uid}`]);
+  try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+}
+async function setBarterOffer(uid, o) {
+  await redisCommand(["SET", `${REDIS_BARTER_OFFER_PREFIX}${uid}`, JSON.stringify(o), "EX", "900"]);
+}
+
+// Mulai pengisian bukti: minta foto preview dulu (nama sudah diketahui)
+async function startBarterProof(token, chatId, uid, dasar) {
+  await setBarterDraft(uid, { ...dasar, step: "foto" });
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text: `📸 Kirim <b>1 foto preview</b> dari produk <b>${escapeHtml(dasar.nama)}</b>. Ini untuk dilihat admin sebelum menyetujui.`,
+  });
+}
+
+// Mengolah pesan selama pengisian bukti. Mengembalikan true kalau pesan sudah ditangani.
+async function handleBarterDraftMessage(token, msg, draft, uid) {
+  const text = (msg.text || "").trim();
+  if (text.startsWith("/")) return false;
+  const chatId = msg.chat.id;
+  const ask = (t) => tgRequest(token, "sendMessage", { chat_id: chatId, parse_mode: "HTML", text: t });
+
+  if (draft.step === "nama") {
+    if (!text) { await ask("✍️ Ketik nama produknya sebagai teks."); return true; }
+    draft.nama = text.slice(0, 200);
+    draft.step = "foto";
+    await setBarterDraft(uid, draft);
+    await ask(`📸 Kirim <b>1 foto preview</b> dari produk <b>${escapeHtml(draft.nama)}</b>.`);
+    return true;
+  }
+  if (draft.step === "foto") {
+    if (!msg.photo || !msg.photo.length) { await ask("📸 Kirim foto, bukan teks."); return true; }
+    draft.preview = msg.photo[msg.photo.length - 1].file_id;
+    draft.step = "link";
+    await setBarterDraft(uid, draft);
+    await ask("🔗 Kirim <b>link isi produkmu</b> (link file atau folder).");
+    return true;
+  }
+  if (draft.step === "link") {
+    const cocok = text.match(/https?:\/\/\S+/i);
+    if (!cocok) { await ask("🔗 Kirim link yang diawali https://"); return true; }
+    draft.link = cocok[0];
+    draft.step = "total";
+    await setBarterDraft(uid, draft);
+    await ask("🖼️ Berapa <b>total foto</b> di produk itu? Ketik angkanya.");
+    return true;
+  }
+  if (draft.step === "total") {
+    const n = parseInt(text, 10);
+    if (!(n >= 1 && n <= 500)) { await ask("🖼️ Ketik angka total foto, misalnya <code>12</code>."); return true; }
+    await delBarterDraft(uid);
+    const offer = {
+      mode: draft.mode,
+      nama: draft.nama,
+      link: draft.link,
+      total: n,
+      preview: draft.preview,
+      old_item_id: draft.old_item_id || "",
+      old_harga: Number(draft.old_harga) || 0,
+    };
+    await setBarterOffer(uid, offer);
+    await ask(`✅ Penawaran diterima: <b>${escapeHtml(offer.nama)}</b> (${n} foto).\nSekarang pilih produk tujuan dari katalog:`);
+    const isKoleksi = String(offer.mode || "").startsWith("k");
+    await sendBarterTujuPage(
+      token, chatId, isKoleksi ? offer.mode : "lain", 0,
+      isKoleksi ? offer.nama : null,
+      "Pilih produk tujuan dari katalog:",
+      isKoleksi ? offer.old_harga : 0
+    );
+    return true;
+  }
+  return false;
+}
+
+const BARTER_MAKS_SELISIH = 0.3; // selisih harga di atas 30% ditolak otomatis oleh bot
+
+async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItemId, tuju, oldHarga, bukti) {
   const hargaTuju = parseNominal(tuju.harga);
+  const hargaLama = Number(oldHarga) || 0;
+  if (hargaLama > 0 && hargaTuju > 0) {
+    const selisihPct = Math.abs(hargaTuju - hargaLama) / Math.max(hargaTuju, hargaLama);
+    if (selisihPct > BARTER_MAKS_SELISIH) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: chatId,
+        parse_mode: "HTML",
+        text:
+          `❌ <b>Pengajuan ditolak otomatis.</b>\n` +
+          `Harga <b>${escapeHtml(oldNama)}</b> (${formatRupiah(hargaLama)}) dan <b>${escapeHtml(tuju.nama)}</b> (${formatRupiah(hargaTuju)}) terlalu jomplang, selisihnya lebih dari ${Math.round(BARTER_MAKS_SELISIH * 100)}%.\n` +
+          `Coba pilih produk tujuan yang harganya lebih mirip.`,
+      });
+      return null;
+    }
+  }
   const tujuLinks =
     Array.isArray(tuju.links) && tuju.links.length > 0 ? tuju.links : tuju.link ? [tuju.link] : [];
   const b = {
@@ -10008,6 +10184,7 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
     old_nama: oldNama,
     old_link: oldLink || "",
     old_item_id: oldItemId || "",
+    bukti: bukti || null,
     tuju_id: String(tuju.id),
     tuju_nama: tuju.nama,
     tuju_link: tujuLinks[0] || "",
@@ -10020,22 +10197,24 @@ async function createBarterRequest(token, chatId, uid, oldNama, oldLink, oldItem
   });
   const adminId = await getNotifyAdminId();
   if (adminId) {
-    await tgRequest(token, "sendMessage", {
-      chat_id: adminId,
-      parse_mode: "HTML",
-      text:
+    const teksAdmin =
         `🔁 <b>PENGAJUAN BARTER</b>\n` +
         `Pembeli: <code>${escapeHtml(uid)}</code>\n` +
-        `Tukar: <b>${escapeHtml(oldNama)}</b>${oldHargaText ? ` (harga ${escapeHtml(oldHargaText)})` : " (produk di luar koleksi)"}\n` +
+        `Tukar: <b>${escapeHtml(oldNama)}</b>${hargaLama > 0 ? ` (harga ${formatRupiah(hargaLama)})` : " (produk di luar koleksi)"}\n` +
         `Ke: <b>${escapeHtml(b.tuju_nama)}</b> (harga ${formatRupiah(hargaTuju)})\n` +
-        `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`,
-      reply_markup: {
-        inline_keyboard: [[
-          { text: "✅ ACC", callback_data: `barter_acc_${b.id}` },
-          { text: "❌ Tolak", callback_data: `barter_tolak_${b.id}` },
-        ]],
-      },
-    });
+        `${bukti ? `📦 Isi link: ${escapeHtml(bukti.link)}\n🖼️ Total foto: <b>${bukti.total}</b>\n` : ""}` +
+        `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`;
+    const markup = {
+      inline_keyboard: [[
+        { text: "✅ ACC", callback_data: `barter_acc_${b.id}` },
+        { text: "❌ Tolak", callback_data: `barter_tolak_${b.id}` },
+      ]],
+    };
+    if (bukti && bukti.preview) {
+      await tgRequest(token, "sendPhoto", { chat_id: adminId, photo: bukti.preview, caption: teksAdmin, parse_mode: "HTML", reply_markup: markup });
+    } else {
+      await tgRequest(token, "sendMessage", { chat_id: adminId, parse_mode: "HTML", text: teksAdmin, reply_markup: markup });
+    }
   }
   return b;
 }
@@ -10633,8 +10812,46 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
         await sendQrisInvoiceForTarget(token, chatId, call.from, target);
+      } else if (data.startsWith("barter_halaman_")) {
+        const sisa = data.replace("barter_halaman_", "");
+        const cut = sisa.lastIndexOf("_");
+        const modeKey = sisa.slice(0, cut);
+        const page = parseInt(sisa.slice(cut + 1), 10) || 0;
+        let excludeNama = null;
+        let hargaRef = 0;
+        if (modeKey.startsWith("k")) {
+          const src = await barterSourceAt(String(call.from.id), parseInt(modeKey.slice(1), 10));
+          excludeNama = src.ok ? src.item.nama : null;
+          hargaRef = src.ok ? parseNominal(src.item.harga) : 0;
+        }
+        await sendBarterTujuPage(token, chatId, modeKey, page, excludeNama, "Pilih produk tujuan dari katalog:", hargaRef);
+      } else if (data === "barter_butuh") {
+        const list = await getButuh();
+        if (!list.length) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Saat ini admin belum membutuhkan barang khusus." });
+          return res.status(200).json({ ok: true });
+        }
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text: "📌 <b>Barang yang dibutuhkan admin</b>\nPilih salah satu sebagai penawaranmu:",
+          reply_markup: {
+            inline_keyboard: list.map((x, i) => [{ text: x.slice(0, 40), callback_data: `barter_butuhpilih_${i}` }]),
+          },
+        });
+      } else if (data.startsWith("barter_butuhpilih_")) {
+        const i = parseInt(data.replace("barter_butuhpilih_", ""), 10);
+        const list = await getButuh();
+        if (!list[i]) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Barang itu sudah tidak dibutuhkan admin." });
+          return res.status(200).json({ ok: true });
+        }
+        await startBarterProof(token, chatId, String(call.from.id), {
+          mode: "lain",
+          nama: `[DIBUTUHKAN ADMIN] ${list[i]}`,
+        });
       } else if (data === "barter_lain") {
-        await redisCommand(["SET", `${REDIS_BARTER_WAIT_PREFIX}${call.from.id}`, "1", "EX", "600"]);
+        await setBarterDraft(String(call.from.id), { step: "nama", mode: "lain" });
         await tgRequest(token, "sendMessage", {
           chat_id: chatId,
           parse_mode: "HTML",
@@ -10643,14 +10860,14 @@ module.exports = async function handler(req, res) {
       } else if (data.startsWith("barter_lainpilih_")) {
         const tujuId = data.replace("barter_lainpilih_", "");
         const uid = String(call.from.id);
-        const offer = await redisCommand(["GET", `${REDIS_BARTER_OFFER_PREFIX}${uid}`]);
+        const offer = await getBarterOffer(uid);
         const katalogList = await getKatalog();
         const tuju = katalogList.find((k) => String(k.id) === String(tujuId));
         if (!offer || !tuju) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Penawaran sudah kedaluwarsa. Ulangi lewat /barter." });
           return res.status(200).json({ ok: true });
         }
-        await createBarterRequest(token, chatId, uid, String(offer), "", "", tuju, "");
+        await createBarterRequest(token, chatId, uid, offer.nama, offer.link, "", tuju, 0, offer);
       } else if (data.startsWith("barter_pilih_")) {
         const i = parseInt(data.replace("barter_pilih_", ""), 10);
         const src = await barterSourceAt(String(call.from.id), i);
@@ -10658,33 +10875,27 @@ module.exports = async function handler(req, res) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: `⚠️ ${src.error}` });
           return res.status(200).json({ ok: true });
         }
-        const katalogList = await getKatalog();
-        const tujuan = katalogList
-          .filter((k) => k.nama !== src.item.nama && parseNominal(k.harga) > 0)
-          .slice(0, 8);
-        if (!tujuan.length) {
-          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "Belum ada produk lain di katalog untuk ditukar." });
-          return res.status(200).json({ ok: true });
-        }
-        await tgRequest(token, "sendMessage", {
-          chat_id: chatId,
-          parse_mode: "HTML",
-          text:
-            `Kamu mau menukar <b>${escapeHtml(src.item.nama)}</b>.\n` +
-            `Pilih produk tujuan dari katalog:`,
-          reply_markup: {
-            inline_keyboard: tujuan.map((k) => [
-              { text: `${k.nama.slice(0, 30)} (${formatRupiah(parseNominal(k.harga))})`, callback_data: `barter_tuju_${i}_${k.id}` },
-            ]),
-          },
+        await startBarterProof(token, chatId, String(call.from.id), {
+          mode: `k${i}`,
+          nama: src.item.nama,
+          link: src.entry.link || "",
+          old_item_id: String(src.item.id),
+          old_harga: parseNominal(src.item.harga),
         });
       } else if (data.startsWith("barter_tuju_")) {
-        const [, , idxRaw, tujuId] = data.split("_");
+        const tujuId = data.split("_")[3];
         const uid = String(call.from.id);
-        const src = await barterSourceAt(uid, parseInt(idxRaw, 10));
-        if (!src.ok) {
-          await tgRequest(token, "sendMessage", { chat_id: chatId, text: `⚠️ ${src.error}` });
+        const offer = await getBarterOffer(uid);
+        if (!offer) {
+          await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Penawaran sudah kedaluwarsa. Ulangi lewat /barter." });
           return res.status(200).json({ ok: true });
+        }
+        if (offer.old_item_id) {
+          const cd = await redisCommand(["GET", `${REDIS_BARTER_CD_PREFIX}${uid}_${offer.old_item_id}`]);
+          if (cd) {
+            await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Produk hasil tukar belum bisa ditukar lagi (tunggu 30 hari)." });
+            return res.status(200).json({ ok: true });
+          }
         }
         const katalogList = await getKatalog();
         const tuju = katalogList.find((k) => String(k.id) === String(tujuId));
@@ -10692,49 +10903,7 @@ module.exports = async function handler(req, res) {
           await tgRequest(token, "sendMessage", { chat_id: chatId, text: "⚠️ Produk tujuan sudah tidak ada." });
           return res.status(200).json({ ok: true });
         }
-        const hargaTuju = parseNominal(tuju.harga);
-        const tujuLinks =
-          Array.isArray(tuju.links) && tuju.links.length > 0 ? tuju.links : tuju.link ? [tuju.link] : [];
-        const b = {
-          id: Date.now().toString(36),
-          uid,
-          old_nama: src.entry.nama,
-          old_link: src.entry.link || "",
-          old_item_id: String(src.item.id),
-          tuju_id: String(tuju.id),
-          tuju_nama: tuju.nama,
-          tuju_link: tujuLinks[0] || "",
-          status: "menunggu_acc",
-        };
-        await saveBarter(b);
-        await tgRequest(token, "sendMessage", {
-          chat_id: chatId,
-          parse_mode: "HTML",
-          text: `⏳ Pengajuan barter dikirim ke admin. Kamu akan dikabari setelah disetujui.`,
-        });
-        const adminId = await getNotifyAdminId();
-        if (adminId) {
-          await tgRequest(token, "sendMessage", {
-            chat_id: adminId,
-            parse_mode: "HTML",
-            text:
-              `🔁 <b>PENGAJUAN BARTER</b>
-` +
-              `Pembeli: <code>${escapeHtml(uid)}</code>
-` +
-              `Tukar: <b>${escapeHtml(b.old_nama)}</b> (harga ${formatRupiah(parseNominal(src.item.harga))})
-` +
-              `Ke: <b>${escapeHtml(b.tuju_nama)}</b> (harga ${formatRupiah(hargaTuju)})
-` +
-              `<i>Tanpa pembayaran. ACC kalau tukarannya layak.</i>`,
-            reply_markup: {
-              inline_keyboard: [[
-                { text: "✅ ACC", callback_data: `barter_acc_${b.id}` },
-                { text: "❌ Tolak", callback_data: `barter_tolak_${b.id}` },
-              ]],
-            },
-          });
-        }
+        await createBarterRequest(token, chatId, uid, offer.nama, offer.link, offer.old_item_id, tuju, offer.old_harga, offer);
       } else if (data.startsWith("barter_acc_") || data.startsWith("barter_tolak_")) {
         if (!(await isAdminUser(call.from))) return res.status(200).json({ ok: true });
         const isAcc = data.startsWith("barter_acc_");
@@ -11421,25 +11590,11 @@ module.exports = async function handler(req, res) {
 
       const rawText = (msg.text || msg.caption || "").trim();
 
-      // BARTER LAIN: user sedang diminta mengetik nama produk penawaran
-      if (msg.text && !rawText.startsWith("/") && msg.chat && msg.chat.type === "private") {
-        const uidWait = String(msg.from && msg.from.id);
-        const waiting = await redisCommand(["GET", `${REDIS_BARTER_WAIT_PREFIX}${uidWait}`]);
-        if (waiting) {
-          await redisCommand(["DEL", `${REDIS_BARTER_WAIT_PREFIX}${uidWait}`]);
-          await redisCommand(["SET", `${REDIS_BARTER_OFFER_PREFIX}${uidWait}`, rawText.slice(0, 200), "EX", "900"]);
-          const katalogList = await getKatalog();
-          const pilihan = katalogList.filter((k) => parseNominal(k.harga) > 0).slice(0, 8);
-          await tgRequest(token, "sendMessage", {
-            chat_id: msg.chat.id,
-            parse_mode: "HTML",
-            text: `Penawaranmu: <b>${escapeHtml(rawText.slice(0, 200))}</b>\nSekarang pilih produk tujuan dari katalog:`,
-            reply_markup: {
-              inline_keyboard: pilihan.map((k) => [
-                { text: `${k.nama.slice(0, 30)} (${formatRupiah(parseNominal(k.harga))})`, callback_data: `barter_lainpilih_${k.id}` },
-              ]),
-            },
-          });
+      // BARTER: alur pengisian bukti penawaran (nama, foto, link, total foto)
+      if (msg.chat && msg.chat.type === "private") {
+        const uidDraft = String(msg.from && msg.from.id);
+        const draft = await getBarterDraft(uidDraft);
+        if (draft && (await handleBarterDraftMessage(token, msg, draft, uidDraft))) {
           return res.status(200).json({ ok: true });
         }
       }
@@ -12284,6 +12439,40 @@ module.exports = async function handler(req, res) {
         return res.status(200).json({ ok: true });
       }
 
+      // 0D2. ADMIN: /butuh (kelola daftar barang yang dibutuhkan admin untuk barter)
+      if (/^\/butuh(\s|$)/i.test(rawText)) {
+        if (!isAdmin) return res.status(200).json({ ok: true });
+        if (!msg.chat || msg.chat.type !== "private") return res.status(200).json({ ok: true });
+        const args = rawText.trim().split(/\s+/).slice(1);
+        const aksi = (args[0] || "").toLowerCase();
+        const nama = args.slice(1).join(" ").trim();
+        let list = await getButuh();
+        let info = "";
+        if (aksi === "tambah" && nama) {
+          if (!list.includes(nama)) list.push(nama);
+          await saveButuh(list);
+          info = `✅ <b>${escapeHtml(nama)}</b> ditambahkan.\n\n`;
+        } else if (aksi === "hapus" && nama) {
+          list = list.filter((x) => x.toLowerCase() !== nama.toLowerCase());
+          await saveButuh(list);
+          info = `🗑️ <b>${escapeHtml(nama)}</b> dihapus.\n\n`;
+        } else if (aksi === "kosong") {
+          await saveButuh([]);
+          list = [];
+          info = "🧹 Daftar dikosongkan.\n\n";
+        }
+        const daftar = list.length ? list.map((x, i) => `${i + 1}. ${escapeHtml(x)}`).join("\n") : "<i>(kosong)</i>";
+        await tgRequest(token, "sendMessage", {
+          chat_id: chatId,
+          parse_mode: "HTML",
+          text:
+            info +
+            `📌 <b>Barang yang dibutuhkan admin</b>\n${daftar}\n\n` +
+            `Perintah:\n<code>/butuh tambah NAMA</code>\n<code>/butuh hapus NAMA</code>\n<code>/butuh kosong</code>`,
+        });
+        return res.status(200).json({ ok: true });
+      }
+
       // 0E. USER: /barter (barter produk di koleksi ke admin, tanpa pembayaran)
       if (/^\/barter(\s|$)/i.test(rawText)) {
         const uid = String(msg.from && msg.from.id);
@@ -12300,6 +12489,7 @@ module.exports = async function handler(req, res) {
             inline_keyboard: [
               ...list.map((e, i) => [{ text: e.nama.slice(0, 40), callback_data: `barter_pilih_${i}` }]),
               [{ text: "➕ Produk lain (ketik sendiri)", callback_data: "barter_lain" }],
+              ...((await getButuh()).length ? [[{ text: "📌 Dibutuhkan admin", callback_data: "barter_butuh" }]] : []),
             ],
           },
         });
