@@ -1087,6 +1087,7 @@ async function maybeRewardReferral(token, order) {
     throw addErr;
   }
   await redisCommand(["HINCRBY", REDIS_REF_TOTAL_KEY, String(referrerId), 1]);
+  await misiProgres(String(referrerId), "ajak").catch((e) => console.error("Misi ajak error:", e));
   try {
     await addReferralLeaderboardPoint(referrerId);
   } catch (lbErr) {
@@ -1200,6 +1201,8 @@ async function getActiveUserVoucher(userId) {
 }
 
 async function setActiveUserVoucher(userId, code) {
+  const lama = await redisCommand(["GET", `${REDIS_USER_VOUCHER_PREFIX}${userId}`]);
+  if (lama && String(lama) !== String(code)) await redisCommand(["RPUSH", `${REDIS_MISI_QUEUE_PREFIX}${userId}`, String(lama)]);
   await redisCommand([
     "SET",
     `${REDIS_USER_VOUCHER_PREFIX}${userId}`,
@@ -1211,6 +1214,8 @@ async function setActiveUserVoucher(userId, code) {
 
 async function clearActiveUserVoucher(userId) {
   await redisCommand(["DEL", `${REDIS_USER_VOUCHER_PREFIX}${userId}`]);
+  const antre = await redisCommand(["LPOP", `${REDIS_MISI_QUEUE_PREFIX}${userId}`]);
+  if (antre) await redisCommand(["SET", `${REDIS_USER_VOUCHER_PREFIX}${userId}`, String(antre), "EX", String(30 * 24 * 3600)]);
       }
     async function getKoleksi(userId) {
   const raw = await redisCommand(["GET", `${REDIS_KOLEKSI_PREFIX}${userId}`]);
@@ -1503,6 +1508,7 @@ async function recordPurchaseToLeaderboard(order) {
   const pertamaKali = Number(await redisCommand(["HGET", REDIS_LB_ALLCNT_KEY, memberId])) === 0;
   if (pertamaKali) kirimSelamatDatang(memberId).catch((e) => console.error("Selamat datang error:", e));
   await catatPembelianSultan(memberId, nominal, String(order.order_id || order.id || Date.now()));
+  await misiProgres(String(memberId), "beli").catch((e) => console.error("Misi beli error:", e));
   const sultanSekarang = await statusSultan(memberId);
   if (sultanSekarang.lolos) {
     const dapat = await redisCommand(["SET", `${REDIS_SULTAN_REWARD_PREFIX}${memberId}`, "1", "NX", "EX", String(SULTAN_PERIODE_DETIK)]);
@@ -1589,9 +1595,11 @@ async function buildLeaderboardPayload(period, viewerId) {
       const buyCount = parseInt((Array.isArray(counts) && counts[idx]) || "1", 10) || 1;
       const lifetimeCount =
         parseInt((Array.isArray(allCounts) && allCounts[idx]) || String(buyCount), 10) || buyCount;
+      const flagMisi = (await redisCommand(["HMGET", `${REDIS_MISI_PREFIX}${userIds[idx]}`, "ajak", "selesai"])) || [];
+      const badgeMisi = (flagMisi[0] === "1" ? " 🤝" : "") + (flagMisi[1] === "1" ? " 🏆" : "");
       const sultanList = await statusSultan(userIds[idx]);
       const tier = sultanList.lolos ? "👑 Sultan Lumine+" : getTierBadge(lifetimeCount);
-      listLines += `│ ${rankBadge} <b>${escapeHtml(rawName)}</b> [${tier}]\n│     └ ${buyCount}x beli (<code>${formatRupiah(totals[idx])}</code>)\n`;
+      listLines += `│ ${rankBadge} <b>${escapeHtml(rawName)}</b> [${tier}]${badgeMisi}\n│     └ ${buyCount}x beli (<code>${formatRupiah(totals[idx])}</code>)\n`;
     }
   }
 
@@ -2932,6 +2940,7 @@ function getCompactReplyKeyboard() {
       [{ text: "🎒 Koleksi Saya" }, { text: "🎲 Mystery Box" }],
       [{ text: "☰ Lainnya" }, { text: "📖 Panduan" }],
       [{ text: "🎁 Promo Saya" }, { text: "⏳ Cek Jeda" }],
+      [{ text: "🎯 Misi Berantai" }],
       [{ text: "👆 Tap Challenge" }],
     ],
     resize_keyboard: true,
@@ -3378,6 +3387,7 @@ async function sendMainMenuCard(token, chatId) {
         { text: "🎲 Mystery Box", callback_data: "menu_mystery" },
         { text: "🏆 Leaderboard", callback_data: "menu_lb" },
       ],
+      [{ text: "🎯 Misi Berantai", callback_data: "menu_misi" }],
       [
         { text: "☰ Menu Lainnya", callback_data: "menu_lainnya" },
         { text: "💬 Admin", url: `https://t.me/${ADMIN_USERNAME}` },
@@ -10021,6 +10031,7 @@ async function finalizeBarter(token, b) {
   b.status = "selesai";
   await redisCommand(["DEL", `${REDIS_BARTER_PEND_PREFIX}${b.uid}`]);
   await barterLog(b, "selesai");
+  await misiProgres(String(b.uid), "barter").catch((e) => console.error("Misi barter error:", e));
   await saveBarter(b);
   if (b.drive_id) await redisCommand(["SET", `${REDIS_BARTER_DRIVE_PREFIX}${b.drive_id}`, b.uid, "EX", String(60 * 60 * 24 * 90)]);
   const links = Array.isArray(b.tuju_links) && b.tuju_links.length ? b.tuju_links : b.tuju_link ? [b.tuju_link] : [];
@@ -10615,7 +10626,8 @@ async function kirimSelamatDatang(uid) {
       "👋 <b>Selamat datang di Lumine!</b>\n\n" +
       "🎒 <b>Koleksi Saya</b> nyimpen semua produk yang udah kamu beli.\n" +
       "🔁 Ketik <code>/barter</code> buat nukar produk koleksimu ke admin.\n" +
-      "🔗 Link isi produk Drive harus dibuka <b>Siapa saja yang memiliki link</b>.\n\n" +
+      "🔗 Link isi produk Drive harus dibuka <b>Siapa saja yang memiliki link</b>.\n" +
+      "🎯 Ada misi berantai, ketik <code>/misi</code> buat liat hadiahnya.\n\n" +
       "Ketik pertanyaanmu di sini, bot bantu jawab yang umum.",
   });
 }
@@ -10670,6 +10682,107 @@ async function beriVoucherSultan(uid) {
         `Kode: <code>${kode}</code>`,
     });
   }
+}
+
+// ---- MISI BERANTAI (sekali seumur hidup, hadiah voucher bertumpuk) ----
+const MISI_ENABLED = true;
+const REDIS_MISI_PREFIX = "lumine_main_misi_"; // hash per user: beli, barter, ajak, selesai (1 = sudah)
+const REDIS_MISI_QUEUE_PREFIX = "lumine_main_misi_antre_"; // antrean kode voucher yang menunggu giliran
+const MISI_HADIAH = {
+  beli: { label: "Beli 1 produk", diskon: 2000, min: 10000 },
+  barter: { label: "Barter 1 kali sampai selesai", diskon: 3000, min: 10000 },
+  ajak: { label: "Ajak 1 teman yang berhasil belanja", diskon: 10000, min: 20000, badge: "🤝 Pengajak" },
+  selesai: { label: "Semua tahap selesai", persen: 20, maks: 15000, min: 20000, badge: "🏆 Misi Selesai" },
+};
+const MISI_TAHAP_UTAMA = ["beli", "barter", "ajak"];
+
+async function buatVoucherMisi(uid, kode, h) {
+  const vm = await getVouchers();
+  vm[kode] = {
+    code: kode,
+    discount: h.persen ? h.maks : h.diskon,
+    percent: h.persen || 0,
+    min_belanja: h.min,
+    quota: 1,
+    used_by: [],
+    source: "misi",
+  };
+  await saveVouchers(vm);
+  const aktif = await redisCommand(["GET", `${REDIS_USER_VOUCHER_PREFIX}${uid}`]);
+  if (aktif) {
+    await redisCommand(["RPUSH", `${REDIS_MISI_QUEUE_PREFIX}${uid}`, kode]);
+  } else {
+    await redisCommand(["SET", `${REDIS_USER_VOUCHER_PREFIX}${uid}`, kode, "EX", String(30 * 24 * 3600)]);
+  }
+}
+
+function teksDiskonMisi(h) {
+  return h.persen
+    ? `diskon ${h.persen}% (maks ${formatRupiah(h.maks)})`
+    : `diskon ${formatRupiah(h.diskon)}`;
+}
+
+async function misiProgres(uid, tahap) {
+  if (!MISI_ENABLED) return;
+  const key = `${REDIS_MISI_PREFIX}${uid}`;
+  if ((await redisCommand(["HGET", key, tahap])) === "1") return;
+  if ((await redisCommand(["HGET", key, "selesai"])) === "1") return;
+  await redisCommand(["HSET", key, tahap, "1"]);
+  const token = process.env.BOT_TOKEN;
+  const h = MISI_HADIAH[tahap];
+  const kodeBase = `MISI${tahap.toUpperCase()}${String(uid).slice(-6)}${Date.now().toString(36).toUpperCase()}`;
+  await buatVoucherMisi(uid, kodeBase, h);
+  if (token) {
+    await tgRequest(token, "sendMessage", {
+      chat_id: uid,
+      parse_mode: "HTML",
+      text:
+        `🎯 <b>Misi berantai</b>: ${h.label} selesai!\n` +
+        `🎟️ Kamu dapat voucher <b>${teksDiskonMisi(h)}</b>, min. belanja ${formatRupiah(h.min)}.\n` +
+        (h.badge ? `🏅 Badge baru: <b>${h.badge}</b>\n` : ""),
+    });
+  }
+  // semua tahap utama selesai -> hadiah akhir
+  const vals = (await redisCommand(["HMGET", key, ...MISI_TAHAP_UTAMA])) || [];
+  if (vals.length && vals.every((v) => v === "1")) {
+    await redisCommand(["HSET", key, "selesai", "1"]);
+    const hf = MISI_HADIAH.selesai;
+    await buatVoucherMisi(uid, `MISISELESAI${String(uid).slice(-6)}${Date.now().toString(36).toUpperCase()}`, hf);
+    if (token) {
+      await tgRequest(token, "sendMessage", {
+        chat_id: uid,
+        parse_mode: "HTML",
+        text:
+          `🏆 <b>MISI BERANTAI SELESAI!</b>\n` +
+          `🎟️ Hadiah akhir: <b>${teksDiskonMisi(hf)}</b>, min. belanja ${formatRupiah(hf.min)}.\n` +
+          `🏅 Badge: <b>${hf.badge}</b>`,
+      });
+    }
+  }
+}
+
+// ---- MENU MISI: tampilkan 4 tahap + progres user ----
+async function sendMisiMenu(token, chatId, uid) {
+  if (!MISI_ENABLED) return;
+  const v = (await redisCommand(["HMGET", `${REDIS_MISI_PREFIX}${uid}`, "beli", "barter", "ajak", "selesai"])) || [];
+  const ok = (x) => (x === "1" ? "✅" : "⬜");
+  const hadiah = (h) =>
+    h.persen ? `diskon ${h.persen}% (maks ${formatRupiah(h.maks)})` : `diskon ${formatRupiah(h.diskon)}`;
+  const baris = [
+    `${ok(v[0])} <b>1.</b> ${MISI_HADIAH.beli.label}\n    🎟️ ${hadiah(MISI_HADIAH.beli)}, min. ${formatRupiah(MISI_HADIAH.beli.min)}`,
+    `${ok(v[1])} <b>2.</b> ${MISI_HADIAH.barter.label}\n    🎟️ ${hadiah(MISI_HADIAH.barter)}, min. ${formatRupiah(MISI_HADIAH.barter.min)}`,
+    `${ok(v[2])} <b>3.</b> ${MISI_HADIAH.ajak.label}\n    🎟️ ${hadiah(MISI_HADIAH.ajak)}, min. ${formatRupiah(MISI_HADIAH.ajak.min)}\n    🏅 Badge: ${MISI_HADIAH.ajak.badge}`,
+    `${ok(v[3])} <b>4.</b> ${MISI_HADIAH.selesai.label}\n    🎟️ ${hadiah(MISI_HADIAH.selesai)}, min. ${formatRupiah(MISI_HADIAH.selesai.min)}\n    🏅 Badge: ${MISI_HADIAH.selesai.badge}`,
+  ];
+  const footer =
+    v[3] === "1"
+      ? "🎉 Kamu udah nyelesaiin semua misi!"
+      : "Tahap boleh dikerjain urutannya bebas. Misi cuma bisa diselesaikan sekali.";
+  await tgRequest(token, "sendMessage", {
+    chat_id: chatId,
+    parse_mode: "HTML",
+    text: `🎯 <b>Misi Berantai</b>\n\n${baris.join("\n\n")}\n\n${footer}`,
+  });
 }
 
 function barterLinkHost(u) {
@@ -11215,6 +11328,8 @@ module.exports = async function handler(req, res) {
         await sendBestsellerMenu(token, chatId);
       } else if (data === "menu_mystery") {
         await sendMysteryMenu(token, chatId);
+      } else if (data === "menu_misi") {
+        await sendMisiMenu(token, call.message.chat.id, String(call.from.id));
       } else if (data === "menu_koleksi") {
         await sendKoleksiMenu(token, chatId, callerId);
       } else if (data === "menu_promo") {
@@ -16141,6 +16256,8 @@ module.exports = async function handler(req, res) {
             parse_mode: "HTML",
             reply_markup: lb.reply_markup,
           });
+        } else if (text === "🎯 Misi Berantai" || text === "/misi") {
+          await sendMisiMenu(token, chatId, String(senderId));
         } else if (text === "🎒 Koleksi Saya" || text === "/koleksi") {
           await sendKoleksiMenu(token, chatId, senderId);
         } else if (text === "📋 Cara Order" || text === "📋 Cara Beli & Aturan") {
