@@ -1180,6 +1180,15 @@ async function saveVouchers(vouchersMap) {
   await redisCommand(["SET", REDIS_VOUCHERS_KEY, JSON.stringify(vouchersMap)]);
 }
 
+// Voucher berlaku kalau harga produk ada di rentang min-maks (maks 0 = tanpa batas atas)
+function voucherCocokBelanja(v, harga) {
+  const min = Number(v.min_belanja) || 0;
+  const maks = Number(v.maks_belanja) || 0;
+  if (harga < min) return false;
+  if (maks > 0 && harga > maks) return false;
+  return true;
+}
+
 async function getActiveUserVoucher(userId) {
   const code = await redisCommand(["GET", `${REDIS_USER_VOUCHER_PREFIX}${userId}`]);
   if (!code) return null;
@@ -2144,7 +2153,8 @@ async function resolveBestDiscount(userId, itemId, baseNominal) {
 
   let voucherDisc = 0;
   let voucher = null;
-  const activeVoucher = await getActiveUserVoucher(userId);
+  const activeVoucherRaw = await getActiveUserVoucher(userId);
+  const activeVoucher = activeVoucherRaw && voucherCocokBelanja(activeVoucherRaw, baseNominal) ? activeVoucherRaw : null;
   if (activeVoucher) {
     const pctV = Number(activeVoucher.percent) || 0;
     voucherDisc = pctV > 0
@@ -13905,7 +13915,7 @@ module.exports = async function handler(req, res) {
         if (parts.length < 3) {
           await tgRequest(token, "sendMessage", {
             chat_id: chatId,
-            text: "⚠️ Format salah! Gunakan: <code>/buatvoucher KODE | POTONGAN | KUOTA</code>",
+            text: "⚠️ Format salah! Gunakan: <code>/buatvoucher KODE | POTONGAN | KUOTA | MIN-MAKS (opsional)</code>",
             parse_mode: "HTML",
           });
           return res.status(200).json({ ok: true });
@@ -13923,7 +13933,10 @@ module.exports = async function handler(req, res) {
           return res.status(200).json({ ok: true });
         }
 
-        vouchers[code] = { code, discount, quota, used_by: [] };
+        const angkaRange = parts.length >= 4 ? (parts[3].replace(/\./g, "").match(/\d+/g) || []) : [];
+        const minBelanja = Number(angkaRange[0]) || 0;
+        const maksBelanja = angkaRange.length >= 2 ? Number(angkaRange[1]) || 0 : 0;
+        vouchers[code] = { code, discount, quota, used_by: [], min_belanja: minBelanja, maks_belanja: maksBelanja };
         await saveVouchers(vouchers);
 
         await tgRequest(token, "sendMessage", {
@@ -13932,7 +13945,12 @@ module.exports = async function handler(req, res) {
             `✅ <b>Voucher Berhasil Dibuat!</b>\n\n` +
             `• <b>Kode:</b> <code>${code}</code>\n` +
             `• <b>Potongan Harga:</b> ${formatRupiah(discount)}\n` +
-            `• <b>Kuota:</b> ${quota} orang tercepat`,
+            `• <b>Kuota:</b> ${quota} orang tercepat` +
+            (minBelanja > 0 && maksBelanja > 0
+              ? `\n• <b>Berlaku belanja:</b> ${formatRupiah(minBelanja)} – ${formatRupiah(maksBelanja)}`
+              : minBelanja > 0
+                ? `\n• <b>Min. belanja:</b> ${formatRupiah(minBelanja)}`
+                : ""),
           parse_mode: "HTML",
         });
         return res.status(200).json({ ok: true });
@@ -14006,7 +14024,11 @@ module.exports = async function handler(req, res) {
           text:
             `🎉 <b>VOUCHER BERHASIL DIPASANG!</b>\n\n` +
             `🎟️ Kode: <code>${escapeHtml(v.code)}</code>\n` +
-            `💸 Potongan: <b>${formatRupiah(v.discount)}</b>\n\n` +
+            `💸 Potongan: <b>${formatRupiah(v.discount)}</b>\n` +
+            (Number(v.min_belanja) > 0
+              ? `🛒 Berlaku belanja: <b>${formatRupiah(v.min_belanja)}${Number(v.maks_belanja) > 0 ? ` – ${formatRupiah(v.maks_belanja)}` : " ke atas"}</b>\n`
+              : "") +
+            `\n` +
             `Diskon akan otomatis memotong tagihan saat kamu checkout set di Katalog atau Mystery Box 👇`,
           parse_mode: "HTML",
           reply_markup: {
